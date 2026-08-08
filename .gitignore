@@ -1,0 +1,9 @@
+# Eval run outputs, benchmarks and scratch workspaces
+parallel-agents-workspace/
+*-workspace/
+
+__pycache__/
+*.py[cod]
+
+.DS_Store
+Thumbs.db
