@@ -116,9 +116,20 @@ same-file rule then holds you to.
   isolation and is not. **Commit instead** — a commit belongs to your branch and no
   stranger can pop it — and leave someone else's `stash@{0}` alone even when it looks
   redundant.
-- **Ports, dev servers, databases, and any single machine resource.** A build that writes
-  a shared output directory still kills a dev server serving it; a timing measurement
-  cannot be trusted while another agent is saturating the same disk.
+- **A fixed output path in the project's own tooling.** Scripts written when there was one
+  checkout name their output after the *project* — `%TEMP%\<project>-tests`,
+  `~/.cache/<project>` — and clear it at the start of every run. Every worktree then shares
+  one directory, so you wait for a marker file and read a result some other tree produced.
+  One repo's test runner did exactly that: three consecutive full-suite runs on a tree
+  whose only change was a comment reported 966, 959 and 966 passed. **A number that moves
+  between runs on a tree you did not change is shared state, not a flaky test** — find out
+  where the runner writes before you chase the flake. Fix it at the default rather than by
+  passing a flag every time: derive the path from the checkout — its leaf name, so a reader
+  can tell whose it is, plus a few bytes of hash over the absolute path, so two worktrees
+  with the same leaf still differ — and keep the explicit override working.
+- **Ports, dev servers, databases, and any single machine resource.** Two trees cannot both
+  bind the same port, and a timing measurement cannot be trusted while another agent is
+  saturating the same disk.
 - **The work item.** Two agents can happily take the same ticket. Claim it before you
   build — see [references/ticketing.md](references/ticketing.md).
 - **Shared insert points in docs.** An append-ordered changelog or a hand-maintained
@@ -180,7 +191,8 @@ So the levers are on the briefing side, not the checkout side:
 - **Delegate reads, keep writes.** A read-only subagent returns a summary instead of forty
   file reads. That is the cheap kind of parallelism, and the reason read-only agents are
   carved out above.
-- **Run the full gate once, at the end.** Mid-work iterations want a typecheck and a lint.
+- **Run the full gate once, at the end** — and check it reports on *your* tree, not on
+  whichever one finished last. Mid-work iterations want a typecheck and a lint.
 - **Parallelise by area, not by layer.** Two agents building the same feature conflict in
   the source, and no checkout discipline helps.
 - **Don't parallelise sequential work.** Coordination overhead and token cost scale with

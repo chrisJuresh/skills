@@ -123,8 +123,8 @@ Honest limits, so nobody assumes cover that is not there.
 - **Sibling writing subagents** may share their parent's session id, in which case they are
   one writer as far as the registry is concerned. `isolation: worktree` is the mechanism
   for those, not this.
-- **Everything a worktree does not isolate** — ports, databases, build outputs, the work
-  item itself. Those are in `SKILL.md` and in [ticketing.md](ticketing.md).
+- **Everything a worktree does not isolate** — ports, databases, a runner's fixed output
+  path, the work item itself. Those are in `SKILL.md` and in [ticketing.md](ticketing.md).
 
 ## Cost
 

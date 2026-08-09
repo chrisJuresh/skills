@@ -55,8 +55,8 @@ output and no tokens.
 - Working-tree movers — `checkout`, `switch`, `restore`, `reset`, `rebase`, `merge`,
   `cherry-pick`, `revert`, `am`, `apply`, `clean`
 - Blind staging — `git add -A`/`.`/`-u`, `git commit -a`/`-am`
-- `git stash` — `refs/stash` is one stack shared by every worktree, so it is the one failure
-  a worktree does not isolate
+- `git stash` — `refs/stash` is one stack shared by every worktree, so it is the one git
+  failure a worktree does not isolate
 - `Edit`/`Write`/`NotebookEdit` on a file another live session has written
 
 Everything else proceeds: targeted `git add <path>`, ordinary commits, `push`, `fetch`,
