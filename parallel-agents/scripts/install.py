@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -30,6 +31,12 @@ from pathlib import Path
 
 GUARD_SOURCE = Path(__file__).resolve().parent / "parallel_guard.py"
 GUARD_FILENAME = "parallel-guard.py"
+
+# The test `parallel_guard.py` applies when it decides whether to stand down, kept
+# character-for-character identical to `_OTHER_GUARD` there. `--status` reporting a
+# stand-down the guard will not perform — or missing one it will — is worse than
+# reporting nothing, because a status line is believed.
+OTHER_GUARD = re.compile(r"concurrent[-_]?writer|writer[-_]?guard|parallel[-_]?guard", re.I)
 MATCHER = "Write|Edit|NotebookEdit|Bash|PowerShell"
 EVENTS = ("PreToolUse", "SessionStart", "SessionEnd")
 REGISTRY_DIRNAME = "claude-parallel-sessions"
@@ -216,8 +223,10 @@ def report_status(user_root: Path, repo: Path | None) -> int:
             blob = load(main_root / ".claude" / name)
             for matchers in (blob.get("hooks") or {}).get("PreToolUse") or []:
                 for hook in (matchers or {}).get("hooks") or []:
+                    if is_ours(hook):
+                        continue
                     text = " ".join(str(p) for p in (hook.get("command"), *(hook.get("args") or [])) if p)
-                    if not is_ours(hook) and ("concurrent" in text or "writer-guard" in text):
+                    if OTHER_GUARD.search(text):
                         print(f"  ! this repo ships its own guard ({name}) — ours stands down here")
 
     now = time.time()
