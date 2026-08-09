@@ -9,6 +9,7 @@ make someone delete the hook. Run it after any change to `parallel_guard.py`:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -21,6 +22,15 @@ GUARD = Path(__file__).resolve().parent / "parallel_guard.py"
 REGISTRY = "claude-parallel-sessions"
 
 failures: list[str] = []
+
+
+def load_install():
+    """`install.py` as a module, for the predicates it has to share with the guard."""
+    path = Path(__file__).resolve().parent / "install.py"
+    spec = importlib.util.spec_from_file_location("parallel_install", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run(payload: dict, env: dict | None = None) -> dict:
@@ -207,6 +217,36 @@ def main() -> int:
         claim(repo, "other", repo, [repo / "auth.ts"])
         check("floor-mover", decision(run(pre(repo, "Bash", {"command": "git switch feat"}))), "allow")
         check("no claim written", (repo / ".git" / REGISTRY / "mine.json").is_file(), False)
+
+        # `--status` reports the same stand-down, so a repo cannot be told it is
+        # covered by one and not the other. Separators vary in the wild — the repo
+        # that motivated this ships `concurrent_writer_guard.py` — and "concurrent"
+        # on its own is not a guard.
+        install = load_install()
+        for command, is_guard in (
+            ("node scripts/concurrent-writer-guard.mjs", True),
+            ("python .claude/hooks/concurrent_writer_guard.py", True),
+            ("bash scripts/writer_guard.sh", True),
+            ("python scripts/check-concurrent-jobs.py", False),
+        ):
+            repo = make_repo(base / f"guard-{abs(hash(command))}")
+            (repo / ".claude").mkdir()
+            (repo / ".claude" / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claim(repo, "other", repo, [repo / "auth.ts"])
+            stood_down = decision(run(pre(repo, "Bash", {"command": "git switch feat"}))) == "allow"
+            check(f"guard stands down for {command!r}", stood_down, is_guard)
+            check(f"--status agrees for {command!r}", bool(install.OTHER_GUARD.search(command)), is_guard)
 
         print("\n[I] session lifecycle")
         repo = make_repo(base / "lifecycle")

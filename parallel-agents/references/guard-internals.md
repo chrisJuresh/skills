@@ -97,9 +97,11 @@ Before doing anything else the guard exits silently when:
 - `cwd` is not inside a git repository, or the git metadata will not resolve;
 - the repository already registers a concurrent-writer hook of its own in
   `.claude/settings.json` or `.claude/settings.local.json` — matched on
-  `concurrent-writer`, `writer-guard` or `parallel-guard` in the command. Two guards means
-  two denials with two different remedies for one action, which is the flail this exists to
-  prevent. See [migrating-repo-guards.md](migrating-repo-guards.md).
+  `concurrent-writer`, `writer-guard` or `parallel-guard` in the command, with the separator
+  optional so `concurrent_writer_guard.py` matches too. Two guards means two denials with two
+  different remedies for one action, which is the flail this exists to prevent.
+  `install.py --status` applies the same test, so the two never disagree about whether a repo
+  is covered. See [migrating-repo-guards.md](migrating-repo-guards.md).
 
 It also fails open on every question it cannot answer: an unparseable payload, a missing
 session id, an unreadable registry, a claim file that is not valid JSON. Blocking the only

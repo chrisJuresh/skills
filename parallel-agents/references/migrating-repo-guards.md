@@ -6,8 +6,12 @@ deciding whether to consolidate, and what it would cost.
 
 A repo guard is recognised by `concurrent-writer`, `writer-guard` or `parallel-guard`
 appearing in a hook command in the repo's `.claude/settings.json` or
-`.claude/settings.local.json`. To see what a given repo has, read that file and the script
-it points at, and note four things before deciding anything:
+`.claude/settings.local.json`. The separator is not load-bearing — a hyphen, an underscore
+or nothing all match, so a repo whose hook is `concurrent_writer_guard.py` is recognised —
+but the words are: a command mentioning `concurrent` alone is not a guard, and does not stand
+anything down. `install.py --status` applies the same test, so if it does not report a repo
+guard, the guard is not standing down either. To see what a given repo has, read that file
+and the script it points at, and note four things before deciding anything:
 
 | What to look for | Why it matters |
 |---|---|
