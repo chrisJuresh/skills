@@ -8,8 +8,10 @@ description: >-
   agent teams, worktrees, "another agent is editing this", two tickets at once, or asks
   you to fan work out across subagents that write. Use it when a tool call is denied for
   a concurrent writer, when you are about to switch branches, stash, or `git add -A` in a
-  repo you may be sharing, and before starting a second `/implement` in one folder. Also
-  use it when the user wants this protection installed once and working everywhere.
+  repo you may be sharing, and before starting a second `/implement` in one folder. Use it
+  when a generated index, changelog or other machine-written file conflicts on every
+  parallel branch and the user wants that to stop happening. Also use it when the user
+  wants this protection installed once and working everywhere.
 ---
 
 # Parallel agents in one checkout
@@ -135,6 +137,46 @@ same-file rule then holds you to.
 - **Shared insert points in docs.** An append-ordered changelog or a hand-maintained
   index is a guaranteed conflict on every branch. Prefer one file per entry with a
   generated index, and keep doc edits to the narrowest diff, in one commit, last.
+  **One file per entry does not finish the job** — see below, because the generated index
+  is itself a shared insert point.
+
+## Generated files: stop resolving what nobody wrote
+
+One file per entry fixes the *entries*: two files that do not exist yet cannot conflict. The
+**generated index** still conflicts on every parallel branch, because each one appends its
+row and rewrites the same `N entries` line. That is a merge stop over text no agent authored
+and nobody should be reading — pure time and tokens.
+
+Give that one file git's built-in union driver, and keep regenerating:
+
+```gitattributes
+docs/decisions/README.md merge=union
+```
+
+- **`union` is built in; `ours` is not.** `merge=ours` needs
+  `git config merge.ours.driver true` on every machine, and without it the attribute
+  silently does nothing — measured: the merge conflicts exactly as if the file had no
+  attribute. Anything requiring per-machine setup is not a repo rule.
+- **It buys "the merge does not stop", not "the file is right."** Measured: union keeps both
+  branches' rows but in *side* order rather than the generator's, and where the two `N
+  entries` lines differ it keeps **both**. So the regenerate command stays in the pre-PR
+  ritual, and it is needed *especially* on a merge that reported no conflict at all.
+- **Pair it with a blocking check.** If the generator has a verify mode (`--check`) in CI,
+  forgetting to regenerate is a red gate rather than a quietly wrong index. Without that
+  check, do not add the attribute — you have traded a visible conflict for an invisible
+  staleness.
+- **Never on an authored file.** Keep-both-sides lands one agent's paragraph and another's
+  rewrite of it, merged clean, wrong and unreviewed. A conflict you have to look at beats a
+  merge you don't. The single safe case is a file with no authored content at all, because
+  there are no two sides to choose between and a generator can re-derive the truth.
+- **Don't untrack it instead.** A generated index exists so a teammate reading the forge can
+  find "what did we decide and why" without running a script; deleting it from the repo ends
+  the conflict by ending the feature.
+
+Server-side merges are worth one caveat: a forge's own "Merge" button may not read
+`.gitattributes`, so the path this relies on is the branch-side one — fetch, merge or rebase
+the target branch locally, regenerate, push — which is where the conflicts were being paid
+for anyway.
 
 ## When the guard denies you
 
