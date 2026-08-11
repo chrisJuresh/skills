@@ -43,6 +43,21 @@
         "Says to close each ticket when done because that is what unblocks its dependents",
         "Warns against git stash (shared across worktrees) or blind staging"
       ]
+    },
+    {
+      "id": 3,
+      "name": "generated-index-conflict",
+      "prompt": "every single PR in acme/console now conflicts on docs/decisions/README.md. it's generated (npm run fix:decisions writes it from the files in docs/decisions/, and check:decisions verifies it in CI) so the resolution is always the same - regenerate it - but 3 branches in flight means i'm doing that dance constantly. is there a way to just make this stop that isn't a load of ceremony? someone suggested merge=ours in .gitattributes",
+      "expected_output": "merge=union on that one generated file, with the regenerate step and the blocking CI check kept, merge=ours rejected because it is not a built-in driver, and the attribute explicitly not extended to authored files.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Recommends `merge=union` in .gitattributes scoped to that one generated file",
+        "Rejects merge=ours because it is not a built-in driver and needs per-machine git config to do anything",
+        "Says union does not make the file correct — regenerating after the merge/rebase is still required",
+        "Keeps or requires the blocking CI check as what catches a forgotten regenerate",
+        "Warns that the attribute must not be applied to authored/prose files, because both sides land unreviewed",
+        "Does not propose untracking or gitignoring the generated index as the fix"
+      ]
     }
   ]
 }
