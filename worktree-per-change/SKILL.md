@@ -84,6 +84,44 @@ from the integration branch you just merged into. The guard marks a worktree spe
 a new commit reaches nobody, because the PR that would have carried it is already
 closed.
 
+On Windows, write a multi-line PR body to a file and pass `--body-file`, and write that
+file **without a BOM** — PowerShell's `Set-Content -Encoding utf8` emits one, it lands at
+the top of the body, and it stops a leading markdown heading from rendering. Use
+`[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false))`.
+
+## What a fresh worktree does not have
+
+This is the cost that changed. Under a rule where worktrees were occasional, setting one
+up was a rare tax; under this one it is paid on **every change**, so it is worth making
+cheap rather than rediscovering it each time.
+
+A worktree is a fresh checkout of tracked files and nothing else. Dependencies, build
+output, local config and anything else `.gitignore` covers are simply absent:
+
+- **Dependencies.** `node_modules/`, a virtualenv, a `pnpm install`. Some repos dodge
+  most of this by committing build output — check before assuming a full install is
+  needed; often only a change that touches source requires one.
+- **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
+  start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
+  and the failure looks like the tool being broken rather than the file being missing.
+- **Untracked scratch state** the last session left in the main checkout.
+
+Two ways to fix it, and the second is better for anything a *human* also needs:
+
+- **`.worktreeinclude`** lists untracked paths Claude Code copies into each new worktree.
+  Right for machine-local secrets and caches that must not be committed.
+- **Un-ignore the file.** If every worktree needs it and it holds nothing private, the
+  honest answer is to commit it — a worktree only gets a file if git puts it there. This
+  applies to the guard itself: `.claude/settings.json`, `.claude/hooks/worktree-guard.py`
+  and `.claude/worktree-per-change.json` must be tracked, or the rule stops applying
+  inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
+  needs its ignore narrowed to name them, keeping `settings.local.json` and
+  `.claude/worktrees/` out.
+
+A repo that commits the hook should also test it, in its own test suite and idiom — the
+committed copy is what actually runs, and a hook that silently stopped denying looks
+exactly like a hook that had nothing to deny.
+
 ## Installing it
 
 Per repository is the usual install, because the rule depends on what that repository's
@@ -96,7 +134,15 @@ python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --branch development --
 Show the user that output, then run it without `--dry-run`. It copies the guard to
 `.claude/hooks/`, registers three hooks in the committed `.claude/settings.json`, writes
 `.claude/worktree-per-change.json` with the integration branch, and links this skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three.
+`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three, and
+check `.gitignore` is not swallowing them.
+
+A repo install registers the hook as `python` against
+`${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py`, deliberately: the file is
+committed, so it must not carry the installing machine's interpreter path or this
+checkout's absolute location, and `${CLAUDE_PROJECT_DIR}` resolves to whichever worktree
+the session is actually in. `--python` overrides the interpreter where `python` is not on
+`PATH`.
 
 - Omit `--repo` to install at user scope for every repository on the machine. It applies
   one integration branch to repos that may not share it, so prefer per-repo.

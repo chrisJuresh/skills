@@ -146,11 +146,11 @@ def strip(settings: dict, also_legacy: bool) -> tuple[dict, list[str]]:
     return settings, removed
 
 
-def entry(interpreter: str, script: Path, event: str) -> dict:
+def entry(interpreter: str, script: str, event: str) -> dict:
     # `-S` skips site initialisation, ~13% of interpreter startup and worth having on a
     # hook that runs before every write-tool call. The guard is stdlib-only by design so
     # that it can.
-    hook = {"type": "command", "command": interpreter, "args": ["-S", str(script)], "timeout": 10}
+    hook = {"type": "command", "command": interpreter, "args": ["-S", script], "timeout": 10}
     if event == "PreToolUse":
         hook["statusMessage"] = "Checking this change is in its own worktree"
         return {"matcher": MATCHER, "hooks": [hook]}
@@ -159,7 +159,7 @@ def entry(interpreter: str, script: Path, event: str) -> dict:
     return {"hooks": [hook]}
 
 
-def add_ours(settings: dict, interpreter: str, script: Path) -> dict:
+def add_ours(settings: dict, interpreter: str, script: str) -> dict:
     hooks = settings.setdefault("hooks", {})
     for event in EVENTS:
         bucket = hooks.setdefault(event, [])
@@ -285,6 +285,7 @@ def main() -> int:
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--python", metavar="EXE", help="interpreter to run the guard with")
     parser.add_argument("--keep-legacy", action="store_true", help="leave a predecessor guard registered")
     parser.add_argument("--no-skill", action="store_true", help="skip linking the skill into ~/.claude/skills")
     args = parser.parse_args()
@@ -315,7 +316,9 @@ def main() -> int:
         if args.dry_run:
             print(f"would rewrite {target}\n--- before\n{before}\n--- after\n{after}")
             return 0
-        write_json(target, settings, backup=True)
+        # No `.bak` beside a committed settings file: git is already the backup, and the
+        # stray file shows up in `git status` for whoever installs next.
+        write_json(target, settings, backup=repo is None)
         for path in (guard_path(root), (repo / ".claude" / CONFIG_FILENAME) if repo else None):
             if path is None:
                 continue
@@ -334,7 +337,15 @@ def main() -> int:
         return 0
 
     script = guard_path(root)
-    settings = add_ours(settings, sys.executable, script)
+    # A repo install is committed and read on other machines and in every worktree, so it
+    # must not carry this machine's interpreter path or this checkout's absolute location:
+    # `${CLAUDE_PROJECT_DIR}` resolves to whichever tree the session is actually in, and
+    # `python` resolves to whatever that machine has. A user-scope install is the opposite
+    # case — it is nobody else's file and there is no project dir to expand — so it pins
+    # the interpreter that ran the installer.
+    interpreter = args.python or ("python" if repo else sys.executable)
+    reference = "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + GUARD_FILENAME if repo else str(script)
+    settings = add_ours(settings, interpreter, reference)
     after = json.dumps(settings, indent=2)
     branch = args.branch or DEFAULT_BRANCH
     config = (repo / ".claude" / CONFIG_FILENAME) if repo else None
