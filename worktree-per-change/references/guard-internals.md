@@ -1,0 +1,171 @@
+# The guard: what it checks, and what it deliberately does not
+
+`scripts/worktree_guard.py` runs as a `PreToolUse`, `SessionStart` and `Stop` hook. Read
+this when it fires somewhere it should not, when a repo needs a different integration
+branch, or before changing it.
+
+## Contents
+
+- [The rule set](#the-rule-set)
+- [How it tells a worktree from the main checkout](#how-it-tells-a-worktree-from-the-main-checkout)
+- [Spent worktrees](#spent-worktrees)
+- [The Stop hook](#the-stop-hook)
+- [Configuration](#configuration)
+- [Where it stands down](#where-it-stands-down)
+- [What it does not protect](#what-it-does-not-protect)
+- [Cost](#cost)
+- [Debugging](#debugging)
+- [Changing it](#changing-it)
+
+## The rule set
+
+| Denied | Why |
+|---|---|
+| `Edit`/`Write`/`NotebookEdit` whose target is inside the **main checkout** | The main checkout is read-and-pull only. Every write there is a write two sessions can collide on, and one that reaches the integration branch without a diff anyone read. |
+| `git add`, `commit`, `checkout`, `switch`, `restore`, `reset`, `rebase`, `merge`, `cherry-pick`, `revert`, `am`, `apply`, `clean`, `rm`, `mv` in the **main checkout** | Same rule, other half. A protocol that denies the file edit and allows the commit has not denied anything. |
+| An edit in a worktree sitting on the **integration branch** | It would put the change on the branch everything merges into, with no PR and no review. |
+| An edit in a worktree whose **PR has already merged** | A merged branch that grows a commit reaches nobody: the PR that would have carried it is closed. The next change is a new worktree. |
+| `git stash`, **everywhere** | `refs/stash` is one stack for the whole repository. A push in one worktree renumbers every other worktree's entries, so a later `pop` or `drop` in either takes the wrong one. The one hazard a worktree looks like it isolates and does not. |
+
+Everything else proceeds: every read, every `push`, `fetch`, `log`, `diff`, `status`,
+`branch`, `tag`, `worktree`, `stash list`, every `gh` call, and every edit in a live
+worktree on its own branch — which is where all the work happens, so the guard is silent
+for the whole of a normal change.
+
+Writes to paths **outside** the repository are not the repository's business and are
+allowed from anywhere: a scratchpad file, a note in `~/.claude/`, another repo entirely.
+
+## How it tells a worktree from the main checkout
+
+`.git` is a **directory** in the main checkout and a **file** holding a `gitdir:` pointer
+in a linked worktree. That single stat is the entire test.
+
+It is worth saying why it is not a path comparison against `.claude/worktrees/`: worktrees
+live *inside* the main checkout's directory tree, so any prefix test says every worktree
+write is a main-checkout write. The `.git` test is a property of the tree itself and cannot
+be got wrong by path arithmetic, symlinks, or a worktree someone put somewhere else.
+
+The branch is read straight out of `<git-dir>/HEAD` — `ref: refs/heads/<name>` — rather
+than by shelling out. A detached HEAD reads as `None` and is treated as not-the-integration-
+branch, which is the permissive direction and correct: nothing merges into a detached HEAD.
+
+## Spent worktrees
+
+"A new worktree every time" is only a real rule if reusing a finished one is refused.
+
+The guard watches shell commands for `gh pr merge` and, when it sees one in a worktree,
+writes `<git-common-dir>/claude-worktree-gate/spent/<worktree-name>.json`. Every later
+`Edit`/`Write` in that tree is denied with a pointer at `EnterWorktree`.
+
+The marker is written **before** the merge runs, because `PreToolUse` is the only hook that
+sees the command and there is no after-hook that can tell a merge from a merge that failed.
+A worktree marked spent by a merge that did not land is the harmless direction: the remedy
+is a new worktree, which is what the protocol wanted anyway. The escape, if you genuinely
+need the old tree back, is to delete its marker file.
+
+State lives in the **common** git directory — the one every worktree shares, found through
+the `commondir` pointer — so all the trees read the same markers, and so nothing the guard
+writes can ever show up in `git status`.
+
+## The Stop hook
+
+`Stop` refuses to end a session sitting in a worktree that is holding uncommitted files or
+commits that `origin/<integration>` has not got, and names which. That is the only place
+the guard shells out to git: `status --porcelain` and `rev-list --count`, once per stop
+attempt, never on the write path.
+
+It blocks at most **twice** per session and then lets the session end. A hook that can block
+forever hangs a session, and an agent that has ignored the same instruction twice will not
+take it on the third telling. Every git call that fails resolves to "nothing to hold" —
+blocking a session over a command that merely errored would strand it with no way out.
+
+## Configuration
+
+The integration branch is per repository, read in this order:
+
+1. `CLAUDE_INTEGRATION_BRANCH` in the environment;
+2. `integrationBranch` in the main checkout's `.claude/worktree-per-change.json`;
+3. `development`.
+
+It is committed next to the hook rather than inferred from the remote's default branch,
+because the default branch is frequently *not* the integration branch, and guessing it wrong
+sends every PR at the wrong target and every new worktree at the wrong base.
+
+`CLAUDE_WORKTREE_GATE` controls the guard itself: `on` (default), `warn` — allow, but print
+the reason it would have denied, which is how to watch what a repo would block before
+committing to it — and `off`.
+
+## Where it stands down
+
+- `CLAUDE_WORKTREE_GATE=off`;
+- `cwd` is not inside a git repository, or the git metadata will not resolve;
+- the payload has no `cwd`, or does not parse.
+
+Note what is *not* on that list: unlike its predecessor, this guard does **not** stand down
+for a repo that ships another concurrent-writer hook. There is no version of this protocol
+that coexists with a guard permitting main-checkout writes. `install.py` removes such a hook
+from the settings file it is writing and says so; `--keep-legacy` opts out, and then you own
+the two-denials-one-action problem.
+
+It fails open on every question it cannot answer. Blocking the only writer in a tree over
+state it merely failed to read is the worse error, and it is the error that gets a hook
+deleted.
+
+## What it does not protect
+
+Honest limits, so nobody assumes cover that is not there.
+
+- **A human in an editor, or a plain `claude` CLI session**, writes without ever running
+  this hook. Nothing here stops a person editing the main checkout, and nothing should.
+- **A shell redirect into a file** — `echo x > file`, `sed -i`, a script that writes — is
+  not parsed. A parser guessing at shell semantics would be a worse hole than the one it
+  closed. The `git` rules cover the part that reaches history.
+- **`git -C "$W" commit`** is judged as a plain `commit` against the session's own tree,
+  because the `-C` read is textual and never expands a variable. Spell the path out when
+  you mean another tree.
+- **A PR merged through the web UI** leaves no `gh pr merge` for the guard to see, so that
+  worktree is never marked spent. The `Stop` hook still catches the unlanded case, and
+  `install.py --status` shows the tree as landed.
+- **Everything a worktree does not isolate** — ports, databases, build outputs, the work
+  item itself. Those are in `SKILL.md` and [ticketing.md](ticketing.md).
+
+## Cost
+
+Zero tokens when nothing is denied: the guard produces no output at all on the allow path.
+That path is one stat of `.git`, one small read of `HEAD`, and one stat of a marker file —
+no subprocess, no `git` call. The repository is located by walking up for `.git` rather than
+shelling out, precisely because a subprocess on every write-tool call is the one cost that
+cannot be amortised.
+
+Wall-clock is interpreter startup, roughly 75 ms per guarded tool call on Windows (the
+install registers `-S` to skip site initialisation, about 13% of that). Against a tool call
+that itself takes hundreds of milliseconds, that is the right trade.
+
+## Debugging
+
+```bash
+python scripts/install.py --status
+```
+
+```bash
+python scripts/test_guard.py
+```
+
+`--status` reports what is installed, which branch the repo integrates through, whether the
+cwd may write, and every worktree with what it is still holding. To see a decision directly,
+feed the guard a payload on stdin:
+
+```bash
+echo '{"session_id":"x","hook_event_name":"PreToolUse","cwd":".","tool_name":"Write","tool_input":{"file_path":"a.txt"}}' | python scripts/worktree_guard.py
+```
+
+Empty output means allowed. State is inert once the guard is uninstalled; delete
+`<repo>/.git/claude-worktree-gate/` if you want it gone.
+
+## Changing it
+
+Run `test_guard.py` after any change. Every case in it is either a failure someone actually
+hit or a false positive that would make someone delete the hook, and the second category is
+the one that matters — a denial that lands on ordinary work in a legitimate worktree spends
+trust the guard has to keep. Adding a subcommand to `MUTATORS` is cheap; broadening what
+counts as a write is not.
