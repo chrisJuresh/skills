@@ -88,11 +88,25 @@ gh pr view <n> --json state --jq .state    # expect MERGED
 git branch -D <short-topic-name>
 ```
 
-`--delete-branch` removes the branch from the remote, which is the part that matters. It
-also tries the local one, and fails when a worktree still has it checked out — which
-yours does — so free the worktree first with `ExitWorktree` and finish the local delete
-by hand. That order matters anyway: deleting a branch out from under a live worktree
-leaves the worktree on a detached HEAD and git unsure which of the two to believe.
+**`--delete-branch` is not reliable on its own, and it fails quietly.** It deletes the
+local branch first and the remote second, and when the local delete fails it **abandons
+the remote one** — so it leaves standing exactly the branch you asked it to remove. The
+local delete fails whenever a worktree still has the branch checked out, which yours does
+at merge time, so this is the *normal* case here rather than an edge one. Measured twice
+in one afternoon: `gh` reported only `failed to delete local branch`, and the remote
+branch was still listed after a pruning fetch.
+
+So verify, and finish by hand:
+
+```bash
+git fetch origin --prune
+git branch -r                                   # is it still there?
+git push origin --delete <short-topic-name>     # if so
+```
+
+Freeing the worktree before deleting the local branch is right anyway: deleting a branch
+out from under a live worktree leaves the worktree on a detached HEAD and git unsure
+which of the two to believe.
 
 **Use `-D`, and check the PR rather than the ancestry.** The instinct is `git branch -d`,
 because refusing to delete an unmerged branch sounds like exactly the safety check you
