@@ -344,8 +344,11 @@ def main() -> int:
             True,
         )
         check(
-            "it warns that ExitWorktree's remove is a no-op here",
-            'action: "keep"' in reason and "no-op" in reason,
+            # `action: "remove"` refuses on a worktree EnterWorktree only entered, which is
+            # every worktree here. A teardown message that recommends it costs the session a
+            # round trip at the one moment it is trying to stop.
+            "it names the ExitWorktree action that can take the tree down",
+            'action: "keep"' in reason and '"remove"' in reason,
             True,
         )
         for _ in range(2):
