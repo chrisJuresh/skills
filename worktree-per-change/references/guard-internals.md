@@ -124,9 +124,33 @@ writes `<git-common-dir>/claude-worktree-gate/spent/<worktree-name>.json`. Every
 
 The marker is written **before** the merge runs, because `PreToolUse` is the only hook that
 sees the command and there is no after-hook that can tell a merge from a merge that failed.
-A worktree marked spent by a merge that did not land is the harmless direction: the remedy
-is a new worktree, which is what the protocol wanted anyway. The escape, if you genuinely
-need the old tree back, is to delete its marker file.
+That stays, but it is not the harmless direction it was once described as. It was harmless
+while only the merging session saw it; the `Stop` block and the SessionStart sweep then began
+reporting it to *everybody*, and a record of an attempt read as a statement of fact.
+
+Measured on 2026-08-13, in the repo this guard came from: a PR the forge refused as `DIRTY`,
+its worktree holding an unresolved rebase and ten modified files, had a spent marker — so the
+sweep announced it to every new session as merged and asked for it to be removed, and the
+tree's own session had every edit denied on the grounds that its work was already delivered.
+Both are wrong in the expensive direction: the thing at stake is somebody's conflict
+resolution.
+
+So an **unfinished rebase, merge or cherry-pick outranks the marker**. `mid_operation()`
+stats the worktree's git dir for `rebase-merge`, `rebase-apply`, `MERGE_HEAD` and
+`CHERRY_PICK_HEAD` — no subprocess, because the sweep runs it per marker at every
+SessionStart — and where one is present `is_spent` returns nothing and the sweep stays quiet
+about the tree. A tree mid-conflict cannot be a delivered change, whatever a marker says.
+The wording moved with it: both messages now say a merge was *recorded* and name
+`gh pr view <n> --json state` as what confirms it.
+
+This does open a way past a marker that is telling the truth — start a rebase, then edit. It
+is a deliberate act rather than an accident, and it belongs with the shell redirect and the
+aliased `git` under [Limits](#limits): the guard exists to stop a session continuing a merged
+branch by mistake, not to win against one determined to. The alternative was a denial with no
+remedy a session can reach, which is the failure this hook has already been fixed for once.
+
+If you need the tree back and nothing is in progress, deleting the marker file is the escape,
+and it is the operator's — the same as the gate.
 
 What is spent is a **branch in a tree**, not a directory name. The file has to be named
 after something filesystem-safe and stable, and the leaf name is the only candidate — but a
@@ -230,8 +254,12 @@ Honest limits, so nobody assumes cover that is not there.
 - **`gh pr merge` is still matched against raw text**, unlike everything else here, so a PR
   body quoting that phrase marks the worktree spent. Deliberate: the mark is written
   *before* the merge runs anyway, because no hook can tell a merge from a merge that
-  failed, and a wrongly-spent tree costs a new worktree — which is what the protocol wanted
-  next regardless.
+  failed. What that costs is bounded above, under [Spent worktrees](#spent-worktrees) — an
+  in-progress rebase or merge overrides the marker, and both messages say a merge was
+  recorded rather than that one happened.
+- **An in-progress rebase suppresses the spent denial**, which a session could do on purpose
+  to keep editing a genuinely merged tree. Left open with the two above, and for the same
+  reason.
 - **A PR merged through the web UI** leaves no `gh pr merge` for the guard to see, so that
   worktree is never marked spent — no spent-edit denial, and no teardown prompt at `Stop`
   either, which makes it the one route by which a merged worktree still reaches the operator.

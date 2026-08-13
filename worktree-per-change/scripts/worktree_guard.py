@@ -270,7 +270,44 @@ def is_spent(common: Path, tree_root: Path, topic: str | None) -> dict | None:
     was = marker.get("branch")
     if isinstance(was, str) and topic is not None and was != topic:
         return None
+    # An unfinished rebase or merge outranks the marker, because the marker is written
+    # before `gh pr merge` runs and a refused merge leaves the same one. Conflict
+    # resolution is a tree full of edits, every one of which this denial would refuse
+    # while telling the session its work was already delivered — and there is no remedy
+    # it could print, since the gate is the operator's and a fresh worktree abandons the
+    # conflict. Measured on 2026-08-13 against a `DIRTY` PR whose merge was refused.
+    #
+    # It does open a way past a *true* marker: start a rebase, then edit. That is a
+    # deliberate act, not an accident, and it sits with the redirect and the aliased
+    # `git` in "Limits" — the guard is here to stop a session continuing a merged branch
+    # by mistake, not to win against one determined to.
+    if mid_operation(tree_root):
+        return None
     return marker
+
+
+def mid_operation(tree: Path) -> bool:
+    """Whether a rebase, merge or cherry-pick is unfinished in this worktree.
+
+    Stat-only, and deliberately so: this runs over every spent marker at SessionStart, and
+    the one thing the guard may not become is a `git` subprocess on a path it takes
+    routinely. Git records an in-progress operation as state inside the worktree's own git
+    dir, so its presence is the whole test.
+
+    What it is for: a tree in this condition cannot be a delivered change, whatever a
+    marker says about it. Conflict resolution is the work, and it is happening now.
+    """
+    try:
+        pointer = (tree / ".git").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not pointer.startswith("gitdir:"):
+        return False
+    git_dir = Path(pointer.split(":", 1)[1].strip())
+    return any(
+        (git_dir / name).exists()
+        for name in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")
+    )
 
 
 def sweep_spent(common: Path) -> list[str]:
@@ -285,6 +322,15 @@ def sweep_spent(common: Path) -> list[str]:
     by the worktree's *leaf name*, so a stale one denies the first edit in the next
     worktree that happens to be named the same — a fresh tree reported as already merged,
     which is the most confusing denial this guard can produce.
+
+    A tree mid-rebase is left out of the list entirely, and its marker is left alone. The
+    marker is written *before* `gh pr merge` runs, so a merge that failed leaves exactly the
+    same file as one that landed; measured on 2026-08-13, a `DIRTY` PR whose merge was
+    refused had a spent marker, an unresolved rebase and ten modified files, and this sweep
+    named it to every new session as merged and asked for it to be removed. Being wrong in
+    that direction costs somebody else's conflict resolution, which is the most expensive
+    thing this hook could destroy, so the in-progress trees are the ones it stays quiet
+    about.
     """
     standing = []
     try:
@@ -299,7 +345,8 @@ def sweep_spent(common: Path) -> list[str]:
         if not isinstance(tree, str) or not tree:
             continue
         if Path(tree).is_dir():
-            standing.append(tree)
+            if not mid_operation(Path(tree)):
+                standing.append(tree)
         else:
             try:
                 marker.unlink()
@@ -732,8 +779,11 @@ def block_stop_cleanup(tree: Path, branch: str, topic: str | None, marker: dict)
         {
             "decision": "block",
             "reason": (
-                f"This worktree's change has landed ({landed}) and the worktree is still "
-                "standing. Taking it down is part of finishing, not an errand to hand over: "
+                f"This worktree recorded a merge ({landed}) and is still standing. Step 1 "
+                "below is what confirms it: the record is written before the merge runs, so "
+                "a merge the forge refused leaves the same one. If it did not land, finish "
+                "the change instead — do not take the tree down.\n\n"
+                "Otherwise, taking it down is part of finishing, not an errand to hand over: "
                 "a worktree with no live branch is a stale checkout, a merged branch is a "
                 "push target after the PR that reviewed it has closed, and either one left "
                 "behind costs the next session a status check before it can trust what it "
@@ -827,12 +877,17 @@ def main() -> None:
         standing = sweep_spent(common)
         if standing:
             context += (
-                "\n\nLanded worktrees still on disk, left by an earlier session:\n"
+                "\n\nWorktrees still on disk that recorded a merge, left by an earlier "
+                "session:\n"
                 + "\n".join(f"- {path}" for path in standing)
-                + "\nEach one's PR has merged. Remove the ones that are yours — "
-                "`git worktree remove <path>` then `git branch -D <branch>`, from the main "
-                "checkout. A worktree another session is holding is its business even after "
-                "its branch merges: leave it, and say it is there."
+                + "\nEach ran `gh pr merge` from inside itself. That is recorded *before* "
+                "the merge, so a merge the forge refused leaves the same record as one that "
+                "landed — confirm with `gh pr view <n> --json state` before removing "
+                "anything, and treat uncommitted changes as a merge that did not land. Then "
+                "`git worktree remove <path>` and `git branch -D <branch>`, from the main "
+                "checkout, for the ones that are yours. A worktree another session is "
+                "holding is its business even after its branch merges: leave it, and say it "
+                "is there."
             )
         emit(
             {

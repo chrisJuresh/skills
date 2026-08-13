@@ -97,7 +97,7 @@ worktree-per-change/
   scripts/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
-    test_guard.py                              78 checks against real git repos in a temp dir
+    test_guard.py                              101 checks against real git repos in a temp dir
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against
