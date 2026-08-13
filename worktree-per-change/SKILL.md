@@ -127,13 +127,32 @@ at merge time, so this is the *normal* case here rather than an edge one. Measur
 in one afternoon: `gh` reported only `failed to delete local branch`, and the remote
 branch was still listed after a pruning fetch.
 
-So verify, and finish by hand:
+So verify, and finish by hand — asking the **remote**, not a tracking ref:
 
 ```bash
-git fetch origin --prune
-git branch -r                                   # is it still there?
-git push origin --delete <short-topic-name>     # if so
+git ls-remote --heads origin <short-topic-name>   # is it still there?
+git push origin --delete <short-topic-name>       # if so
 ```
+
+**Not `git fetch --prune` then `git branch -r`**, which is what this recipe used to say, and
+which is wrong twice over. `git branch -r` reads *tracking* refs, so it answers out of a
+local cache rather than from the remote. And the fetch that refreshes that cache is the step
+likeliest to fail at exactly this moment: `git fetch` compare-and-swaps every tracking ref it
+touches, so anything that moved the integration branch underneath it fails the **whole**
+fetch with `cannot lock ref … is at X but expected Y` — and merging your own PR moves
+precisely that ref, so under this protocol it is the common case rather than a rare race.
+`git branch -r` then answers from stale data, and the reading that costs you is the confident
+one: the branch looks already gone, you skip the delete, and it is still standing. Measured
+twice in one afternoon, on top of the `--delete-branch` failure above. `git ls-remote` asks
+the remote and cannot be stale.
+
+If you wrap this teardown in a script, keep the refresh — if you keep one at all — **out of
+the failure path**. Under `set -e` a failed fetch aborts the run *after* the worktree and
+local branch are gone and *before* the remote delete, which is the worst available ordering:
+the destructive half has happened, the tidying half has not, and the exit code arrives too
+late to mean anything. A genuinely unreachable remote is the one case worth failing on, and
+worth failing loudly, because then the branch's fate is unknowable rather than merely
+unrefreshed.
 
 Freeing the worktree before deleting the local branch is right anyway: deleting a branch
 out from under a live worktree leaves the worktree on a detached HEAD and git unsure

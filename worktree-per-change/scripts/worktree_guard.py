@@ -617,11 +617,14 @@ def cleanup_steps(tree: Path | str, topic: str | None) -> str:
         f"3. `git worktree remove {tree}` — from the main checkout, which is where it is "
         "allowed and the only place it can run. Nothing can remove the tree it is "
         "standing in.\n"
-        f"4. `git branch -D {name}`, then `git fetch origin --prune && git branch -r` and "
-        f"`git push origin --delete {name}` if the remote branch is still listed. "
+        f"4. `git branch -D {name}`, then `git ls-remote --heads origin {name}` and "
+        f"`git push origin --delete {name}` if that prints anything. "
         "`--delete-branch` deletes the local branch first and abandons the remote one when "
         "that fails, which is the normal case here because your worktree still has the "
-        "branch checked out at merge time."
+        "branch checked out at merge time. Ask the REMOTE, not `git branch -r` behind a "
+        "pruning fetch: merging your own PR moves the integration branch, so that fetch is "
+        "the one likely to die on `cannot lock ref`, and then either it takes the check down "
+        "with it or the check answers from a stale cache and the branch looks already gone."
     )
 
 
