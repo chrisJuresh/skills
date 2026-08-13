@@ -110,9 +110,10 @@ git branch -D <short-topic-name>
 
 **Do not use `ExitWorktree` with `action: "remove"` for this.** It removes only a
 worktree `EnterWorktree` *itself* created, and under this protocol the tree is made with
-`git worktree add` and entered by `path` — explicitly out of its scope. It reports success
-either way, so a session that used it believes it cleaned up and the tree is still there.
-Ask for `"keep"`, then remove the tree with git.
+`git worktree add` and entered by `path` — out of its scope. Measured: it refuses, saying
+the session does not own the worktree and to use `action: "keep"`, and it names the other
+cause too — another live session holding that tree's liveness lock, where git will refuse
+as well and tell you the owner. Ask for `"keep"`, then remove the tree with git.
 
 The order is forced: nothing can remove the working tree it is standing in, and from
 inside a worktree Claude Code refuses `git -C <main>` redirects back out. So the exit

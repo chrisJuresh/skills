@@ -354,10 +354,12 @@ ESCAPE = (
 def cleanup_steps(tree: Path | str, topic: str | None) -> str:
     """How a landed worktree comes down, spelled out because two of the four steps trap.
 
-    `ExitWorktree` with `action: "remove"` is the one everybody reaches for and it does
-    nothing here: it only removes a worktree EnterWorktree *itself* created, and under
-    this protocol the tree is made with `git worktree add` and entered by path. It reports
-    success either way, which is how a session comes to believe it cleaned up.
+    `ExitWorktree` with `action: "remove"` is the one everybody reaches for, and it cannot
+    do this job: it removes only a worktree EnterWorktree *itself* created, where under this
+    protocol the tree is made with `git worktree add` and entered by path. Measured — it
+    refuses outright, saying the session does not own the worktree and to use `"keep"`. So
+    the cost is a wasted call rather than a tree that quietly stays, and asking for `"keep"`
+    up front is what turns four steps into four steps instead of five.
     """
     name = topic or "<branch>"
     return (
@@ -367,8 +369,8 @@ def cleanup_steps(tree: Path | str, topic: str | None) -> str:
         "negatives.\n"
         '2. `ExitWorktree` with `action: "keep"` — it returns the session to the main '
         'checkout. **Not `"remove"`**: that removes only a worktree EnterWorktree created '
-        "itself, so for a `git worktree add` tree entered by path it is a no-op that "
-        "reports success and leaves the tree standing.\n"
+        "itself, and refuses on one it merely entered by path, so it cannot take this tree "
+        "down.\n"
         f"3. `git worktree remove {tree}` — from the main checkout, which is where it is "
         "allowed and the only place it can run. Nothing can remove the tree it is "
         "standing in.\n"
