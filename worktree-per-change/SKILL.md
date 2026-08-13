@@ -206,15 +206,23 @@ edit needed to resolve the conflict was denied as work already delivered. "Resyn
 upstream moves" was written down and had nothing to say *when*, because nothing recorded which
 upstream commit the copy came from.
 
-So record it and check it. Put the source, the upstream commit and a hash beside the branch
-name in `.claude/worktree-per-change.json`:
+So record it and check it. `install.py` writes the record itself, beside the branch name in
+`.claude/worktree-per-change.json`, because it is the only thing that knows both halves at
+the one moment they are both true — a hand-written record is right once and silently wrong
+from the next resync on, which is this same failure one level up:
 
 ```json
 { "integrationBranch": "queue",
   "guard": { "source": "…/worktree_guard.py", "syncedFrom": "<sha>", "sha256": "<hash>" } }
 ```
 
-Then a check in the repo's gate asks two questions, and only the first is answerable on a CI
+It merges rather than replaces, so re-running it to resync keeps the branch and anything
+else the repo keeps in that file. `syncedFrom` is absent when the skill directory is not a
+git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
+sha is not.
+
+The record is what makes the copy checkable; the checking is still the repo's to do. A
+check in its gate asks two questions, and only the first is answerable on a CI
 runner: **does the committed file match its record** (offline — catches an edit in place, since
 the copy is not the repo's to edit, and a resync that forgot to record itself), and **has
 upstream moved** (needs a clone, so it must *skip out loud* rather than fail — a check that goes

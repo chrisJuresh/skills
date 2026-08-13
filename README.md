@@ -38,9 +38,13 @@ Read the diff it prints, then run it without `--dry-run`. Per repository is the 
 install, because the rule depends on what that repository's branches mean. It copies the
 guard to `.claude/hooks/`, registers three hooks (`PreToolUse`, `SessionStart`, `Stop`) in
 the committed `.claude/settings.json`, writes `.claude/worktree-per-change.json` with the
-integration branch, and links the skill into `~/.claude/skills/` so `/worktree-per-change`
-resolves everywhere. Commit all three, and check `.gitignore` is not swallowing them — a
-worktree only gets a file if git puts it there.
+integration branch and the provenance of the copy it just made, and links the skill into
+`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three, and
+check `.gitignore` is not swallowing them — a worktree only gets a file if git puts it
+there.
+
+Re-running it is how a repo resyncs. The config file is merged rather than replaced, so
+the branch, the provenance and anything else that repo keeps beside them all survive.
 
 New hooks apply to sessions started afterwards, not the one you are in.
 
@@ -97,7 +101,8 @@ worktree-per-change/
   scripts/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
-    test_guard.py                              101 checks against real git repos in a temp dir
+    test_guard.py                              104 checks on what the hook decides
+    test_install.py                            25 checks on what the installer leaves on disk
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against
@@ -105,6 +110,12 @@ worktree-per-change/
 
 ### Tests
 
+Both run against real git repositories in a temp dir, and need nothing but git.
+
 ```bash
 python worktree-per-change/scripts/test_guard.py
+```
+
+```bash
+python worktree-per-change/scripts/test_install.py
 ```
