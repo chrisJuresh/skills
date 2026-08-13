@@ -125,6 +125,20 @@ def build(root: Path) -> tuple[Path, Path, Path]:
     return main, topic, onbase
 
 
+def worktree_at(repo: Path, name: str, branch: str, merged: bool = True) -> Path:
+    """A worktree at `<repo>/.claude/worktrees/<name>`, by default one that has merged.
+
+    `merged=True` runs the merge through the guard rather than writing the marker file
+    directly: the marker's shape is the guard's business, and a fixture that hand-rolls it
+    passes while the real thing is broken.
+    """
+    tree = repo / ".claude" / "worktrees" / name
+    git(repo, "worktree", "add", str(tree), "-b", branch, "development")
+    if merged:
+        run(shell(tree, "gh pr merge --squash --delete-branch"))
+    return tree
+
+
 # --------------------------------------------------------------------------- cases
 
 
@@ -313,6 +327,63 @@ def main() -> int:
             "SessionStart states the protocol",
             "EnterWorktree" in json.dumps(started or {}) and "development" in json.dumps(started or {}),
             True,
+        )
+
+        # --- cleanup, the other half of finishing --------------------------------
+        # Delivery had two hooks and the teardown had a paragraph in a doc, so the
+        # worktrees piled up: the change lands, the reply is truthful, and a stale
+        # checkout plus a live push target stay behind for the next session to work
+        # out the status of.
+        landed = worktree_at(repo,"landed-tree", "dev/landed")
+        stopped = run({"session_id": "c1", "hook_event_name": "Stop", "cwd": str(landed)})
+        check("Stop blocks in a worktree whose PR merged", decision(stopped), "block")
+        reason = (stopped or {}).get("reason", "")
+        check(
+            "the block says how to take the tree down",
+            "git worktree remove" in reason and "git branch -D dev/landed" in reason,
+            True,
+        )
+        check(
+            "it warns that ExitWorktree's remove is a no-op here",
+            'action: "keep"' in reason and "no-op" in reason,
+            True,
+        )
+        for _ in range(2):
+            run({"session_id": "c2", "hook_event_name": "Stop", "cwd": str(landed)})
+        check(
+            "it gives up rather than trapping a session that will not clean up",
+            decision(run({"session_id": "c2", "hook_event_name": "Stop", "cwd": str(landed)})),
+            "allow",
+        )
+
+        swept = run({"session_id": "c3", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        check(
+            "SessionStart reports a landed worktree still on disk",
+            str(landed) in json.dumps(swept or {}),
+            True,
+        )
+
+        # A marker is named after the worktree's LEAF NAME, so it outlives the tree.
+        # Left in place it denies the first edit in the next worktree to take that
+        # name — a fresh checkout told its change has already landed.
+        git(repo, "worktree", "remove", "--force", str(landed))
+        git(repo, "branch", "-D", "dev/landed")
+        run({"session_id": "c4", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        recycled = worktree_at(repo,"landed-tree", "dev/landed-again", merged=False)
+        check(
+            "a reused worktree name is not spent",
+            decision(run(write(recycled, str(recycled / "README.md")))),
+            "allow",
+        )
+
+        # The sweep must not amount to forgetting everything: reusing the tree that
+        # merged is the failure the marker exists for.
+        still = worktree_at(repo,"still-spent", "dev/still-spent")
+        run({"session_id": "c5", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        check(
+            "the branch that actually merged is still refused",
+            decision(run(write(still, str(still / "README.md")))),
+            "deny",
         )
 
     print(f"{PASSED} passed, {len(FAILED)} failed")

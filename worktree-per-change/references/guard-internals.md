@@ -32,6 +32,11 @@ Everything else proceeds: every read, every `push`, `fetch`, `log`, `diff`, `sta
 worktree on its own branch — which is where all the work happens, so the guard is silent
 for the whole of a normal change.
 
+`worktree` and `branch` being on that list is load-bearing, not incidental: the teardown
+(`git worktree remove <path>`, `git branch -D <branch>`) runs **in the main checkout**,
+because nothing can remove the tree it is standing in. A guard that denied those would deny
+the last step of its own protocol.
+
 Writes to paths **outside** the repository are not the repository's business and are
 allowed from anywhere: a scratchpad file, a note in `~/.claude/`, another repo entirely.
 
@@ -63,6 +68,15 @@ A worktree marked spent by a merge that did not land is the harmless direction: 
 is a new worktree, which is what the protocol wanted anyway. The escape, if you genuinely
 need the old tree back, is to delete its marker file.
 
+What is spent is a **branch in a tree**, not a directory name. The file has to be named
+after something filesystem-safe and stable, and the leaf name is the only candidate — but a
+leaf name is not unique (`../hermes-dev-x` and `.claude/worktrees/hermes-dev-x`) and, once
+teardown is routine, it gets **reused**: same obvious name, cut again off the integration
+branch, for the next change. So the marker records the tree path and the branch, and
+`is_spent` requires both to match before it applies. A marker with no `branch` field predates
+the field and still means what it said. Without this, cleaning up properly earns a fresh
+worktree the strangest denial the guard can produce: *your change has already landed*.
+
 State lives in the **common** git directory — the one every worktree shares, found through
 the `commondir` pointer — so all the trees read the same markers, and so nothing the guard
 writes can ever show up in `git status`.
@@ -73,6 +87,20 @@ writes can ever show up in `git status`.
 commits that `origin/<integration>` has not got, and names which. That is the only place
 the guard shells out to git: `status --porcelain` and `rev-list --count`, once per stop
 attempt, never on the write path.
+
+It refuses just as firmly when the tree's PR **has** merged and the tree is still standing,
+printing the four teardown commands. That is the half of the protocol nothing used to hold —
+delivery had two hooks, the teardown had a paragraph in a doc — and its failure is silent:
+the change landed, the reply is true, and a stale checkout plus a live push target stay
+behind. The spent check runs **before** the unlanded-work check, because a squash merge
+leaves none of the branch's own commits in `origin/<integration>`, so a landed tree can also
+read as holding unpushed work; telling a session to push what it has already merged is the
+one wrong answer available here.
+
+`SessionStart` closes the gap `Stop` cannot: a session that crashed or was killed never
+reaches it. It lists landed worktrees still on disk — invisible otherwise, since a merged
+worktree looks exactly like an in-progress one in `git worktree list` — and, in the same
+pass, deletes markers whose tree is gone.
 
 It blocks at most **twice** per session and then lets the session end. A hook that can block
 forever hangs a session, and an agent that has ignored the same instruction twice will not
@@ -124,8 +152,10 @@ Honest limits, so nobody assumes cover that is not there.
   because the `-C` read is textual and never expands a variable. Spell the path out when
   you mean another tree.
 - **A PR merged through the web UI** leaves no `gh pr merge` for the guard to see, so that
-  worktree is never marked spent. The `Stop` hook still catches the unlanded case, and
-  `install.py --status` shows the tree as landed.
+  worktree is never marked spent — no spent-edit denial, and no teardown prompt at `Stop`
+  either, which makes it the one route by which a merged worktree still reaches the operator.
+  The `Stop` hook still catches the unlanded case, and `install.py --status` shows the tree as
+  landed.
 - **Everything a worktree does not isolate** — ports, databases, build outputs, the work
   item itself. Those are in `SKILL.md` and [ticketing.md](ticketing.md).
 
