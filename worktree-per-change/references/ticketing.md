@@ -86,8 +86,30 @@ does not tick the acceptance criteria, and does not act on what `code-review` fo
 dependency chain that matters more than it sounds, because the frontier is defined by closed
 blockers — if nothing gets closed, nothing ever becomes visibly unblocked and the other
 agents have nothing to pick up. So close it yourself, with a comment naming the branch and
-what a reader can now see, and let the dependents unblock themselves. Do not edit another
-ticket's body to record that this one is done.
+what a reader can now see. Do not edit another ticket's body to record that this one is done.
+
+**"Let the dependents unblock themselves" is a property of the tracker, not a rule.** It
+holds on GitHub, where `blocked_by` is *computed* from the blockers' open/closed state, so
+closing one moves the frontier in the very next query and nobody has to touch a dependent.
+It fails on a tracker where the dependency is a link and readiness is a separate field that
+nothing watches — Jira issue links beside a status column, most obviously. There the
+frontier is a fiction: a dependent stays parked in the not-ready status long after the thing
+blocking it shipped, and the failure is invisible, because nobody ever sees a ticket that
+was never promoted. So on that kind of tracker, **promoting the dependents is part of
+finishing**: read what this ticket blocks, and move each one whose blockers are all clear.
+
+Two consequences worth stating, because they are the ones that bite:
+
+- **Check which kind of tracker this is before trusting the frontier**, from the file above.
+  A frontier query that returns nothing looks the same on both.
+- **Do not test "clear" as "closed" if agents cannot close.** Where a completion status is
+  reserved for a human — a review gate, a QA sign-off — an agent's own tickets never reach
+  it, so a closed-only test promotes nothing, ever, and reads as a quiet no-op. The test
+  that works is whether the blocker's **code has landed**: merged, and present in the branch
+  the dependent will be cut from. Be conservative at the edges: a status you do not
+  recognise should read as still blocking, since the cost of that is a human releasing one
+  ticket, while the cost of the opposite is an agent building against a dependency that is
+  not there.
 
 `code-review` reviews `git diff <fixed-point>...HEAD`, which excludes staged and
 working-tree changes — commit first, or it has nothing to look at. In a worktree the fixed
