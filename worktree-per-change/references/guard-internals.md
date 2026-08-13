@@ -210,9 +210,9 @@ Honest limits, so nobody assumes cover that is not there.
 Zero tokens when nothing is denied: the guard produces no output at all on the allow path.
 That path is one stat of `.git`, one small read of `HEAD`, and one stat of a marker file —
 no subprocess, no `git` call. Resolving a *named* target adds a second `.git` walk and one
-small read of `commondir`, and only for the calls that name one. The repository is located by walking up for `.git` rather than
-shelling out, precisely because a subprocess on every write-tool call is the one cost that
-cannot be amortised.
+small read of `commondir`, and only for the calls that name one. The repository is located
+by walking up for `.git` rather than shelling out, precisely because a subprocess on every
+write-tool call is the one cost that cannot be amortised.
 
 Wall-clock is interpreter startup, roughly 75 ms per guarded tool call on Windows (the
 install registers `-S` to skip site initialisation, about 13% of that). Against a tool call

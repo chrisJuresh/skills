@@ -481,10 +481,14 @@ def main() -> int:
         landed = worktree_at(repo,"landed-tree", "dev/landed")
         stopped = run({"session_id": "c1", "hook_event_name": "Stop", "cwd": str(landed)})
         check("Stop blocks in a worktree whose PR merged", decision(stopped), "block")
-        reason = (stopped or {}).get("reason", "")
+        # A Stop block carries its message at the top level, not in the
+        # `permissionDecisionReason` the `reason()` helper reads, so it is pulled out
+        # by hand here — and under a name of its own, since binding `reason` would
+        # shadow that helper for the whole function.
+        teardown = (stopped or {}).get("reason", "")
         check(
             "the block says how to take the tree down",
-            "git worktree remove" in reason and "git branch -D dev/landed" in reason,
+            "git worktree remove" in teardown and "git branch -D dev/landed" in teardown,
             True,
         )
         check(
@@ -492,7 +496,7 @@ def main() -> int:
             # every worktree here. A teardown message that recommends it costs the session a
             # round trip at the one moment it is trying to stop.
             "it names the ExitWorktree action that can take the tree down",
-            'action: "keep"' in reason and '"remove"' in reason,
+            'action: "keep"' in teardown and '"remove"' in teardown,
             True,
         )
         for _ in range(2):
