@@ -71,6 +71,17 @@ def reason(output: dict | None) -> str:
     return ((output or {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
 
 
+def spent_marker_for(repo: Path, tree: Path) -> Path:
+    """Where the guard writes `tree`'s spent marker — recomputed, not imported.
+
+    The point of asserting the denial spells this path out is that a session can act on it,
+    so the test derives it the same way a reader would (state lives in the COMMON git dir,
+    keyed by the worktree's leaf name) rather than calling the function under test and
+    agreeing with whatever it says.
+    """
+    return repo / ".git" / "claude-worktree-gate" / "spent" / f"{tree.name}.json"
+
+
 def check(name: str, got, want) -> None:
     global PASSED
     if got == want:
@@ -676,10 +687,35 @@ def main() -> int:
         # every new session as merged, with a request to remove the tree. Conflict
         # resolution is the most expensive thing this hook could destroy.
         refused = worktree_at(repo, "refused-tree", "dev/refused")
+        refused_write = run(write(refused, str(refused / "a.txt")))
         check(
             "a spent tree refuses a write while nothing is in progress",
-            decision(run(write(refused, str(refused / "a.txt")))),
+            decision(refused_write),
             "deny",
+        )
+
+        # ...and that refusal has to carry its own doubt. `mid_operation` covers the common
+        # shape — a conflict, so a rebase — but a merge refused for a FAILING CHECK leaves no
+        # rebase and lands here, where the text is the only thing a session gets. Measured
+        # 2026-08-13: a session read the old wording ("this worktree's change has already
+        # landed") as fact, believed its work was delivered, and spent two turns reporting a
+        # guard bug rather than clearing a marker. Three things make that recoverable, so
+        # three checks — the claim is hedged, the forge is named as the arbiter, and the
+        # marker path is spelled out.
+        check(
+            "the spent denial does not assert the merge landed",
+            "has already landed" in reason(refused_write),
+            False,
+        )
+        check(
+            "the spent denial names the check that settles it",
+            "gh pr view" in reason(refused_write),
+            True,
+        )
+        check(
+            "the spent denial names the marker to remove",
+            str(spent_marker_for(repo, refused)) in reason(refused_write),
+            True,
         )
         leave_unfinished_rebase(onbase, refused)
         check(

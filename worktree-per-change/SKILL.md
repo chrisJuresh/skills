@@ -195,6 +195,36 @@ A repo that commits the hook should also test it, in its own test suite and idio
 committed copy is what actually runs, and a hook that silently stopped denying looks
 exactly like a hook that had nothing to deny.
 
+**And it should gate the copy's provenance, which is a different failure.** A committed hook is
+a fork the moment this skill moves, and a stale one is the one kind of broken hook that *still
+looks like it works*: it denies confidently and prints a remedy that no longer fits. Its own
+suite will not catch that, because the suite was copied at the same time and is equally old.
+
+Measured 2026-08-13. A downstream repo's copy was one release behind the fix for exactly the
+failure it then hit — a `gh pr merge` the forge refused marked the tree as landed, and every
+edit needed to resolve the conflict was denied as work already delivered. "Resync it when
+upstream moves" was written down and had nothing to say *when*, because nothing recorded which
+upstream commit the copy came from.
+
+So record it and check it. Put the source, the upstream commit and a hash beside the branch
+name in `.claude/worktree-per-change.json`:
+
+```json
+{ "integrationBranch": "queue",
+  "guard": { "source": "…/worktree_guard.py", "syncedFrom": "<sha>", "sha256": "<hash>" } }
+```
+
+Then a check in the repo's gate asks two questions, and only the first is answerable on a CI
+runner: **does the committed file match its record** (offline — catches an edit in place, since
+the copy is not the repo's to edit, and a resync that forgot to record itself), and **has
+upstream moved** (needs a clone, so it must *skip out loud* rather than fail — a check that goes
+red over a clone nobody has is a gate nobody can turn green, and the first person to hit it
+deletes the step). Print the skip as `UNVERIFIED`, never as a pass: the whole failure above was
+something unverified reading as fine. `integration-console`'s
+[`scripts/check-guard.mjs`](https://github.com/third-bridge/hermes-frontend) is a worked
+example. Don't fetch this repo from CI — that puts a third-party's availability on a required
+check — and don't auto-resync, because the suite has to run against the new file first.
+
 ## Installing it
 
 Per repository is the usual install, because the rule depends on what that repository's
