@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -177,6 +178,39 @@ def write_json(path: Path, blob: dict, backup: bool) -> None:
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(body, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def provenance(script: Path) -> dict:
+    """Where the copy at `script` came from — source, upstream commit, hash.
+
+    A committed guard is a fork the moment this skill moves, and a stale one is the
+    kind of broken hook that still looks like it works: it denies confidently and
+    prints a remedy that no longer fits. Recording which commit the copy came from is
+    what lets a repo's own gate ask whether it has drifted.
+
+    The installer writes it because the installer is the only thing that knows both
+    halves at once, and knows them at the only moment they are both true. Left to a
+    human step it is written once and then silently wrong from the next resync on —
+    which is the same failure one level up.
+
+    Every field is best-effort. A skill directory that is not a git checkout still
+    installs; it just cannot say which commit it was, and an absent `syncedFrom` is
+    honest where a stale one is not.
+    """
+    where = f"{SKILL_NAME}/scripts/{GUARD_SOURCE.name}"
+    record: dict = {"source": where}
+    origin = git(SKILL_SOURCE, "remote", "get-url", "origin")
+    if origin:
+        stem = origin[: -len(".git")] if origin.endswith(".git") else origin
+        record["source"] = f"{stem} {where}"
+    head = git(SKILL_SOURCE, "rev-parse", "HEAD")
+    if head:
+        record["syncedFrom"] = head
+    try:
+        record["sha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    return record
 
 
 # ------------------------------------------------------------------------- status
@@ -353,7 +387,10 @@ def main() -> int:
     if args.dry_run:
         print(f"would copy  {GUARD_SOURCE}\n        ->  {script}")
         if config is not None:
-            print(f"would write {config}  ->  integrationBranch = {branch}")
+            # The hash is of the file that WOULD be copied, so the dry run shows the record
+            # the real run will write rather than a placeholder for it.
+            print(f"would write {config}  ->  integrationBranch = {branch}, "
+                  f"guard = {json.dumps(provenance(GUARD_SOURCE))}")
         for line in removed:
             print(f"would remove predecessor guard  {line}")
         if not args.no_skill:
@@ -364,8 +401,17 @@ def main() -> int:
     script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(GUARD_SOURCE, script)
     if config is not None:
-        write_json(config, {"integrationBranch": branch}, backup=False)
-        print(f"config  -> {config} (integrationBranch = {branch})")
+        # Merged into what is there rather than written over it. The file is the repo's,
+        # not this installer's: it carries the branch, the provenance below, and whatever
+        # else that repo decided belongs beside them, and a resync is exactly the moment
+        # a replace would drop the lot.
+        blob = load(config)
+        blob["integrationBranch"] = branch
+        blob["guard"] = provenance(script)
+        write_json(config, blob, backup=False)
+        synced = blob["guard"].get("syncedFrom")
+        print(f"config  -> {config} (integrationBranch = {branch}"
+              f"{', syncedFrom ' + synced[:12] if synced else ''})")
     for line in removed:
         print(f"removed predecessor guard  {line}")
     write_json(target, settings, backup=True)
