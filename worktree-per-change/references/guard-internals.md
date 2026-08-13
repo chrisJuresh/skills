@@ -40,6 +40,39 @@ the last step of its own protocol.
 Writes to paths **outside** the repository are not the repository's business and are
 allowed from anywhere: a scratchpad file, a note in `~/.claude/`, another repo entirely.
 
+## Which tree a rule is judged against
+
+The tree the operation **targets** — never the directory the session happens to sit in.
+Those differ constantly, and where they differ the session's own status is the wrong answer:
+
+| The operation names | Judged as |
+|---|---|
+| nothing (`git commit`, a relative `file_path`) | the session's own tree — what an ordinary command means |
+| `cd <path> && git …`, `git -C <path>` | the tree containing `<path>` |
+| an absolute `file_path` | the tree containing that file |
+| a target this hook cannot read — `$VAR`, a backtick, a glob, `cd -` | the session's own tree, because guessing at a shell expansion is worse than being strict about the tree the guard is there to protect |
+
+`cd` and `-C` compose left to right, and `~` is expanded because that expansion is
+deterministic and needs no shell.
+
+Two consequences, and they pull in opposite directions on purpose:
+
+- **Another repository is not this repository's rule.** `cd ~/other-repo && git add -A`
+  passes. It was denied until 2026-08-13, on nothing but the session's cwd, and that denial
+  was unfollowable as well as wrong: the remedy it printed named an integration branch the
+  other repo did not have. `Write` to that same path was allowed throughout, which is what
+  showed the asymmetry was an oversight rather than a decision.
+- **Naming the guarded tree from elsewhere buys no exemption.** `git -C <main-checkout>
+  commit` from inside a worktree, or a `Write` to an absolute path in the main checkout, is
+  denied wherever it was issued. Both were allowed before the same change.
+
+"The same repository" is the shared **common git dir**, not a path prefix: linked worktrees
+live *inside* the main checkout's tree, so a prefix test reads every worktree as the main
+checkout and an unrelated clone sitting inside it as this repo's business. Paths are
+compared with symlinks resolved — measured on macOS, a repo under `/var/folders/…` records
+its worktrees' git dir as `/private/var/…`, and an unresolved comparison reads one
+repository as two, which stands the guard down on the tree it is protecting.
+
 ## How it tells a worktree from the main checkout
 
 `.git` is a **directory** in the main checkout and a **file** holding a `gitdir:` pointer
@@ -123,11 +156,20 @@ sends every PR at the wrong target and every new worktree at the wrong base.
 the reason it would have denied, which is how to watch what a repo would block before
 committing to it — and `off`.
 
+Both variables are read from the **hook's** environment, which is the Claude Code process's,
+so they are the operator's switches and not a session's. A `CLAUDE_WORKTREE_GATE=off git add
+…` prefix sets the variable for that one command, after the hook that vetted the command has
+already run and denied it — verified, not assumed. Setting it for real means the environment
+Claude Code starts in, or a settings `env` block, and it applies to sessions started
+afterwards. The denial text says so, because a message that tells a session to flip a switch
+it cannot reach costs a turn to disprove and teaches the reader the guard can be argued with.
+
 ## Where it stands down
 
 - `CLAUDE_WORKTREE_GATE=off`;
 - `cwd` is not inside a git repository, or the git metadata will not resolve;
-- the payload has no `cwd`, or does not parse.
+- the payload has no `cwd`, or does not parse;
+- the operation targets another repository, or no repository at all.
 
 Note what is *not* on that list: unlike its predecessor, this guard does **not** stand down
 for a repo that ships another concurrent-writer hook. There is no version of this protocol
@@ -148,9 +190,13 @@ Honest limits, so nobody assumes cover that is not there.
 - **A shell redirect into a file** — `echo x > file`, `sed -i`, a script that writes — is
   not parsed. A parser guessing at shell semantics would be a worse hole than the one it
   closed. The `git` rules cover the part that reaches history.
-- **`git -C "$W" commit`** is judged as a plain `commit` against the session's own tree,
-  because the `-C` read is textual and never expands a variable. Spell the path out when
+- **`git -C "$W" commit`** is judged against the session's own tree, because the `-C` read
+  is textual and never expands a variable. A literal path *is* honoured; spell it out when
   you mean another tree.
+- **A `git` call reached indirectly** — through a script, a `sh -c '…'` string, an alias, a
+  variable holding the word `git` — is not seen at all, because the parser reads tokens and
+  those hide the token. The same limit as the shell redirect above, and the same answer: a
+  parser that guessed at shell semantics would be the bigger hole.
 - **A PR merged through the web UI** leaves no `gh pr merge` for the guard to see, so that
   worktree is never marked spent — no spent-edit denial, and no teardown prompt at `Stop`
   either, which makes it the one route by which a merged worktree still reaches the operator.
@@ -163,9 +209,10 @@ Honest limits, so nobody assumes cover that is not there.
 
 Zero tokens when nothing is denied: the guard produces no output at all on the allow path.
 That path is one stat of `.git`, one small read of `HEAD`, and one stat of a marker file —
-no subprocess, no `git` call. The repository is located by walking up for `.git` rather than
-shelling out, precisely because a subprocess on every write-tool call is the one cost that
-cannot be amortised.
+no subprocess, no `git` call. Resolving a *named* target adds a second `.git` walk and one
+small read of `commondir`, and only for the calls that name one. The repository is located
+by walking up for `.git` rather than shelling out, precisely because a subprocess on every
+write-tool call is the one cost that cannot be amortised.
 
 Wall-clock is interpreter startup, roughly 75 ms per guarded tool call on Windows (the
 install registers `-S` to skip site initialisation, about 13% of that). Against a tool call

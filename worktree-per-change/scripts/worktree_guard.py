@@ -35,6 +35,14 @@ the whole repository, so a push in one worktree renumbers another's entries and 
 later `pop` in *either* takes the wrong one. It is the one hazard a worktree looks
 like it isolates and does not.
 
+Every rule is scoped to the tree the operation **targets**, not the directory the
+session happens to sit in — those differ constantly, and the session's own status is
+the wrong answer for every case where they do. So `cd ../other-repo && git add -A` is
+that repository's business and passes; a `git -C <main-checkout>` from a worktree is
+judged as the main checkout and does not; a write to an absolute path inside a linked
+worktree is judged as that worktree. A command that names no target means the
+session's own tree, which is what an ordinary command means anyway.
+
 It fails **open** on every question it cannot answer — no repo, unreadable git
 metadata, an unparseable payload. Blocking the only writer in a tree over state the
 guard merely failed to read is the worse error, and it is the error that gets a hook
@@ -43,6 +51,11 @@ deleted.
   CLAUDE_WORKTREE_GATE=off        turns it off
   CLAUDE_WORKTREE_GATE=warn       reports instead of denying
   CLAUDE_INTEGRATION_BRANCH=x     overrides the branch changes merge into
+
+All three are read from the **hook's** environment, which is the Claude Code process's,
+so they are the operator's switches and not a session's: `CLAUDE_WORKTREE_GATE=off git
+add …` sets the variable for that command alone, and by then this hook has already run
+and denied it. Changing one takes effect for sessions started afterwards.
 """
 
 from __future__ import annotations
@@ -100,8 +113,15 @@ _MERGED = re.compile(r"\bgh\s+pr\s+merge\b", re.I)
 
 
 def key(path) -> str:
-    """A comparable spelling of a path. Case-insensitive where the filesystem is."""
-    return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+    """A comparable spelling of a path. Case-insensitive where the filesystem is.
+
+    Symlinks are resolved, because the two paths being compared are frequently derived
+    from different sources and only one of them has been through git. Measured on macOS:
+    a repo under `/var/folders/…` records its worktrees' git dir as `/private/var/…`, so
+    an unresolved comparison reads one repository as two — which made the guard stand
+    down on the very tree it was protecting.
+    """
+    return os.path.normcase(os.path.realpath(str(path)))
 
 
 def find_tree(start: Path):
@@ -295,15 +315,48 @@ def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
 # ------------------------------------------------------------------- command parse
 
 
-def git_calls(command: str):
-    """Every git subcommand in a shell command, as (subcommand, args).
+def dir_token(token: str) -> str | None:
+    """A `cd` or `-C` argument as a directory, or None when it is not one to read.
 
-    Textual, and it never expands a variable: `git -C "$W" switch` is judged as a plain
-    `switch`. That is the guard being conservative rather than clever — the cost is
-    spelling a path out in full, and the alternative is trusting a shell expansion it
-    cannot evaluate.
+    `~` is expanded, because that expansion is deterministic and needs no shell. Anything
+    a shell would have to *evaluate* — `$VAR`, a backtick, a glob, `cd -` — is not, and
+    reads as None: guessing at it would be the guard trusting an expansion it cannot see.
+    """
+    if not token or token.startswith("-"):
+        return None
+    if any(character in token for character in "$`*?"):
+        return None
+    return os.path.expanduser(token)
+
+
+def joined(base: str | None, token: str | None) -> str | None:
+    """`cd` and `-C` composed left to right, the way a shell and repeated `-C` compose.
+
+    None propagates: a leg this hook could not read makes the whole chain unreadable, and
+    an unreadable chain falls back to the session's own tree, which is the conservative
+    end (it is the tree the guard is there to protect).
+    """
+    if token is None:
+        return None
+    return os.path.join(base, token) if base else token
+
+
+def git_calls(command: str):
+    """Every git subcommand in a shell command, as (subcommand, args, where).
+
+    `where` is the directory the call would run in as far as the *text* says: a `cd`
+    earlier in the chain, one or more `git -C`, or None when the command names none — or
+    names one this hook cannot read, `git -C "$W" switch` being the standing example.
+    Both spellings of None mean the same thing downstream, "the session's own tree",
+    which is what an ordinary command means and the conservative reading of one that
+    could not be parsed.
+
+    Still textual, and still never a shell: the cost is spelling a path out in full
+    instead of hiding it in a variable, and the alternative is trusting an expansion the
+    guard cannot evaluate.
     """
     calls = []
+    chain = None
     for segment in _SEGMENT.split(command):
         try:
             tokens = shlex.split(segment)
@@ -311,16 +364,25 @@ def git_calls(command: str):
             tokens = segment.split()
         if not tokens:
             continue
+        if Path(tokens[0]).name in {"cd", "pushd"}:
+            # A `cd` carries to every later segment, which is what `&&` and `;` do. It is
+            # read for its path only — whether the `cd` would have *succeeded* is not a
+            # question worth answering, since a command whose `cd` failed writes nothing.
+            chain = joined(chain, dir_token(tokens[1])) if len(tokens) > 1 else None
+            continue
         try:
             start = next(i for i, t in enumerate(tokens) if Path(t).name in {"git", "git.exe"})
         except StopIteration:
             continue
         rest = tokens[start + 1 :]
         index = 0
+        where = chain
         while index < len(rest) and rest[index].startswith("-"):
+            if rest[index] == "-C":
+                where = joined(where, dir_token(rest[index + 1]) if index + 1 < len(rest) else None)
             index += 2 if rest[index] in {"-C", "-c"} else 1
         if index < len(rest):
-            calls.append((rest[index], rest[index + 1 :]))
+            calls.append((rest[index], rest[index + 1 :], where))
     return calls
 
 
@@ -346,8 +408,14 @@ BASE_NOTE = (
 )
 
 ESCAPE = (
-    "`/worktree-per-change` has the full protocol. Set CLAUDE_WORKTREE_GATE=off only if "
-    "the guard is provably wrong, and say in your reply that you did it and why."
+    "`/worktree-per-change` has the full protocol. **A session cannot turn this guard "
+    "off**, and reading otherwise wastes a turn finding out: `CLAUDE_WORKTREE_GATE` is "
+    "read from the hook's own environment, so a `CLAUDE_WORKTREE_GATE=off` prefix sets it "
+    "for that one command while the hook that denied the command has already run. Setting "
+    "it for the Claude Code process, or in a settings `env` block, is the operator's move "
+    "and takes a new session. So if this denial is provably wrong, the move that works is "
+    "to say so plainly in your reply — what you were doing, what it blocked, and why the "
+    "guard is wrong — and stop, rather than spending turns on a way around it."
 )
 
 
@@ -563,6 +631,36 @@ def target_paths(payload: dict, cwd: Path):
     return [candidate if candidate.is_absolute() else cwd / candidate]
 
 
+def targeted(where: str | None, cwd: Path, session, common: Path):
+    """The tree an operation lands in — but only when that tree is *this* repository's.
+
+    None means it is none of this repository's business: another repository entirely, or
+    no repository at all. The answer comes from the path the operation names rather than
+    from the directory the session sits in, because those differ constantly — a
+    `cd`-then-git into a sibling checkout, a `git -C` back into the main checkout, an
+    absolute path into a worktree — and in every one of those the session's own status is
+    the wrong thing to judge by. `where` of None means the command named nothing (or named
+    something unreadable), and then the session's own tree is both the honest reading and
+    the conservative one.
+
+    "The same repository" is the shared **common** git directory, not a path prefix: a
+    linked worktree lives inside the main checkout's directory tree, so a prefix test
+    reads every worktree as the main checkout, and an unrelated clone that happens to sit
+    inside it as this repo's business. The common dir is neither.
+    """
+    if where is None:
+        return session
+    directory = Path(where)
+    if not directory.is_absolute():
+        directory = cwd / directory
+    found = find_tree(directory)
+    if found is None:
+        return None
+    if key(common_git_dir(found[1])) != key(common):
+        return None
+    return found
+
+
 def main() -> None:
     mode = (os.environ.get("CLAUDE_WORKTREE_GATE") or "on").strip().lower()
     if mode == "off":
@@ -645,18 +743,18 @@ def main() -> None:
 
     if tool in FILE_TOOLS:
         for path in target_paths(payload, Path(cwd)):
-            target = key(path)
-            root = key(tree_root)
-            if target != root and not target.startswith(root + os.sep):
+            scope = targeted(str(path), Path(cwd), located, common)
+            if scope is None:
                 continue  # Outside this repository — not this repository's rule.
-            if not linked:
+            target_root, target_git_dir, target_linked = scope
+            if not target_linked:
                 deny(reason_main_checkout("file edits are not made", branch), warn_only)
                 return
-            topic = branch_of(git_dir)
+            topic = branch_of(target_git_dir)
             if topic == branch:
                 deny(reason_integration_branch(branch), warn_only)
                 return
-            marker = is_spent(common, tree_root, topic)
+            marker = is_spent(common, target_root, topic)
             if marker:
                 deny(reason_spent(marker, branch), warn_only)
                 return
@@ -681,11 +779,17 @@ def main() -> None:
             "gh pr merge was run from this worktree",
         )
 
-    for subcommand, _args in git_calls(command):
+    for subcommand, _args, where in git_calls(command):
+        scope = targeted(where, Path(cwd), located, common)
+        if scope is None:
+            # Another repository, or none. Its branches, its integration branch, its rules
+            # — and the remedy this hook would print is not even possible there.
+            continue
+        _, _, target_linked = scope
         if subcommand == "stash" and not (_args and _args[0] in {"list", "show"}):
             deny(reason_stash(), warn_only)
             return
-        if not linked and subcommand in MUTATORS:
+        if not target_linked and subcommand in MUTATORS:
             deny(reason_main_checkout(f"`git {subcommand}` does not run", branch), warn_only)
             return
 

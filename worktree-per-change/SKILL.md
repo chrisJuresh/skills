@@ -249,9 +249,20 @@ single stack for the whole repository, so a push in one worktree renumbers every
 worktree's entries and a later `pop` or `drop` in *either* takes the wrong one. It is the
 one hazard a worktree looks like it isolates and does not.
 
-If the guard is provably wrong, set `CLAUDE_WORKTREE_GATE=off` for the session and say in
-your reply that you did it and why. `CLAUDE_WORKTREE_GATE=warn` reports without denying,
-which is the setting for watching what a repo would have blocked before committing to it.
+Every one of those rules is scoped to the repository the operation **targets**, not the
+directory the session sits in: `cd ../other-repo && git add -A` is that repository's
+business and passes, and a `git -C` or an absolute path that reaches back into *this*
+repository's main checkout is denied wherever it was issued from.
+
+**A session cannot turn the guard off, so do not spend a turn trying.**
+`CLAUDE_WORKTREE_GATE` is read from the hook's own environment, which is Claude Code's; a
+`CLAUDE_WORKTREE_GATE=off git add …` prefix sets it for that one command, and by then the
+hook has already vetted the command and denied it. Setting it on the Claude Code process,
+or in a settings `env` block, is the **operator's** move and takes a new session — and the
+same goes for `CLAUDE_WORKTREE_GATE=warn`, which reports without denying and is how an
+operator watches what a repo would block before committing to it. So if a denial is
+provably wrong, the move that works is to say so plainly in your reply — what you were
+doing, what it blocked, why the guard is wrong — and stop.
 
 ## What a worktree still does not isolate
 
