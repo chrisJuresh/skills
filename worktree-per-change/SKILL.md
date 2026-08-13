@@ -83,14 +83,28 @@ which is what makes a genuinely unmerged branch visible at all.
 
 ```bash
 # 4. clean up, then the next change starts over
-git branch -d <short-topic-name>
+#    ExitWorktree (action: "remove") first — it is holding the branch
+gh pr view <n> --json state --jq .state    # expect MERGED
+git branch -D <short-topic-name>
 ```
 
-`--delete-branch` removes the branch from the remote, and the local one too when it is
-not checked out. Yours *is* checked out — by your worktree — so free the worktree first:
-`ExitWorktree` with `action: "remove"`, then delete the local branch if it is still
-there. That order matters; deleting a branch out from under a live worktree leaves the
-worktree on a detached HEAD and git unsure which of the two to believe.
+`--delete-branch` removes the branch from the remote, which is the part that matters. It
+also tries the local one, and fails when a worktree still has it checked out — which
+yours does — so free the worktree first with `ExitWorktree` and finish the local delete
+by hand. That order matters anyway: deleting a branch out from under a live worktree
+leaves the worktree on a detached HEAD and git unsure which of the two to believe.
+
+**Use `-D`, and check the PR rather than the ancestry.** The instinct is `git branch -d`,
+because refusing to delete an unmerged branch sounds like exactly the safety check you
+want. It is the wrong check here. `-d` asks whether your commits are *ancestors* of the
+branch you are on, and `--squash` does not preserve ancestry: it replays your diff as one
+new commit, so a squash-merged branch looks completely unmerged to `-d` and to
+`git merge-base --is-ancestor`. Under this protocol that is every branch. The forge is the
+only thing that knows, so ask it — `gh pr view <n> --json state` reporting `MERGED` — and
+then `-D`. A blind `-D` without that check is how genuinely unmerged work disappears.
+
+The same trap catches `git branch --merged <integration>`: it lists nothing after a squash
+merge, so it is not a sweep, and a branch missing from it has not necessarily survived.
 
 A second change in the same session gets a **new** worktree and a **new** branch, cut
 from the integration branch you just merged into. The guard marks a worktree spent once
@@ -262,10 +276,9 @@ branch with `git branch -d`. They only mean anything together: a worktree with n
 is a stale checkout, a branch with no worktree is a push target nobody is watching, and
 either one left behind is something the next session has to work out the status of.
 
-`git branch -d` (lower case) is the right spelling. It refuses to delete a branch that is
-not merged, which is exactly the check you want here — if it refuses, the merge did not
-land and deleting is not the next move. Reach for `-D` only when you know why `-d`
-objected.
+Confirm the merge against the **forge**, not against git's ancestry — see step 4. Every
+local test of mergedness (`git branch -d`, `--merged`, `merge-base --is-ancestor`) reads
+squash-merged work as unmerged, so under this protocol they are all false negatives.
 
 Sweep whatever earlier sessions left at the **start** of a session, when nothing is in
 flight:
