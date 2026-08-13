@@ -650,19 +650,49 @@ def reason_integration_branch(branch: str) -> str:
     )
 
 
-def reason_spent(marker: dict, branch: str) -> str:
+def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path) -> str:
     landed = marker.get("why") or "its PR merged"
     return (
-        f"Denied: this worktree's change has already landed ({landed}), so it is finished "
-        "work. Editing it again grows a branch that has been reviewed and merged, and the "
-        "new edit reaches nobody until someone notices and opens a second PR from a tree "
-        "that looks done.\n\n"
+        f"Denied: this worktree's change looks finished ({landed}), so editing it again "
+        "grows a branch that has been reviewed and merged, and the new edit reaches nobody "
+        "until someone notices and opens a second PR from a tree that looks done.\n\n"
         "The next change is a new one: call **EnterWorktree** again for a fresh worktree "
         "and branch, cut from the current "
         f"`origin/{branch}` so it already contains what you just merged.\n\n"
+        # The mark records that `gh pr merge` RAN, not that it succeeded, and this is the
+        # one denial in the guard that can therefore be flatly wrong about the state of
+        # the world. Saying so here is not hedging: measured 2026-08-13, a session whose
+        # merge GitHub refused for a conflict read this text as fact, believed its work
+        # was delivered, and spent two turns reporting a guard bug instead of clearing a
+        # marker. The unfinished-rebase check above catches the common shape of that; a
+        # merge refused for a failing check leaves no rebase and still lands here.
+        + spent_doubt(spent_marker(common, tree_root))
+        + "\n\n"
         + BASE_NOTE.format(branch=branch)
         + "\n\n"
         + ESCAPE
+    )
+
+
+def spent_doubt(marker_path: Path) -> str:
+    """The sentence that lets a wrongly-marked session out, with the check that decides it.
+
+    Named after what it is: this mark is written *before* `gh pr merge` runs, so it records
+    an attempt. Every other denial in this guard is about state git can be asked for
+    directly; this one is about something that happened earlier and might not have worked.
+    """
+    return (
+        "**But this mark records that `gh pr merge` RAN, not that it landed** — it is "
+        "written before the command, because no later hook can tell a merge from a merge "
+        "that failed. A merge GitHub refuses (a conflict with a base that moved, a failing "
+        "check) leaves exactly this mark. So ask the forge before believing it:\n"
+        "`gh pr view <n> --json state --jq .state`\n\n"
+        "**`MERGED`** — the tree really is finished; take the fresh worktree above. "
+        "**Anything else** — the mark is wrong, and clearing it is the fix rather than a "
+        "workaround:\n"
+        f"`rm {marker_path}`\n"
+        "Then carry on in this tree. Clearing a mark for a PR the forge calls `MERGED` is "
+        "how a merged branch grows a commit that reaches nobody, so check first, every time."
     )
 
 
@@ -939,7 +969,7 @@ def main() -> None:
                 return
             marker = is_spent(common, target_root, topic)
             if marker:
-                deny(reason_spent(marker, branch), warn_only)
+                deny(reason_spent(marker, branch, common, target_root), warn_only)
                 return
         return
 
@@ -952,9 +982,16 @@ def main() -> None:
 
     if linked and _MERGED.search(command):
         # Recorded *before* the merge runs rather than after, because there is no
-        # after-hook that can tell a merge apart from a merge that failed. A worktree
-        # marked spent by a merge that did not land is the harmless direction: the
-        # remedy is a new worktree, which is what the protocol wanted anyway.
+        # after-hook that can tell a merge apart from a merge that failed.
+        #
+        # Being wrong in this direction is *survivable*, not harmless, and the difference
+        # is what `mid_operation` and `spent_doubt` are for. "The remedy is a new
+        # worktree, which is what the protocol wanted anyway" — the old note here — holds
+        # only when the merge actually landed. When it did not, the branch still has to
+        # reach the integration branch, and a fresh worktree abandons the conflict while
+        # leaving an open PR that can never merge. So: an unfinished rebase outranks the
+        # mark, and the denial names the forge check and the marker path rather than
+        # asserting the change is done.
         mark_spent(
             common,
             tree_root,

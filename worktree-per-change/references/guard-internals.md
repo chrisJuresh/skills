@@ -149,8 +149,31 @@ aliased `git` under [Limits](#limits): the guard exists to stop a session contin
 branch by mistake, not to win against one determined to. The alternative was a denial with no
 remedy a session can reach, which is the failure this hook has already been fixed for once.
 
-If you need the tree back and nothing is in progress, deleting the marker file is the escape,
-and it is the operator's — the same as the gate.
+### `mid_operation` is not the whole of it, so the denial carries the escape
+
+A merge refused for a **failing check** leaves no rebase behind, so it lands on the spent
+denial with nothing to outrank the marker. `spent_doubt()` is that case: the `Edit` denial now
+states that the mark records `gh pr merge` having *run*, names
+`gh pr view <n> --json state --jq .state` as the arbiter, and prints the marker's own path to
+`rm` when the answer is not `MERGED`.
+
+**That is a change of stance, and worth naming as one.** Deleting a marker used to be described
+here as the operator's escape, the same as the gate. It is not the same: the gate turns the
+protocol *off*, which is exactly the decision a session must not be able to take, whereas
+clearing one wrongly-written marker corrects a false statement about work the session is in the
+middle of — and the forge is an arbiter the session cannot fake. Withholding it bought nothing
+and cost a real failure. Measured 2026-08-13 in a downstream repo: a session read the old
+wording ("this worktree's change has already landed") as fact, believed its work delivered, and
+spent two turns reporting a guard bug instead of clearing a marker, with an open PR that could
+not merge sitting behind it.
+
+The general rule this is an instance of: **the text a denial prints is the only documentation
+that reaches an agent at the moment it is blocked.** Anything a blocked session needs belongs in
+the denial first and in a doc second. This file is lazily loaded, which makes it the one place a
+mid-denial session has not read — so an escape documented only here is an escape nobody takes.
+
+Three checks in `test_guard.py` hold that text — the claim is hedged, the forge is named, the
+path is printed — and each was verified to fail against the old wording before the fix landed.
 
 What is spent is a **branch in a tree**, not a directory name. The file has to be named
 after something filesystem-safe and stable, and the leaf name is the only candidate — but a
