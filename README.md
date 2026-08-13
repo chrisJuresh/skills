@@ -75,11 +75,15 @@ A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twi
 Everything else proceeds: every read, `push`, `fetch`, `log`, `diff`, `status`, `branch`,
 `git worktree`, `stash list`, every `gh` call, and every edit in a live worktree on its own
 branch — which is where all the work happens, so the guard is silent for the whole of a
-normal change. Writes outside the repository are never its business.
+normal change. Neither writes nor `git` calls that target **another** repository are ever its
+business: every rule is judged against the tree the operation names, so `cd ~/other-repo &&
+git add -A` passes, and a `git -C` back into this repository's main checkout does not.
 
 `CLAUDE_WORKTREE_GATE` selects `on` (default), `warn` (report without denying, for watching
 what a repo would block before committing to it), or `off`.
-`CLAUDE_INTEGRATION_BRANCH` overrides the configured branch.
+`CLAUDE_INTEGRATION_BRANCH` overrides the configured branch. Both are read from the hook's
+environment, so they are the **operator's** switches: a per-command prefix is set after the
+hook has already run, and a change applies to sessions started afterwards.
 
 ### Layout
 
@@ -93,7 +97,7 @@ worktree-per-change/
   scripts/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
-    test_guard.py                              48 checks against real git repos in a temp dir
+    test_guard.py                              71 checks against real git repos in a temp dir
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against
