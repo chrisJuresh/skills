@@ -39,7 +39,8 @@ What it buys, in the order the failures actually happen:
 ## The loop
 
 ```bash
-# 1. before the first edit — a worktree cut from the integration branch
+# 1. before the first edit — a worktree cut from the FETCHED integration branch
+git fetch origin <integration>
 git worktree add .claude/worktrees/<name> -b <short-topic-name> origin/<integration>
 ```
 
@@ -50,12 +51,27 @@ refused, for the session and every subagent under it. A `cd` into the worktree d
 of that, and the session goes on reporting the main checkout as its `cwd`, which quietly
 breaks the signal every other session reads.
 
-A bare `EnterWorktree` (no `git worktree add` first) is only correct when the
-repository's **default branch is also its integration branch**. `worktree.baseRef`
-accepts `"fresh"` or `"head"` and never a branch name, so in a repo that merges through
-`development` a bare call cuts from `main` and carries the divergence into your diff
-without complaining. Check `.claude/worktree-per-change.json` for which branch this repo
-integrates through.
+**The base is `origin/<integration>` — the fetched remote tip — and never anything else.**
+Not local HEAD, not whatever branch the main checkout is sitting on, not a local
+`<integration>` ref that has not been fetched since someone else merged. Fetch first: the
+whole point of merging every change is that the next one starts from it, and a stale local
+ref silently reintroduces work you already landed as a conflict.
+
+That is also why a bare `EnterWorktree` (no `git worktree add` first) is only correct when
+the repository's **default branch is also its integration branch** *and* you want it fresh
+from the remote. `worktree.baseRef` never accepts a branch name — it chooses between two
+values, and in a repo that integrates through anything but its default branch **both are
+wrong**:
+
+- `"fresh"` cuts from the repository's default branch, so in a repo that merges through
+  `development` it cuts from `main` and carries the whole divergence between them into your
+  diff;
+- `"head"` cuts from local HEAD — whatever the last session or person left that directory
+  on, including unmerged work and a branch that has since been squash-merged and deleted.
+
+Neither complains, and both produce a diff containing changes you did not make. Check
+`.claude/worktree-per-change.json` for which branch this repo integrates through, and cut
+from `origin/` that.
 
 ```bash
 # 2. work, then commit — name the paths, never `git add -A`

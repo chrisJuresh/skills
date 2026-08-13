@@ -271,13 +271,14 @@ PROTOCOL = (
 )
 
 BASE_NOTE = (
-    "If the change needs a base other than the repository's default branch — which it "
-    "does here, since changes integrate through `{branch}` — create the worktree with "
-    "git first and enter that path:\n"
-    "`git worktree add .claude/worktrees/<name> -b <branch> origin/{branch}` then "
-    "EnterWorktree with that path. `worktree.baseRef` only chooses between the default "
-    "branch and local HEAD, never a named branch, so a bare EnterWorktree cuts from the "
-    "wrong place and carries the divergence into your diff without complaining."
+    "The base is `origin/{branch}` — the FETCHED remote tip — and never local HEAD, never "
+    "whatever branch the main checkout is sitting on, and never an unfetched local ref. So "
+    "create the worktree with git first and enter that path:\n"
+    "`git fetch origin {branch} && git worktree add .claude/worktrees/<name> -b <branch> "
+    "origin/{branch}` then EnterWorktree with that path. `worktree.baseRef` never accepts a "
+    "branch name — it chooses between the repository's default branch and local HEAD, and "
+    "here BOTH are wrong — so a bare EnterWorktree cuts from the wrong place and carries "
+    "changes you did not make into your diff without complaining."
 )
 
 ESCAPE = (
