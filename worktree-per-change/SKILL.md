@@ -5,9 +5,10 @@ description: >-
   where nothing is ever written in the main checkout, and the guard hook that enforces
   it. Use this skill before the first Edit or Write in any repository that has the guard
   installed, when a write, `git switch`, `git add` or `git stash` is denied, when
-  EnterWorktree cuts from the wrong base, when a change is finished and has to be pushed
-  and merged, when a second change starts in a session that already merged one, and when
-  the user wants this rule installed in a repository or on a machine.
+  EnterWorktree cuts from the wrong base, when a change is finished and has to be pushed,
+  merged and then taken down, when a session is refused permission to stop, when a second
+  change starts in a session that already merged one, and when the user wants this rule
+  installed in a repository or on a machine.
 ---
 
 # One change, one worktree, one branch, one merged PR
@@ -88,7 +89,8 @@ Pushing and merging are part of finishing, not a separate errand to be asked abo
 branch that exists only on this disk is not a delivered change: the operator is left
 with a directory nobody will look in, and the next worktree is cut from an integration
 branch that is missing your work. The `Stop` hook refuses to end a session that is
-walking away from uncommitted or unpushed work, and says which.
+walking away from uncommitted or unpushed work, and says which — and equally refuses one
+that walks away from a worktree it has already merged (step 4).
 
 **`--delete-branch` is not tidiness.** A merged branch left standing is a live push
 target after the PR that reviewed it has closed — the same failure the spent-worktree
@@ -98,11 +100,23 @@ Deleting it makes that push fail loudly instead. It also keeps `git branch -r` r
 which is what makes a genuinely unmerged branch visible at all.
 
 ```bash
-# 4. clean up, then the next change starts over
-#    ExitWorktree (action: "remove") first — it is holding the branch
-gh pr view <n> --json state --jq .state    # expect MERGED
+# 4. take the tree down — this is still finishing, not tidying
+gh pr view <n> --json state --jq .state          # expect MERGED
+#   ExitWorktree with action: "keep"             — puts the SESSION back in the main
+#   checkout; the removal is git's job (see below)
+git worktree remove <path>                       # from the main checkout
 git branch -D <short-topic-name>
 ```
+
+**Do not use `ExitWorktree` with `action: "remove"` for this.** It removes only a
+worktree `EnterWorktree` *itself* created, and under this protocol the tree is made with
+`git worktree add` and entered by `path` — explicitly out of its scope. It reports success
+either way, so a session that used it believes it cleaned up and the tree is still there.
+Ask for `"keep"`, then remove the tree with git.
+
+The order is forced: nothing can remove the working tree it is standing in, and from
+inside a worktree Claude Code refuses `git -C <main>` redirects back out. So the exit
+comes first and the removal second — two steps, and no way to fold them into one.
 
 **`--delete-branch` is not reliable on its own, and it fails quietly.** It deletes the
 local branch first and the remote second, and when the local delete fails it **abandons
@@ -297,21 +311,34 @@ docs/decisions/README.md merge=union
   find "what did we decide and why" without running a script; deleting it from the repo ends
   the conflict by ending the feature.
 
-## Housekeeping
+## Housekeeping: cleaning up is finishing, not tidying
 
-Leave your worktree standing until its PR has merged; the path is where the operator
-finds the work, so name it in your reply. **After the merge, take all three down** — the
-remote branch with `--delete-branch`, the worktree with `ExitWorktree`, and the local
-branch with `git branch -d`. They only mean anything together: a worktree with no branch
-is a stale checkout, a branch with no worktree is a push target nobody is watching, and
-either one left behind is something the next session has to work out the status of.
+**A change is finished when its worktree is gone, not when its PR merges.** All three come
+down together — the remote branch, the worktree, the local branch — because they only mean
+anything together: a worktree with no live branch is a stale checkout, a merged branch is a
+push target after the PR that reviewed it has closed, and either one left behind costs the
+next session a status check before it can trust what it is looking at.
+
+This is the half of the protocol that is easiest to leave for someone else, and leaving it
+does not read as a failure: the change really did land, the reply is really true, and what
+the operator gets is two commands they only have to run because the session that knew the
+PR had merged stopped first. Measured in the first repository to adopt this: **19 linked
+worktrees** standing after two days, nearly all merged. So the `Stop` hook holds the
+teardown the same way it holds the push — it refuses to end a session sitting in a worktree
+whose PR has merged, and prints the commands. Its escape hatch is a sentence: if the tree
+is deliberately still standing (the operator wants the diff, a dev server is on it), say
+so with the path and stop.
+
+Name the **PR** in your reply. Name a path only for a tree you are deliberately leaving.
 
 Confirm the merge against the **forge**, not against git's ancestry — see step 4. Every
 local test of mergedness (`git branch -d`, `--merged`, `merge-base --is-ancestor`) reads
 squash-merged work as unmerged, so under this protocol they are all false negatives.
 
-Sweep whatever earlier sessions left at the **start** of a session, when nothing is in
-flight:
+What a *crashed* session leaves is a different problem: it never reaches `Stop`, and a
+merged worktree is indistinguishable from an in-progress one to anyone reading
+`git worktree list`. `SessionStart` reports those — landed worktrees still on disk — and
+for the full picture, at the start of a session when nothing is in flight:
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/install.py" --status
@@ -321,6 +348,13 @@ Remove the ones reported as `clean and landed` that are yours. Another session's
 worktree is its business even after its branch merges — leave it and say it is there.
 Claude Code's own periodic sweep already removes subagent and background-session
 worktrees that hold no work.
+
+One consequence of cleaning up routinely: worktree **paths get reused**, because the next
+change to the same area wants the same obvious name. The guard's spent marker is keyed by
+the tree's leaf name, so it records the branch too and matches on both, and the
+`SessionStart` sweep deletes markers whose tree is gone. Without that, a fresh worktree
+inherits a dead marker and is denied its first edit on the grounds that its change has
+already landed.
 
 ## Cost, and where it actually is
 

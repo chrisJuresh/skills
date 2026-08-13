@@ -10,19 +10,25 @@ collide and a half-finished edit rides into someone else's commit.
 
 So the shape of every change is fixed:
 
-    EnterWorktree  ->  edit, commit  ->  push  ->  PR  ->  merge  ->  next change
+    EnterWorktree  ->  edit, commit  ->  push  ->  PR  ->  merge  ->  remove the tree
+                                                                     and the branch;
+                                                                     the next change
                                                                      gets a new one
 
-Three hooks hold the three ends of that:
+Three hooks hold the ends of that:
 
   * `PreToolUse` denies `Edit`/`Write`/`NotebookEdit` anywhere but a linked worktree,
     denies them in a worktree sitting on the integration branch, and denies them in a
     worktree whose PR has already merged — because "a new worktree every time" is only
     a real rule if reusing a spent one is refused.
   * `Stop` refuses to end a session that is walking away from committed-but-unlanded
-    work. A branch that only exists on this disk is not a delivered change.
+    work — a branch that only exists on this disk is not a delivered change — and
+    refuses just as much to end one sitting in a worktree whose PR *has* merged. The
+    teardown is the half that used to be nobody's: the change lands, the reply is
+    truthful, and a stale checkout plus a live push target stay behind for the next
+    session to work out the status of.
   * `SessionStart` states the protocol, so an agent knows it before its first denial
-    rather than after.
+    rather than after, and reports landed worktrees an earlier session left on disk.
 
 `git stash` is denied everywhere, worktree or not: `refs/stash` is a single stack for
 the whole repository, so a push in one worktree renumbers another's entries and a
@@ -193,23 +199,81 @@ def spent_marker(common: Path, tree_root: Path) -> Path:
     return state_dir(common) / "spent" / f"{stem}.json"
 
 
-def mark_spent(common: Path, tree_root: Path, why: str) -> None:
+def mark_spent(common: Path, tree_root: Path, topic: str | None, why: str) -> None:
     path = spent_marker(common, tree_root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"tree": str(tree_root), "at": time.time(), "why": why}),
+            json.dumps(
+                {"tree": str(tree_root), "branch": topic, "at": time.time(), "why": why}
+            ),
             encoding="utf-8",
         )
     except OSError:
         pass
 
 
-def is_spent(common: Path, tree_root: Path) -> dict | None:
+def is_spent(common: Path, tree_root: Path, topic: str | None) -> dict | None:
+    """The marker saying this worktree's change has landed, if there is one.
+
+    What is spent is a *branch in a tree*, not a directory name. The marker file is named
+    after the worktree's leaf name — the only stable, filesystem-safe handle available —
+    so it has to confirm both fields before it applies. Two worktrees can share a leaf
+    name (`../hermes-dev-x` and `.claude/worktrees/hermes-dev-x`), and once cleanup is
+    routine a path gets *reused*: the same name, cut again off the integration branch, for
+    the next change. Trusting the filename alone would greet that fresh tree with "your
+    change has already landed", which is the most confusing denial this guard can produce.
+    """
     try:
-        return json.loads(spent_marker(common, tree_root).read_text(encoding="utf-8"))
+        marker = json.loads(spent_marker(common, tree_root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if not isinstance(marker, dict):
+        return None
+    recorded = marker.get("tree")
+    if isinstance(recorded, str) and key(recorded) != key(tree_root):
+        return None
+    # `branch` is absent from markers written before it was recorded. Those still mean
+    # what they said — the tree they name has merged — so a missing field matches.
+    was = marker.get("branch")
+    if isinstance(was, str) and topic is not None and was != topic:
+        return None
+    return marker
+
+
+def sweep_spent(common: Path) -> list[str]:
+    """Landed worktrees still on disk, and a marker file dropped for each one that isn't.
+
+    Both halves are cleanup. The list is what a session inherits from one that crashed or
+    was killed between `gh pr merge` and taking its tree down, which nothing else reports:
+    a merged worktree is indistinguishable from an in-progress one to anybody reading
+    `git worktree list`.
+
+    Dropping the marker for a tree that is gone is not tidiness either. Markers are keyed
+    by the worktree's *leaf name*, so a stale one denies the first edit in the next
+    worktree that happens to be named the same — a fresh tree reported as already merged,
+    which is the most confusing denial this guard can produce.
+    """
+    standing = []
+    try:
+        entries = sorted((state_dir(common) / "spent").iterdir())
+    except OSError:
+        return standing
+    for marker in entries:
+        try:
+            tree = json.loads(marker.read_text(encoding="utf-8")).get("tree")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(tree, str) or not tree:
+            continue
+        if Path(tree).is_dir():
+            standing.append(tree)
+        else:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+    return standing
 
 
 def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
@@ -285,6 +349,35 @@ ESCAPE = (
     "`/worktree-per-change` has the full protocol. Set CLAUDE_WORKTREE_GATE=off only if "
     "the guard is provably wrong, and say in your reply that you did it and why."
 )
+
+
+def cleanup_steps(tree: Path | str, topic: str | None) -> str:
+    """How a landed worktree comes down, spelled out because two of the four steps trap.
+
+    `ExitWorktree` with `action: "remove"` is the one everybody reaches for and it does
+    nothing here: it only removes a worktree EnterWorktree *itself* created, and under
+    this protocol the tree is made with `git worktree add` and entered by path. It reports
+    success either way, which is how a session comes to believe it cleaned up.
+    """
+    name = topic or "<branch>"
+    return (
+        f"1. `gh pr view <n> --json state --jq .state` — expect `MERGED`. Ask the forge, "
+        "not git: `git branch -d`, `--merged` and `merge-base --is-ancestor` all read a "
+        "squash-merged branch as unmerged, so under this protocol all three are false "
+        "negatives.\n"
+        '2. `ExitWorktree` with `action: "keep"` — it returns the session to the main '
+        'checkout. **Not `"remove"`**: that removes only a worktree EnterWorktree created '
+        "itself, so for a `git worktree add` tree entered by path it is a no-op that "
+        "reports success and leaves the tree standing.\n"
+        f"3. `git worktree remove {tree}` — from the main checkout, which is where it is "
+        "allowed and the only place it can run. Nothing can remove the tree it is "
+        "standing in.\n"
+        f"4. `git branch -D {name}`, then `git fetch origin --prune && git branch -r` and "
+        f"`git push origin --delete {name}` if the remote branch is still listed. "
+        "`--delete-branch` deletes the local branch first and abandons the remote one when "
+        "that fails, which is the normal case here because your worktree still has the "
+        "branch checked out at merge time."
+    )
 
 
 def reason_main_checkout(what: str, branch: str) -> str:
@@ -401,7 +494,7 @@ def unlanded(tree: Path, branch: str) -> str | None:
     return " and ".join(parts)
 
 
-def block_stop(tree: Path, branch: str, holding: str) -> None:
+def block_stop(tree: Path, branch: str, topic: str | None, holding: str) -> None:
     emit(
         {
             "decision": "block",
@@ -417,13 +510,40 @@ def block_stop(tree: Path, branch: str, holding: str) -> None:
                 f"3. `gh pr create --base {branch} --fill`\n"
                 "4. `gh pr merge --squash --delete-branch` (add `--admin` only if the "
                 "repo's checks do not apply here)\n"
-                "5. `ExitWorktree` with `action: \"remove\"`, then confirm the PR reads "
-                "`MERGED` and `git branch -D <branch>` — a merged branch left standing "
-                "is a live push target after the PR that reviewed it has closed. `-d` "
-                "and `--merged` both read a squash-merged branch as unmerged, so the "
-                "forge is what to ask.\n\n"
-                "If the change is genuinely abandoned, say so plainly in your reply and "
-                "leave the worktree standing — do not delete it, and do not stash."
+                "5. Then take the worktree down — the four steps below.\n\n"
+                + cleanup_steps(tree, topic)
+                + "\n\nIf the change is genuinely abandoned, say so plainly in your reply "
+                "and leave the worktree standing — do not delete it, and do not stash."
+            ),
+        }
+    )
+
+
+def block_stop_cleanup(tree: Path, branch: str, topic: str | None, marker: dict) -> None:
+    """Refuse to end a session sitting in a worktree whose change has already landed.
+
+    Cleanup is the half of the protocol nothing used to hold. Delivery had a hook and a
+    denial each; the teardown had a paragraph in a doc, and the failure mode is silent —
+    the change is merged, the reply is truthful, and what is left behind is a directory
+    plus a branch that the *next* session has to establish the status of before it can
+    trust either. Handing the operator the two commands is not delivering the work; they
+    only have to run them because the session that knew the answer stopped first.
+    """
+    landed = marker.get("why") or "its PR merged"
+    emit(
+        {
+            "decision": "block",
+            "reason": (
+                f"This worktree's change has landed ({landed}) and the worktree is still "
+                "standing. Taking it down is part of finishing, not an errand to hand over: "
+                "a worktree with no live branch is a stale checkout, a merged branch is a "
+                "push target after the PR that reviewed it has closed, and either one left "
+                "behind costs the next session a status check before it can trust what it "
+                "is looking at.\n\n"
+                + cleanup_steps(tree, topic)
+                + "\n\nIf the operator asked for this tree to stay — to look at the diff, or "
+                "to keep a dev server on it — leave it and say so plainly in your reply, "
+                "with the path. That is the one reason to stop with it standing."
             ),
         }
     )
@@ -463,17 +583,34 @@ def main() -> None:
     branch = integration_branch(main_root)
 
     if event == "SessionStart":
+        context = (
+            "This repository writes only from worktrees. Edits to the main "
+            "checkout are denied by a hook, including one-line ones.\n\n"
+            + PROTOCOL.format(branch=branch)
+            + "\n\n"
+            + BASE_NOTE.format(branch=branch)
+            + "\n\nA change is finished when its worktree is gone too: after the merge, "
+            "`ExitWorktree` (`action: \"keep\"`), then `git worktree remove <path>` and "
+            "`git branch -D <branch>` from the main checkout."
+        )
+        # The sweep runs at SessionStart deliberately: it is the one moment nothing is in
+        # flight, so a landed tree still on disk is somebody's leftovers rather than the
+        # work in progress two minutes from its own merge.
+        standing = sweep_spent(common)
+        if standing:
+            context += (
+                "\n\nLanded worktrees still on disk, left by an earlier session:\n"
+                + "\n".join(f"- {path}" for path in standing)
+                + "\nEach one's PR has merged. Remove the ones that are yours — "
+                "`git worktree remove <path>` then `git branch -D <branch>`, from the main "
+                "checkout. A worktree another session is holding is its business even after "
+                "its branch merges: leave it, and say it is there."
+            )
         emit(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": (
-                        "This repository writes only from worktrees. Edits to the main "
-                        "checkout are denied by a hook, including one-line ones.\n\n"
-                        + PROTOCOL.format(branch=branch)
-                        + "\n\n"
-                        + BASE_NOTE.format(branch=branch)
-                    ),
+                    "additionalContext": context,
                 }
             }
         )
@@ -484,10 +621,19 @@ def main() -> None:
             return
         if stop_blocks(common, session) >= MAX_STOP_BLOCKS:
             return
+        # Spent first. A landed tree can also read as holding unlanded commits — a squash
+        # merge leaves none of the branch's own commits in `origin/<branch>` — and telling
+        # a session to push work it has already merged is the one wrong answer here.
+        topic = branch_of(git_dir)
+        marker = is_spent(common, tree_root, topic)
+        if marker:
+            stop_blocks(common, session, bump=True)
+            block_stop_cleanup(tree_root, branch, topic, marker)
+            return
         holding = unlanded(tree_root, branch)
         if holding:
             stop_blocks(common, session, bump=True)
-            block_stop(tree_root, branch, holding)
+            block_stop(tree_root, branch, topic, holding)
         return
 
     if event != "PreToolUse":
@@ -504,10 +650,11 @@ def main() -> None:
             if not linked:
                 deny(reason_main_checkout("file edits are not made", branch), warn_only)
                 return
-            if branch_of(git_dir) == branch:
+            topic = branch_of(git_dir)
+            if topic == branch:
                 deny(reason_integration_branch(branch), warn_only)
                 return
-            marker = is_spent(common, tree_root)
+            marker = is_spent(common, tree_root, topic)
             if marker:
                 deny(reason_spent(marker, branch), warn_only)
                 return
@@ -525,7 +672,12 @@ def main() -> None:
         # after-hook that can tell a merge apart from a merge that failed. A worktree
         # marked spent by a merge that did not land is the harmless direction: the
         # remedy is a new worktree, which is what the protocol wanted anyway.
-        mark_spent(common, tree_root, "gh pr merge was run from this worktree")
+        mark_spent(
+            common,
+            tree_root,
+            branch_of(git_dir),
+            "gh pr merge was run from this worktree",
+        )
 
     for subcommand, _args in git_calls(command):
         if subcommand == "stash" and not (_args and _args[0] in {"list", "show"}):
