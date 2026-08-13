@@ -182,14 +182,62 @@ which is the setting for watching what a repo would have blocked before committi
 
 ## What a worktree still does not isolate
 
-- **Ports, dev servers, databases, and any single machine resource.** A build writing a
-  shared output directory still kills a dev server serving it, and a timing measurement
-  cannot be trusted while another agent saturates the same disk.
+Under this rule there is always more than one worktree, so every item here is a live
+hazard rather than an occasional one.
+
+- **A fixed output path in the project's own tooling.** Scripts written when there was one
+  checkout name their output after the *project* — `%TEMP%\<project>-tests`,
+  `~/.cache/<project>` — and clear it at the start of every run. Every worktree then shares
+  one directory, so you wait for a marker file and read a result some other tree produced.
+  One repo's test runner did exactly that: three consecutive full-suite runs on a tree
+  whose only change was a comment reported 966, 959 and 966 passed. **A number that moves
+  between runs on a tree you did not change is shared state, not a flaky test** — find out
+  where the runner writes before you chase the flake. Fix it at the default rather than by
+  passing a flag every time: derive the path from the checkout — its leaf name, so a reader
+  can tell whose it is, plus a few bytes of hash over the absolute path, so two worktrees
+  with the same leaf still differ — and keep the explicit override working.
+- **Ports, dev servers, databases, and any single machine resource.** Two trees cannot both
+  bind the same port, and a timing measurement cannot be trusted while another agent is
+  saturating the same disk.
 - **The work item.** Two agents can happily take the same ticket. Claim it before you
   build — see [references/ticketing.md](references/ticketing.md).
 - **Shared insert points in docs.** An append-ordered changelog or a hand-maintained
   index conflicts on every branch. Prefer one file per entry with a generated index, and
-  keep doc edits to the narrowest diff, in one commit, last.
+  keep doc edits to the narrowest diff, in one commit, last. **One file per entry does not
+  finish the job** — see below, because the generated index is itself a shared insert point.
+
+## Generated files: stop resolving what nobody wrote
+
+One file per entry fixes the *entries*: two files that do not exist yet cannot conflict. The
+**generated index** still conflicts on every parallel branch, because each one appends its
+row and rewrites the same `N entries` line. That is a merge stop over text no agent authored
+and nobody should be reading — pure time and tokens.
+
+Give that one file git's built-in union driver, and keep regenerating:
+
+```gitattributes
+docs/decisions/README.md merge=union
+```
+
+- **`union` is built in; `ours` is not.** `merge=ours` needs
+  `git config merge.ours.driver true` on every machine, and without it the attribute
+  silently does nothing — measured: the merge conflicts exactly as if the file had no
+  attribute. Anything requiring per-machine setup is not a repo rule.
+- **It buys "the merge does not stop", not "the file is right."** Measured: union keeps both
+  branches' rows but in *side* order rather than the generator's, and where the two `N
+  entries` lines differ it keeps **both**. So the regenerate command stays in the pre-PR
+  ritual, and it is needed *especially* on a merge that reported no conflict at all.
+- **Pair it with a blocking check.** If the generator has a verify mode (`--check`) in CI,
+  forgetting to regenerate is a red gate rather than a quietly wrong index. Without that
+  check, do not add the attribute — you have traded a visible conflict for an invisible
+  staleness.
+- **Never on an authored file.** Keep-both-sides lands one agent's paragraph and another's
+  rewrite of it, merged clean, wrong and unreviewed. A conflict you have to look at beats a
+  merge you don't. The single safe case is a file with no authored content at all, because
+  there are no two sides to choose between and a generator can re-derive the truth.
+- **Don't untrack it instead.** A generated index exists so a teammate reading the forge can
+  find "what did we decide and why" without running a script; deleting it from the repo ends
+  the conflict by ending the feature.
 
 ## Housekeeping
 
