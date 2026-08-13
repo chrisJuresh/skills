@@ -1,0 +1,61 @@
+{
+  "skill_name": "worktree-per-change",
+  "evals": [
+    {
+      "id": 0,
+      "name": "denied-on-a-one-liner",
+      "prompt": "claude just refused to edit README.md in ~/acme-console - said file edits are not made in the main checkout and every change needs its own worktree. it's a typo. one character. i just want it fixed, what's the actual sequence here? repo merges through development not main",
+      "expected_output": "The full loop for a one-character change, with the worktree cut off development rather than the default branch, and no suggestion that a small change is exempt.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Does not offer an exemption for small changes, or suggest editing the main checkout anyway",
+        "Creates the worktree with git off origin/development rather than relying on a bare EnterWorktree / worktree.baseRef",
+        "Recommends EnterWorktree (not cd) to move into the worktree",
+        "Includes push, PR into development, and merge as part of finishing rather than as optional follow-up",
+        "Does not present CLAUDE_WORKTREE_GATE=off as the fix"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "second-change-same-session",
+      "prompt": "in a worktree, merged the PR for the search fix about a minute ago. now i've spotted the invoice export has the same bug. claude won't let me edit anything in this worktree now. is it broken? i'd rather not go through the whole worktree dance again for a two-line fix",
+      "expected_output": "Explains the spent-worktree rule, and takes a new worktree cut from the freshly-merged development rather than reusing or resurrecting the old one.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Explains that the worktree is spent because its PR merged, and that a merged branch growing a commit reaches nobody",
+        "Takes a NEW worktree and branch for the second fix rather than reusing the old one",
+        "Cuts the new worktree from the current integration branch so it contains the change just merged",
+        "Does not suggest deleting the spent marker or disabling the guard as the ordinary path",
+        "Treats the second change as its own PR"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "wip-at-the-end-of-a-session",
+      "prompt": "i'm done for the day. there's a half-finished refactor in the worktree - 3 files changed, nothing committed. can i just stash it and pick it up tomorrow? or should i leave the worktree and come back to it",
+      "expected_output": "Refuses the stash on the shared-stack grounds, commits instead, and is clear about what leaving unlanded work costs the next session.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Says not to stash, because refs/stash is one stack shared by every worktree and a later pop takes the wrong entry",
+        "Recommends committing (a wip commit) instead, staging the paths by name rather than git add -A",
+        "Says to leave the worktree standing rather than removing it, and names the path",
+        "Mentions that the branch should be pushed so the work is not only on this disk",
+        "Does not claim a worktree isolates the stash"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "installing-over-an-existing-guard",
+      "prompt": "we've got a hook in .claude/hooks/concurrent_writer_guard.py that blocks a second session from switching branches or doing git add -A in the shared checkout. i want to move the whole repo to the one-worktree-per-change thing instead. we PR into development. what do i need to do and what breaks",
+      "expected_output": "A migration that removes the predecessor rather than stacking on it, installs with the right integration branch, and is honest about the cost of losing the in-place fix.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Says the two guards cannot both run, and that the old one is removed rather than left registered",
+        "Installs into the repo's committed .claude/settings.json with development as the integration branch, not the default branch",
+        "Says to rewrite the repo's own docs, because they will still describe working in place as the common case",
+        "Names the cost explicitly: the cheap in-place fix is gone, every change now takes a worktree, branch and PR",
+        "Mentions the integration branch must exist on the remote before the first PR"
+      ]
+    }
+  ]
+}
