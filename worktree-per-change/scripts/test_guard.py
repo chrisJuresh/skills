@@ -71,6 +71,20 @@ def reason(output: dict | None) -> str:
     return ((output or {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
 
 
+def names(output: dict | None, path: Path) -> bool:
+    """Does the guard's output name `path`?
+
+    The path is escaped the way the output already escaped it, rather than matched raw.
+    `json.dumps` doubles a backslash, so on Windows `str(path) in json.dumps(output)` is
+    False however plainly the path is named — and the assertions that ask this question
+    are split between expecting True and expecting False, so a raw comparison does not
+    fail honestly on that platform: it fails the two that expect a tree to be reported
+    and passes the one that expects silence for the wrong reason. A sweep that had
+    stopped reporting anything at all would have looked the same.
+    """
+    return json.dumps(str(path))[1:-1] in json.dumps(output or {})
+
+
 def spent_marker_for(repo: Path, tree: Path) -> Path:
     """Where the guard writes `tree`'s spent marker — recomputed, not imported.
 
@@ -651,7 +665,7 @@ def main() -> int:
         swept = run({"session_id": "c3", "hook_event_name": "SessionStart", "cwd": str(repo)})
         check(
             "SessionStart reports a landed worktree still on disk",
-            str(landed) in json.dumps(swept or {}),
+            names(swept, landed),
             True,
         )
 
@@ -732,14 +746,14 @@ def main() -> int:
         swept_mid = run({"session_id": "c7", "hook_event_name": "SessionStart", "cwd": str(repo)})
         check(
             "the sweep does not name a tree that is mid-rebase",
-            str(refused) in json.dumps(swept_mid or {}),
+            names(swept_mid, refused),
             False,
         )
         # The other half of the pair: suppressing the in-progress tree must not suppress
         # the sweep itself, which is what a bare "does not name" assertion would allow.
         check(
             "the sweep still names a landed tree with nothing in progress",
-            str(still) in json.dumps(swept_mid or {}),
+            names(swept_mid, still),
             True,
         )
 
