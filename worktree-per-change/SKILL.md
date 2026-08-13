@@ -62,10 +62,10 @@ integrates through.
 git add <path> ...
 git commit -m "<what changed>"
 
-# 3. deliver — all three steps, unasked
+# 3. deliver — all of it, unasked
 git push -u origin HEAD
 gh pr create --base <integration> --fill
-gh pr merge --squash
+gh pr merge --squash --delete-branch
 ```
 
 Pushing and merging are part of finishing, not a separate errand to be asked about. A
@@ -74,9 +74,23 @@ with a directory nobody will look in, and the next worktree is cut from an integ
 branch that is missing your work. The `Stop` hook refuses to end a session that is
 walking away from uncommitted or unpushed work, and says which.
 
+**`--delete-branch` is not tidiness.** A merged branch left standing is a live push
+target after the PR that reviewed it has closed — the same failure the spent-worktree
+rule catches one level down, and harder to notice, because a commit pushed there looks
+like ordinary work on an ordinary branch and reaches the integration branch never.
+Deleting it makes that push fail loudly instead. It also keeps `git branch -r` readable,
+which is what makes a genuinely unmerged branch visible at all.
+
 ```bash
-# 4. the next change starts over
+# 4. clean up, then the next change starts over
+git branch -d <short-topic-name>
 ```
+
+`--delete-branch` removes the branch from the remote, and the local one too when it is
+not checked out. Yours *is* checked out — by your worktree — so free the worktree first:
+`ExitWorktree` with `action: "remove"`, then delete the local branch if it is still
+there. That order matters; deleting a branch out from under a live worktree leaves the
+worktree on a detached HEAD and git unsure which of the two to believe.
 
 A second change in the same session gets a **new** worktree and a **new** branch, cut
 from the integration branch you just merged into. The guard marks a worktree spent once
@@ -242,10 +256,19 @@ docs/decisions/README.md merge=union
 ## Housekeeping
 
 Leave your worktree standing until its PR has merged; the path is where the operator
-finds the work, so name it in your reply. After the merge it holds nothing that the
-integration branch does not, and `ExitWorktree` can remove it.
+finds the work, so name it in your reply. **After the merge, take all three down** — the
+remote branch with `--delete-branch`, the worktree with `ExitWorktree`, and the local
+branch with `git branch -d`. They only mean anything together: a worktree with no branch
+is a stale checkout, a branch with no worktree is a push target nobody is watching, and
+either one left behind is something the next session has to work out the status of.
 
-Sweep merged worktrees at the **start** of a session, when nothing is in flight:
+`git branch -d` (lower case) is the right spelling. It refuses to delete a branch that is
+not merged, which is exactly the check you want here — if it refuses, the merge did not
+land and deleting is not the next move. Reach for `-D` only when you know why `-d`
+objected.
+
+Sweep whatever earlier sessions left at the **start** of a session, when nothing is in
+flight:
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/install.py" --status

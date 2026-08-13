@@ -414,8 +414,11 @@ def block_stop(tree: Path, branch: str, holding: str) -> None:
                 "`git add -A`.\n"
                 "2. `git push -u origin HEAD`\n"
                 f"3. `gh pr create --base {branch} --fill`\n"
-                "4. `gh pr merge --squash` (add `--admin` only if the repo's checks do "
-                "not apply here)\n\n"
+                "4. `gh pr merge --squash --delete-branch` (add `--admin` only if the "
+                "repo's checks do not apply here)\n"
+                "5. `ExitWorktree` with `action: \"remove\"`, then `git branch -d "
+                "<branch>` — a merged branch left standing is a live push target after "
+                "the PR that reviewed it has closed.\n\n"
                 "If the change is genuinely abandoned, say so plainly in your reply and "
                 "leave the worktree standing — do not delete it, and do not stash."
             ),
