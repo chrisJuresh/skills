@@ -221,6 +221,14 @@ else the repo keeps in that file. `syncedFrom` is absent when the skill director
 git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
 sha is not.
 
+**`sha256` is over the file's LF-normalised bytes, and a gate checking it must normalise
+too.** The record crosses platforms and the bytes on disk do not: a repo pinning
+`* text=auto eol=lf` hands out LF everywhere, one leaving it to `core.autocrlf` hands out
+CRLF on Windows, so a hash of the working copy is true on the machine that installed and
+false on the Linux runner meant to check it. It then fails in the worst direction — drift
+reported in a file nobody touched, which teaches people to ignore the check. Normalising
+is also what git stores, so the two sides agree without knowing each other's settings.
+
 The record is what makes the copy checkable; the checking is still the repo's to do. A
 check in its gate asks two questions, and only the first is answerable on a CI
 runner: **does the committed file match its record** (offline — catches an edit in place, since

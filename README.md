@@ -102,7 +102,7 @@ worktree-per-change/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
     test_guard.py                              104 checks on what the hook decides
-    test_install.py                            25 checks on what the installer leaves on disk
+    test_install.py                            27 checks on what the installer leaves on disk
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against

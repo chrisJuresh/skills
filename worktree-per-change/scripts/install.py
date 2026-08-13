@@ -180,6 +180,27 @@ def write_json(path: Path, blob: dict, backup: bool) -> None:
     os.replace(temporary, path)
 
 
+def content_hash(data: bytes) -> str:
+    """sha256 of `data` with its line endings normalised to LF.
+
+    The record has to survive the round trip through git, and the bytes on disk do not.
+    A repo that pins `* text=auto eol=lf` hands out LF on every platform; one that
+    leaves it to `core.autocrlf` hands out CRLF on Windows and LF everywhere else. So
+    hashing the working copy records a number that is true on the machine that ran the
+    installer and false on the Linux runner meant to check it — and it fails in the
+    direction that costs most, reporting drift in a file nobody touched.
+
+    Measured: installing into a repo with `eol=lf` from a Windows checkout, where the
+    copy arrives with 1022 CRLFs, gives a hash matching no checkout of that repo on any
+    platform, including the one that wrote it, as soon as git normalises the file.
+
+    Normalising is what git itself stores, so both sides can reach the same number
+    without knowing each other's settings. A gate checking this must normalise too —
+    see SKILL.md.
+    """
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def provenance(script: Path) -> dict:
     """Where the copy at `script` came from — source, upstream commit, hash.
 
@@ -207,7 +228,7 @@ def provenance(script: Path) -> dict:
     if head:
         record["syncedFrom"] = head
     try:
-        record["sha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
+        record["sha256"] = content_hash(script.read_bytes())
     except OSError:
         pass
     return record

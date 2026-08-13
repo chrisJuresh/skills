@@ -11,7 +11,6 @@ running or a copy nobody can date.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -22,6 +21,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 INSTALL = HERE / "install.py"
 GUARD_SOURCE = HERE / "worktree_guard.py"
+
+# Imported rather than reimplemented: the question these ask is whether the installer
+# and its reader agree on what "the same file" means, and a second copy of the rule here
+# could only ever agree with itself.
+sys.path.insert(0, str(HERE))
+from install import content_hash  # noqa: E402
 
 PASSED = 0
 FAILED: list[str] = []
@@ -92,8 +97,21 @@ def main() -> int:
         check(
             "it records the hash of the file it actually wrote",
             guard.get("sha256"),
-            hashlib.sha256((repo / ".claude" / "hooks" / "worktree-guard.py").read_bytes()).hexdigest(),
+            content_hash((repo / ".claude" / "hooks" / "worktree-guard.py").read_bytes()),
         )
+        # The record crosses platforms, so it cannot be a hash of the bytes on disk. A
+        # repo pinning `eol=lf` hands out LF everywhere; one leaving it to `core.autocrlf`
+        # hands out CRLF on Windows — so a working-copy hash is true on the machine that
+        # installed and false on the Linux runner meant to check it, reporting drift in a
+        # file nobody touched.
+        body = GUARD_SOURCE.read_bytes().replace(b"\r\n", b"\n")
+        check("the hash ignores line endings", content_hash(body), content_hash(body.replace(b"\n", b"\r\n")))
+        check(
+            "so the record matches the copy however git checked it out",
+            guard.get("sha256"),
+            content_hash(body.replace(b"\n", b"\r\n")),
+        )
+
         head = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"],
                               capture_output=True, text=True)
         if head.returncode == 0:
@@ -121,17 +139,17 @@ def main() -> int:
         installed.write_bytes(b"# edited in place\n")
         check(
             "an edit in place stops matching the record",
-            config_of(repo)["guard"]["sha256"] == hashlib.sha256(installed.read_bytes()).hexdigest(),
+            config_of(repo)["guard"]["sha256"] == content_hash(installed.read_bytes()),
             False,
         )
         # ...and a resync is what puts the two back in agreement, on the new file.
         install(repo)
         check("a resync restores the copy and re-records it",
               config_of(repo)["guard"]["sha256"],
-              hashlib.sha256(GUARD_SOURCE.read_bytes()).hexdigest())
+              content_hash(GUARD_SOURCE.read_bytes()))
         check("which is the file now on disk",
-              hashlib.sha256(installed.read_bytes()).hexdigest(),
-              hashlib.sha256(GUARD_SOURCE.read_bytes()).hexdigest())
+              content_hash(installed.read_bytes()),
+              content_hash(GUARD_SOURCE.read_bytes()))
 
         # --- dry run writes nothing ----------------------------------------------
         untouched = fresh(root, "dry")
