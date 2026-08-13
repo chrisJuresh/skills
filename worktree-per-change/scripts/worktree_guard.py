@@ -102,6 +102,18 @@ MUTATORS = {
     "mv",
 }
 
+# The characters a shell reads as operators rather than as part of a word. `\n` is in the
+# set deliberately, and `whitespace` is narrowed to match: shlex counts a newline as
+# whitespace, and whitespace is tested first, so leaving it there would erase the boundary
+# between two commands on separate lines and let a `cd` on the first leak into the second.
+_PUNCTUATION = "();<>|&\n"
+
+_GIT = {"git", "git.exe"}
+_CHDIR = {"cd", "pushd"}
+
+# The pre-tokenizer reading, kept for text the lexer cannot lex at all. It splits raw
+# characters, so it cannot tell a `&&` between two commands from one inside a quoted
+# argument — which is the false positive tokenizing first exists to remove.
 _SEGMENT = re.compile(r"&&|\|\||[;\n|]")
 
 # What "the change has landed" looks like on the command line. Seeing one of these
@@ -315,13 +327,86 @@ def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
 # ------------------------------------------------------------------- command parse
 
 
+def tokenize(command: str) -> list[str] | None:
+    """Shell tokens, quoting intact, operators as tokens of their own. None if unlexable.
+
+    Tokenizing *before* looking for command boundaries is the whole point of this
+    function. Splitting raw text on `&&`, `|` and newlines reads the inside of a quoted
+    argument as shell: measured on 2026-08-13, a `gh pr create --body "…"` whose body held
+    the line `cd ~/x && git add -A` and a markdown table of pipes was denied as a `git add`
+    in the main checkout. The lexer hands that body back as a single token, and a single
+    token is never a command.
+
+    `posix=False` — the default — is what keeps the quotes on, and they are exactly what
+    separates a quoted argument from a bare word. `unquote` takes them off again at the two
+    places that read a token as a path or as a command name, and nowhere else.
+    """
+    lexer = shlex.shlex(command, punctuation_chars=_PUNCTUATION)
+    lexer.whitespace_split = True
+    lexer.whitespace = " \t\r"
+    # `#` starts no comment, matching `shlex.split`, which turns comments off too. Dropping
+    # the rest of a line would hide whatever git call sits on it, and losing a call is the
+    # one direction this guard may not fail in.
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def unquote(token: str) -> str:
+    """A token with its shell quoting removed and nothing else touched.
+
+    Deliberately not `shlex.split`, which is POSIX-mode and consumes backslashes as well:
+    that would turn a PowerShell `C:\\Users\\x` into `C:Usersx` and hand the guard a path
+    resolving nowhere, on the one platform where `\\` is the separator.
+    """
+    out: list[str] = []
+    quote = ""
+    for character in token:
+        if quote:
+            if character == quote:
+                quote = ""
+            else:
+                out.append(character)
+        elif character in "'\"":
+            quote = character
+        else:
+            out.append(character)
+    return "".join(out)
+
+
+def names(token: str, commands: set[str]) -> bool:
+    """Whether a token is one of `commands` *as a command* — quoting allowed, prose not.
+
+    `"git"` counts: a shell runs it, so declining to read a quoted spelling would make the
+    whole guard one quote deep. A token holding whitespace does not count, and that is the
+    fix — `"cd ~/x && git add -A"` arrives from the lexer whole precisely so it can be told
+    apart from a command, and no command this guard cares about is spelled with a space.
+    """
+    bare = unquote(token)
+    if not bare or any(character.isspace() for character in bare):
+        return False
+    return Path(bare).name in commands
+
+
+def operator(token: str) -> bool:
+    """A token the lexer built out of punctuation alone — `&&`, `;`, `|`, a newline, a run
+    of them — which is where one command ends and the next begins."""
+    return bool(token) and all(character in _PUNCTUATION for character in token)
+
+
 def dir_token(token: str) -> str | None:
     """A `cd` or `-C` argument as a directory, or None when it is not one to read.
 
     `~` is expanded, because that expansion is deterministic and needs no shell. Anything
     a shell would have to *evaluate* — `$VAR`, a backtick, a glob, `cd -` — is not, and
     reads as None: guessing at it would be the guard trusting an expansion it cannot see.
+
+    The token still carries its quotes, because that is how the lexer marks an argument;
+    they come off first so that `cd "/tmp/a b"` reads as a path rather than as nothing.
     """
+    token = unquote(token)
     if not token or token.startswith("-"):
         return None
     if any(character in token for character in "$`*?"):
@@ -341,6 +426,38 @@ def joined(base: str | None, token: str | None) -> str | None:
     return os.path.join(base, token) if base else token
 
 
+def segments(command: str) -> list[list[str]]:
+    """The command as one token list per command, with every token's quoting still on.
+
+    Two readings, and the first is the one that runs. `tokenize` lexes the whole string
+    and hands back operators as tokens, so a `&&` or a `|` that is merely *inside* an
+    argument stays inside it. Only text the lexer refuses outright — an unbalanced quote,
+    and nothing else met in practice — falls back to splitting the raw characters.
+
+    The fallback over-reports boundaries, which costs a false denial; a parser that
+    declined to read such text at all would under-report them, which costs a missed one.
+    Only the first of those two is a failure a guard may have.
+    """
+    tokens = tokenize(command)
+    if tokens is None:
+        commands = []
+        for segment in _SEGMENT.split(command):
+            try:
+                commands.append(shlex.split(segment, posix=False))
+            except ValueError:
+                commands.append(segment.split())
+        return commands
+    commands, current = [], []
+    for token in tokens:
+        if operator(token):
+            commands.append(current)
+            current = []
+        else:
+            current.append(token)
+    commands.append(current)
+    return commands
+
+
 def git_calls(command: str):
     """Every git subcommand in a shell command, as (subcommand, args, where).
 
@@ -351,38 +468,49 @@ def git_calls(command: str):
     which is what an ordinary command means and the conservative reading of one that
     could not be parsed.
 
+    Every `git` in a segment is read, not only the first. A newline is an operator here
+    and a segment should therefore hold one command, but that rests on a lexer setting
+    rather than on anything structural, and stopping at the first `git` would turn a
+    change in that setting into silently missed calls — which is the failure this guard
+    is not allowed to have. Scanning on costs nothing when the assumption holds.
+
     Still textual, and still never a shell: the cost is spelling a path out in full
     instead of hiding it in a variable, and the alternative is trusting an expansion the
     guard cannot evaluate.
     """
     calls = []
     chain = None
-    for segment in _SEGMENT.split(command):
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            tokens = segment.split()
+    for tokens in segments(command):
         if not tokens:
             continue
-        if Path(tokens[0]).name in {"cd", "pushd"}:
+        if names(tokens[0], _CHDIR):
             # A `cd` carries to every later segment, which is what `&&` and `;` do. It is
             # read for its path only — whether the `cd` would have *succeeded* is not a
             # question worth answering, since a command whose `cd` failed writes nothing.
             chain = joined(chain, dir_token(tokens[1])) if len(tokens) > 1 else None
             continue
-        try:
-            start = next(i for i, t in enumerate(tokens) if Path(t).name in {"git", "git.exe"})
-        except StopIteration:
-            continue
-        rest = tokens[start + 1 :]
         index = 0
-        where = chain
-        while index < len(rest) and rest[index].startswith("-"):
-            if rest[index] == "-C":
-                where = joined(where, dir_token(rest[index + 1]) if index + 1 < len(rest) else None)
-            index += 2 if rest[index] in {"-C", "-c"} else 1
-        if index < len(rest):
-            calls.append((rest[index], rest[index + 1 :], where))
+        while index < len(tokens):
+            if not names(tokens[index], _GIT):
+                index += 1
+                continue
+            where = chain
+            index += 1
+            while index < len(tokens):
+                flag = unquote(tokens[index])
+                if not flag.startswith("-"):
+                    break
+                if flag == "-C":
+                    where = joined(
+                        where,
+                        dir_token(tokens[index + 1]) if index + 1 < len(tokens) else None,
+                    )
+                index += 2 if flag in {"-C", "-c"} else 1
+            if index < len(tokens):
+                calls.append(
+                    (unquote(tokens[index]), [unquote(t) for t in tokens[index + 1 :]], where)
+                )
+                index += 1
     return calls
 
 
