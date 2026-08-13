@@ -440,6 +440,24 @@ the tree's leaf name, so it records the branch too and matches on both, and the
 inherits a dead marker and is denied its first edit on the grounds that its change has
 already landed.
 
+**This teardown is a recipe here and not a shipped script, deliberately.** Scripting it is
+the right move in a repo that runs it often — one consumer has, with a test suite over the
+branch-matching, the refusals and the remote delete — and promoting that script into
+`scripts/` beside the guard was considered and dropped. The guard needs a committed
+per-repo copy because Claude Code loads hooks from inside the repo, and that constraint is
+what pays for the copy-plus-hash-plus-drift-gate machinery around it. A teardown script has
+no such constraint: it runs by hand from the main checkout and never in CI. Shipping it
+would mean a second installed artifact, a second provenance record and a second drift gate
+guarding a file that, measured across 71 repositories on the machine this was written on,
+exists in exactly **one** copy — while turning that one copy from a source into a gated
+fork, which is the expensive half and is expensive *because* there is no second consumer.
+What actually protects the next adopter is this section being right, which is cheaper and
+already done.
+
+**What would reopen it:** a second repository installing this guard. At that point
+`install.py` placing a teardown script is the same small change it is today, made with two
+data points about where it belongs and what it must not assume, instead of one.
+
 ## Cost, and where it actually is
 
 The worktrees are not the expensive part. One costs a dependency install and no context
