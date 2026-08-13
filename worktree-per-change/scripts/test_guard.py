@@ -166,6 +166,30 @@ def worktree_at(repo: Path, name: str, branch: str, merged: bool = True) -> Path
     return tree
 
 
+def leave_unfinished_rebase(onbase: Path, tree: Path) -> None:
+    """Leave a real, unfinished rebase in `tree` — the state a refused merge is fixed from.
+
+    Two commits are genuinely collided rather than `rebase-merge` being created by hand.
+    What the guard reads is git's own in-progress state, so a fixture that faked the
+    directory would keep passing while the real detection was broken — the same reason
+    `worktree_at` runs the merge through the guard instead of writing the marker itself.
+    """
+    (tree / "clash.txt").write_text("the topic's line\n", encoding="utf-8")
+    git(tree, "add", "clash.txt")
+    git(tree, "commit", "-m", "topic side")
+    # `onbase` is the worktree sitting on the integration branch, so this is the collision
+    # arriving from the base — which is what a rebase after a refused merge runs into.
+    (onbase / "clash.txt").write_text("the base's line\n", encoding="utf-8")
+    git(onbase, "add", "clash.txt")
+    git(onbase, "commit", "-m", "base side")
+    # Exits non-zero on the conflict, which is the entire point — so no `check=True`.
+    subprocess.run(
+        ["git", "-C", str(tree), "rebase", "development"],
+        capture_output=True,
+        text=True,
+    )
+
+
 # --------------------------------------------------------------------------- cases
 
 
@@ -641,6 +665,46 @@ def main() -> int:
             "the branch that actually merged is still refused",
             decision(run(write(still, str(still / "README.md")))),
             "deny",
+        )
+
+        # --- a merge the forge refused ------------------------------------------
+        # The marker goes down BEFORE `gh pr merge` runs, because no after-hook can tell a
+        # merge from a merge that failed. That was called the harmless direction while only
+        # the merging session saw it; the sweep and the Stop block then started reporting it
+        # to everybody as fact. Measured in integration-console on 2026-08-13: a `DIRTY` PR
+        # whose merge was refused, an unresolved rebase, ten modified files — announced to
+        # every new session as merged, with a request to remove the tree. Conflict
+        # resolution is the most expensive thing this hook could destroy.
+        refused = worktree_at(repo, "refused-tree", "dev/refused")
+        check(
+            "a spent tree refuses a write while nothing is in progress",
+            decision(run(write(refused, str(refused / "a.txt")))),
+            "deny",
+        )
+        leave_unfinished_rebase(onbase, refused)
+        check(
+            "an unfinished rebase outranks the spent marker",
+            decision(run(write(refused, str(refused / "a.txt")))),
+            "allow",
+        )
+        mid = run({"session_id": "c6", "hook_event_name": "Stop", "cwd": str(refused)})
+        check(
+            "Stop does not tell a mid-rebase session its change was delivered",
+            "recorded a merge" in ((mid or {}).get("reason", "")),
+            False,
+        )
+        swept_mid = run({"session_id": "c7", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        check(
+            "the sweep does not name a tree that is mid-rebase",
+            str(refused) in json.dumps(swept_mid or {}),
+            False,
+        )
+        # The other half of the pair: suppressing the in-progress tree must not suppress
+        # the sweep itself, which is what a bare "does not name" assertion would allow.
+        check(
+            "the sweep still names a landed tree with nothing in progress",
+            str(still) in json.dumps(swept_mid or {}),
+            True,
         )
 
     print(f"{PASSED} passed, {len(FAILED)} failed")

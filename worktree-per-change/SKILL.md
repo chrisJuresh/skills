@@ -349,8 +349,8 @@ squash-merged work as unmerged, so under this protocol they are all false negati
 
 What a *crashed* session leaves is a different problem: it never reaches `Stop`, and a
 merged worktree is indistinguishable from an in-progress one to anyone reading
-`git worktree list`. `SessionStart` reports those — landed worktrees still on disk — and
-for the full picture, at the start of a session when nothing is in flight:
+`git worktree list`. `SessionStart` reports those — worktrees that recorded a merge and are
+still on disk — and for the full picture, at the start of a session when nothing is in flight:
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/install.py" --status
@@ -360,6 +360,13 @@ Remove the ones reported as `clean and landed` that are yours. Another session's
 worktree is its business even after its branch merges — leave it and say it is there.
 Claude Code's own periodic sweep already removes subagent and background-session
 worktrees that hold no work.
+
+**What the sweep reports is a merge that was *attempted*.** The marker goes down before
+`gh pr merge` runs, because no hook can tell a merge from one the forge refused, so confirm
+with `gh pr view <n> --json state` before removing anything and read uncommitted changes as
+a merge that did not land. A tree holding an unfinished rebase or merge is left out of the
+report entirely and keeps its right to be edited — conflict resolution is the work, and it
+is the most expensive thing a wrong cleanup could destroy.
 
 One consequence of cleaning up routinely: worktree **paths get reused**, because the next
 change to the same area wants the same obvious name. The guard's spent marker is keyed by
