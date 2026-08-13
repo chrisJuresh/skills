@@ -7,6 +7,8 @@ branch, or before changing it.
 ## Contents
 
 - [The rule set](#the-rule-set)
+- [Which tree a rule is judged against](#which-tree-a-rule-is-judged-against)
+- [How it reads a command](#how-it-reads-a-command)
 - [How it tells a worktree from the main checkout](#how-it-tells-a-worktree-from-the-main-checkout)
 - [Spent worktrees](#spent-worktrees)
 - [The Stop hook](#the-stop-hook)
@@ -72,6 +74,31 @@ checkout and an unrelated clone sitting inside it as this repo's business. Paths
 compared with symlinks resolved — measured on macOS, a repo under `/var/folders/…` records
 its worktrees' git dir as `/private/var/…`, and an unresolved comparison reads one
 repository as two, which stands the guard down on the tree it is protecting.
+
+## How it reads a command
+
+It **lexes first** and looks for command boundaries in the token stream, so a quoted
+argument arrives whole and a single token is never a command. Until 2026-08-13 it split the
+raw characters on `&&`, `||`, `;`, `|` and newlines *before* lexing, and a quoted argument
+holding any of those was read as shell: a `gh pr create --body "…"` whose body mentioned
+`cd ~/x && git add -A` was denied as a `git add` in the main checkout, and a commit message
+mentioning `git stash` was denied inside a legitimate worktree. `--body-file` was the
+workaround; it is not needed now.
+
+- **Newlines are punctuation here, not whitespace.** `punctuation_chars` alone leaves a
+  newline as whitespace, which would erase the boundary between two commands on separate
+  lines and stop a `cd` on the first from reaching the second. It is added to the
+  punctuation set *and* removed from `whitespace`, because whitespace is tested first.
+- **Quotes stay on** (`posix=False`) and come off only where a token is read as a path
+  (`cd`, `-C`) or as a command name. The unquoting is hand-rolled rather than
+  `shlex.split`, which is POSIX-mode and eats backslashes — that would turn a PowerShell
+  `C:\Users\x` into `C:Usersx`.
+- **A command name must be whitespace-free once unquoted.** `"git" add -A` is a command a
+  shell runs, so a quoted spelling is read; `"cd ~/x && git add -A"` is data, because no
+  command this guard cares about is spelled with a space.
+- **Unbalanced quotes fall back to the old raw-text split.** It over-reports boundaries,
+  costing a false denial, where declining to read the text would cost a missed one — and
+  only the first of those is a failure a guard may have.
 
 ## How it tells a worktree from the main checkout
 
@@ -197,6 +224,14 @@ Honest limits, so nobody assumes cover that is not there.
   variable holding the word `git` — is not seen at all, because the parser reads tokens and
   those hide the token. The same limit as the shell redirect above, and the same answer: a
   parser that guessed at shell semantics would be the bigger hole.
+- **A heredoc body** is lexed as ordinary tokens, so a `git` line inside one is read as a
+  call. That is the same trade as the redirect above pointing the other way, and it errs
+  toward denying.
+- **`gh pr merge` is still matched against raw text**, unlike everything else here, so a PR
+  body quoting that phrase marks the worktree spent. Deliberate: the mark is written
+  *before* the merge runs anyway, because no hook can tell a merge from a merge that
+  failed, and a wrongly-spent tree costs a new worktree — which is what the protocol wanted
+  next regardless.
 - **A PR merged through the web UI** leaves no `gh pr merge` for the guard to see, so that
   worktree is never marked spent — no spent-edit denial, and no teardown prompt at `Stop`
   either, which makes it the one route by which a merged worktree still reaches the operator.

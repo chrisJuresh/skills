@@ -120,8 +120,8 @@ def build_foreign(root: Path) -> Path:
     return foreign
 
 
-def build(root: Path) -> tuple[Path, Path, Path]:
-    """A repo with `development` as its integration branch, plus two worktrees."""
+def build(root: Path) -> tuple[Path, Path, Path, Path]:
+    """A repo with `development` as its integration branch, plus three worktrees."""
     main = root / "repo"
     main.mkdir()
     git(main, "init", "-b", "main")
@@ -144,7 +144,12 @@ def build(root: Path) -> tuple[Path, Path, Path]:
     onbase = main / ".claude" / "worktrees" / "onbase"
     git(main, "worktree", "add", str(onbase), "development")
 
-    return main, topic, onbase
+    # A path with a space in it, which only a parser keeping quoted arguments whole can
+    # read: `cd "/a b/tree"` used to arrive as two tokens and resolve to neither.
+    spaced = main / ".claude" / "worktrees" / "with space"
+    git(main, "worktree", "add", str(spaced), "-b", "a-spaced-topic", "development")
+
+    return main, topic, onbase, spaced
 
 
 def worktree_at(repo: Path, name: str, branch: str, merged: bool = True) -> Path:
@@ -167,7 +172,7 @@ def worktree_at(repo: Path, name: str, branch: str, merged: bool = True) -> Path
 def main() -> int:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        repo, topic, onbase = build(root)
+        repo, topic, onbase, spaced = build(root)
 
         # --- denied in the main checkout ---------------------------------------
         check(
@@ -351,6 +356,107 @@ def main() -> int:
             decision(run(shell(topic, f"cd {onbase} && git stash"))),
             "deny",
         )
+
+        # --- shell, not prose that looks like it --------------------------------
+        # The parser tokenizes before it looks for command boundaries. Splitting raw text
+        # on `&&`, `|` and newlines first read the inside of a quoted argument as shell:
+        # measured on 2026-08-13, a `gh pr create --body "…"` whose body held the line
+        # `cd ~/x && git add -A` and a markdown table of pipes was denied as a `git add` in
+        # the main checkout, and `--body-file` was the workaround. Both halves need cover —
+        # the false positive that is fixed, and the real commands that must keep being seen.
+        # Every line here is load-bearing: it takes an operator *inside* the quotes to
+        # reproduce the bug. The raw-text split cuts the quoted string in half, each half
+        # is left with one unbalanced quote, `shlex.split` raises on both, and the bare
+        # `segment.split()` fallback then exposes the prose word by word.
+        body = (
+            "## What changed\n"
+            "\n"
+            "The install step is now `cd ~/x && git add -A`, which used to be manual.\n"
+            "Do not reach for git stash here || git reset --hard, both lose work.\n"
+            "\n"
+            "| case | before | after |\n"
+            "| --- | --- | --- |\n"
+            "| clean tree | manual | automatic |\n"
+        )
+        # From the main checkout the body's `git add`, and from a worktree its `git stash`,
+        # are both commands the guard really would deny — so an allow here is the parser
+        # telling prose from shell, not the rule standing down.
+        for cwd, place in ((repo, "the main checkout"), (topic, "a worktree")):
+            check(
+                f"a quoted PR body is not the commands it describes, from {place}",
+                decision(run(shell(cwd, f'gh pr create --base development --title x --body "{body}"'))),
+                "allow",
+            )
+        # `git stash` is denied in worktrees too, so a message about it was denied in the one
+        # place all the work happens — the same bug with no `--body-file` to escape to.
+        for message in (
+            "wip && git stash instead",
+            "see the table | git stash | done",
+            "line one\ngit stash is banned",
+        ):
+            check(
+                f"a commit message mentioning git is not a git call ({message!r})",
+                decision(run(shell(topic, f'git commit -m "{message}"'))),
+                "allow",
+            )
+
+        # The other half: everything the old raw-text split caught has to stay caught.
+        for command in ("echo x&&git commit -m y", "true;git add -A", "git status|grep x&&git reset --hard"):
+            check(
+                f"`{command}` is still seen without spaces around the operator",
+                decision(run(shell(repo, command))),
+                "deny",
+            )
+        # A newline is whitespace to shlex, which would have erased both boundaries here.
+        # The lexer is handed `\n` as punctuation instead, so line two is its own command
+        # and the `cd` on line one still carries into it.
+        check(
+            "a git call on the next line is still seen",
+            decision(run(shell(repo, "git status --short\ngit add -A"))),
+            "deny",
+        )
+        check(
+            "a `cd` on the line before still carries into the next command",
+            decision(run(shell(topic, f"cd {repo}\ngit commit -m x"))),
+            "deny",
+        )
+        check(
+            "...including when it carries the call out of this repository",
+            decision(run(shell(repo, f"cd {foreign}\ngit add -A"))),
+            "allow",
+        )
+        # Reading only the bare spelling would make the whole guard one quote deep.
+        for command in ('"git" add -A', "'git' commit -m x"):
+            check(
+                f"`{command}` is not laundered by quoting the command name",
+                decision(run(shell(repo, command))),
+                "deny",
+            )
+        check(
+            "a quoted path with a space in it reads as one path",
+            decision(run(shell(repo, f'cd "{spaced}" && git commit -m x'))),
+            "allow",
+        )
+        check(
+            "`git -C` takes a quoted path too",
+            decision(run(shell(repo, f'git -C "{spaced}" add README.md'))),
+            "allow",
+        )
+        check(
+            "...and quoting does not launder a target back into the main checkout",
+            decision(run(shell(topic, f'git -C "{repo}" add README.md'))),
+            "deny",
+        )
+        # An unbalanced quote is the one input shlex refuses outright, and the raw-text
+        # split is kept for it: over-reporting boundaries costs a false denial, where
+        # declining to read the text would cost a missed one. Only the first is a failure
+        # a guard may have.
+        for command in ('git commit -m "unclosed', "echo 'x && git add -A"):
+            check(
+                f"unlexable text falls back to the older reading ({command!r})",
+                decision(run(shell(repo, command))),
+                "deny",
+            )
 
         # --- stash, everywhere -------------------------------------------------
         check("`git stash` in a worktree is denied", decision(run(shell(topic, "git stash"))), "deny")
