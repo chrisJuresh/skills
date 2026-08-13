@@ -67,6 +67,10 @@ def decision(output: dict | None) -> str:
     return inner.get("permissionDecision", "allow")
 
 
+def reason(output: dict | None) -> str:
+    return ((output or {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+
+
 def check(name: str, got, want) -> None:
     global PASSED
     if got == want:
@@ -96,6 +100,24 @@ def shell(cwd: Path, command: str) -> dict:
 
 
 # ------------------------------------------------------------------------ fixtures
+
+
+def build_foreign(root: Path) -> Path:
+    """A second, unrelated repository — the one the guard has no business policing.
+
+    Deliberately shaped like the checkout that produced the bug: on a feature branch, and
+    with **no `development` branch at all**, so a denial's own remedy ("cut a worktree off
+    `origin/development`") would be impossible to carry out there.
+    """
+    foreign = root / "foreign"
+    foreign.mkdir()
+    git(foreign, "init", "-b", "a-feature")
+    git(foreign, "config", "user.email", "t@example.com")
+    git(foreign, "config", "user.name", "t")
+    (foreign / "a.txt").write_text("x\n", encoding="utf-8")
+    git(foreign, "add", "a.txt")
+    git(foreign, "commit", "-m", "init")
+    return foreign
 
 
 def build(root: Path) -> tuple[Path, Path, Path]:
@@ -230,6 +252,106 @@ def main() -> int:
             "deny",
         )
 
+        # --- scoped to the repository the operation targets ---------------------
+        # The bug this closes: a session whose cwd happened to be inside a guarded repo
+        # had every `git` mutator denied even when the command operated on a different
+        # checkout — while `Write` to that same other checkout was allowed, which is what
+        # showed the asymmetry was accidental. A denial there is unfollowable as well as
+        # wrong: the remedy it prints names a branch the other repo does not have.
+        foreign = build_foreign(root)
+        for command in (
+            f"cd {foreign} && git add -A",
+            f"cd {foreign} && git checkout a.txt",
+            f"cd {foreign} && git commit -m x",
+            f"git -C {foreign} add -A",
+            f"cd {foreign} && git stash",
+            "cd ../foreign && git add -A",
+        ):
+            check(
+                f"`{command}` targets another repository and is allowed",
+                decision(run(shell(repo, command))),
+                "allow",
+            )
+        check(
+            "a `cd` into a directory that is no repository at all is allowed",
+            decision(run(shell(repo, f"cd {root} && git add -A"))),
+            "allow",
+        )
+        check(
+            "a write into another repository is allowed",
+            decision(run(write(repo, str(foreign / "a.txt")))),
+            "allow",
+        )
+
+        # The other direction, which is the half that must not be weakened: naming the
+        # guarded tree from somewhere else does not buy an exemption.
+        check(
+            "a `cd` into this repository's own main checkout is still denied",
+            decision(run(shell(repo, f"cd {repo} && git reset --hard"))),
+            "deny",
+        )
+        check(
+            "`cd` back into the main checkout from a worktree is denied",
+            decision(run(shell(topic, f"cd {repo} && git commit -m x"))),
+            "deny",
+        )
+        check(
+            "`git -C <main checkout>` from a worktree is denied",
+            decision(run(shell(topic, f"git -C {repo} add ."))),
+            "deny",
+        )
+        check(
+            "a foreign first call does not excuse a second one that comes home",
+            decision(run(shell(repo, f"cd {foreign} && git add -A && git -C {repo} commit -m x"))),
+            "deny",
+        )
+        check(
+            "a write back into the main checkout from a worktree is denied",
+            decision(run(write(topic, str(repo / "README.md")))),
+            "deny",
+        )
+
+        # A target this hook cannot read means the session's own tree — the reading that
+        # keeps every ordinary command behaving exactly as it did.
+        check(
+            "an unexpandable `cd` falls back to the session's own tree",
+            decision(run(shell(repo, 'cd "$OTHER" && git add -A'))),
+            "deny",
+        )
+        check(
+            '`git -C "$W"` still reads as the session\'s own tree',
+            decision(run(shell(repo, 'git -C "$W" commit -m x'))),
+            "deny",
+        )
+
+        # A worktree of this repository is where work happens, whichever directory the
+        # command was issued from.
+        check(
+            "`cd <worktree>` from the main checkout is allowed",
+            decision(run(shell(repo, f"cd {topic} && git commit -m x"))),
+            "allow",
+        )
+        check(
+            "`git -C <worktree>` from the main checkout is allowed",
+            decision(run(shell(repo, f"git -C {topic} add README.md"))),
+            "allow",
+        )
+        check(
+            "a write into a worktree, named from the main checkout, is allowed",
+            decision(run(write(repo, str(topic / "README.md")))),
+            "allow",
+        )
+        check(
+            "a write into a worktree that is on the integration branch is denied from anywhere",
+            decision(run(write(topic, str(onbase / "README.md")))),
+            "deny",
+        )
+        check(
+            "another worktree's stash is still this repository's one stash stack",
+            decision(run(shell(topic, f"cd {onbase} && git stash"))),
+            "deny",
+        )
+
         # --- stash, everywhere -------------------------------------------------
         check("`git stash` in a worktree is denied", decision(run(shell(topic, "git stash"))), "deny")
         check("`git stash push` is denied", decision(run(shell(topic, "git stash push -m x"))), "deny")
@@ -285,6 +407,28 @@ def main() -> int:
             ),
             True,
         )
+        # --- the escape hatch names an action that exists -----------------------
+        # `CLAUDE_WORKTREE_GATE` is read from the hook's environment, so a session cannot
+        # set it: a `CLAUDE_WORKTREE_GATE=off git add …` prefix reaches the command, not
+        # the hook that already vetted it. A message telling the reader to do that spends
+        # a turn proving it does not work, which is worse than saying "ask the operator".
+        denial = reason(run(write(repo, str(repo / "README.md"))))
+        check(
+            "the denial does not tell a session to set a variable it cannot set",
+            "cannot turn this guard off" in denial and "operator" in denial,
+            True,
+        )
+        check(
+            "it names what the operator would have to do, and that it needs a new session",
+            "new session" in denial,
+            True,
+        )
+        check(
+            "and it names the move that is actually available: say so, and stop",
+            "say so plainly in your reply" in denial,
+            True,
+        )
+
         outside = root / "not-a-repo"
         outside.mkdir()
         check(
