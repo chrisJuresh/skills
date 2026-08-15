@@ -230,24 +230,31 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     else:
         print(f"  #{number} is already open for {topic}")
 
+    # No `--delete-branch`, deliberately. It makes `gh` do local git work after the API
+    # call — it checks out the base branch to delete the merged one — and under this
+    # protocol that always fails, because the main checkout is permanently sitting on the
+    # integration branch:
+    #
+    #     failed to run git: fatal: 'main' is already used by worktree at '…'
+    #
+    # Measured 2026-08-15, landing this script's own first change. The merge had already
+    # happened on the forge; only the cleanup failed. So the flag cannot do the one thing
+    # it is for here, and asking it to leaves the remote branch standing while returning
+    # an error — the worst of both. The deletion is done explicitly below instead, where
+    # it is one API call that cannot be confused by what this checkout has checked out.
     print("\nmerge")
     target = str(number) if number is not None else "<n>"
-    merged = run(
-        ["gh", "pr", "merge", target, "--squash", "--delete-branch"], tree, args.dry_run
-    )
-    if not args.dry_run and merged.returncode != 0:
-        raise Refused(
-            f"gh pr merge failed:\n{(merged.stderr or '').strip()}\n"
-            "Nothing has been marked as landed. Fix what it reports and run this again."
-        )
+    merged = run(["gh", "pr", "merge", target, "--squash"], tree, args.dry_run)
 
-    # `gh pr merge` reporting success is not the forge reporting MERGED, and the two come
-    # apart often enough to matter: a merge queue, a required check, a rule that turns the
-    # request into a queued one. Everything after this point deletes things, so ask.
+    # A non-zero exit is a question, not an answer. `gh` can merge the PR and then fail on
+    # something afterwards, and the two are indistinguishable from the exit code — which is
+    # exactly how the run above ended: exit 1, a git error, and a merged PR. Refusing on
+    # the exit code alone reports a change as unlanded while it is sitting on the
+    # integration branch, and sends the next session to redo it.
     print("\nverify")
     if args.dry_run:
         run(["gh", "pr", "view", target, "--json", "state", "--jq", ".state"], tree, True)
-        run(["git", "fetch", "origin", "--prune"], tree, True)
+        run(["git", "push", "origin", "--delete", topic], tree, True)
         print("  (dry run — nothing was pushed, opened, merged or deleted)")
         return 0
 
@@ -255,23 +262,26 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     landed = (state.stdout or "").strip()
     if landed != "MERGED":
         raise Refused(
-            f"the forge reports #{number} as {landed or 'unknown'}, not MERGED. "
-            "The branch has NOT been deleted and the change has not landed."
+            f"the forge reports #{number} as {landed or 'unknown'}, not MERGED"
+            + (f", and gh reported:\n{(merged.stderr or '').strip()}" if merged.returncode else "")
+            + "\nThe branch has NOT been deleted and the change has not landed."
         )
+    if merged.returncode:
+        # Worth saying out loud rather than swallowing: the merge landed, something after
+        # it did not, and the next person to read this transcript should know which.
+        print(f"  gh exited {merged.returncode} after the merge — {(merged.stderr or '').strip()}")
     print(f"  #{number} is MERGED")
 
-    # `--delete-branch` deletes the local branch first and the remote second, and when the
-    # local delete fails it abandons the remote one — leaving standing exactly the branch
-    # it was asked to remove. The local delete fails whenever a worktree still has the
-    # branch checked out, which this one does, so that is the normal case here rather than
-    # an edge one. Verify against the remote and finish the job.
+    # The branch is deleted here, from the forge, for the reason in the comment above and
+    # one more: a merged branch left standing is a live push target after the PR that
+    # reviewed it has closed, and a commit pushed there looks like ordinary work and
+    # reaches the integration branch never.
+    deleted = run(["git", "push", "origin", "--delete", topic], tree)
     run(["git", "fetch", "origin", "--prune"], tree)
     remote = git(tree, "ls-remote", "--heads", "origin", topic) or ""
     if remote.strip():
-        print(f"  {topic} is still on the remote — `--delete-branch` did not finish it")
-        deleted = run(["git", "push", "origin", "--delete", topic], tree)
-        if deleted.returncode != 0:
-            print(f"  ! could not delete it: {(deleted.stderr or '').strip()}")
+        print(f"  ! {topic} is STILL on the remote: {(deleted.stderr or '').strip()}")
+        print(f"  ! delete it by hand — `git push origin --delete {topic}`")
     else:
         print(f"  {topic} is gone from the remote")
 
