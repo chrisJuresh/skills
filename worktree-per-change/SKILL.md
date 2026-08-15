@@ -80,10 +80,31 @@ git add <path> ...
 git commit -m "<what changed>"
 
 # 3. deliver — all of it, unasked
+python .claude/scripts/land.py        # push, PR if there is none, merge, verify
+```
+
+`land.py` is the same four commands with the verification that each of them needs, and it
+exists so that the delivery step can be *allowed* — see below. Where a repo does not have
+it, run them by hand and keep the verification:
+
+```bash
 git push -u origin HEAD
 gh pr create --base <integration> --fill
 gh pr merge --squash --delete-branch
 ```
+
+**The delivery step is the one a permission layer stops, and a stopped delivery is not a
+delivered change.** This is not the guard refusing — it is the machine not having been told
+that this agent may push and merge — and the two want opposite responses: obey the guard,
+and *fix* the permission, once, in `settings.json`. `install.py` writes the entries;
+[references/permissions.md](references/permissions.md) is the list and the reasoning.
+
+Never wrap a command to make it unrecognisable to that layer. It does not work — what is
+inspected is the command about to run — and it takes a decision away from the person whose
+decision it is. `land.py` is the legitimate shape: it makes the grant **smaller**, not
+quieter. It takes no PR number and no branch, so it can only ever merge the PR whose head is
+the branch in the worktree it was run from, into the branch that repo recorded. One entry
+for it grants the protocol; `Bash(gh pr merge:*)` would grant every PR on the machine.
 
 Pushing and merging are part of finishing, not a separate errand to be asked about. A
 branch that exists only on this disk is not a delivered change: the operator is left
@@ -266,14 +287,33 @@ Per repository is the usual install, because the rule depends on what that repos
 branches mean:
 
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --branch development --dry-run
+python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --dry-run
 ```
 
 Show the user that output, then run it without `--dry-run`. It copies the guard to
-`.claude/hooks/`, registers three hooks in the committed `.claude/settings.json`, writes
+`.claude/hooks/` and `land.py` to `.claude/scripts/`, registers three hooks and the
+allowlist in the committed `.claude/settings.json`, writes
 `.claude/worktree-per-change.json` with the integration branch, and links this skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three, and
+`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all four, and
 check `.gitignore` is not swallowing them.
+
+**It asks which branch changes merge into, and does not guess.** This is the setting that
+is silently wrong: a guard pointed at the wrong integration branch denies nothing and
+breaks nothing, it just aims every future PR at a branch nobody merges, and nothing looks
+broken until somebody goes looking for the work. Repos differ on this in ways no
+inspection settles — some integrate through their default branch, others hold changes on
+`development` or a `queue` branch and promote from there — so **ask the user, do not read
+it off `origin/HEAD`.** Measured 2026-08-15: a repo with both `main` and `development` had
+its newest PRs on `main` and two older ones on `development`, and no rule over the branch
+list gets that right. Pass `--branch <name>` once they have answered; that also makes the
+install non-interactive, and with no answer available at all it refuses rather than picks.
+
+It also writes a `permissions.allow` block — read-only `git` and `gh` at both scopes, and
+the protocol's own writes at repo scope. That is the second half of making the rule
+followable: the guard says what may not be done, and the allowlist stops the machine
+querying the parts that must be. `--no-permissions` skips it;
+[references/permissions.md](references/permissions.md) has the list, what is deliberately
+left out, and why the read-only half also belongs in `~/.claude/settings.json`.
 
 A repo install registers the hook as `python` against
 `${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py`, deliberately: the file is
@@ -284,10 +324,16 @@ the session is actually in. `--python` overrides the interpreter where `python` 
 
 - Omit `--repo` to install at user scope for every repository on the machine. It applies
   one integration branch to repos that may not share it, so prefer per-repo.
+- `--permissions-only` writes the allowlist and nothing else — no hooks, no guard, no
+  config. Run it once at user scope on any machine doing this work: permissions are scoped
+  to the session's project directory, so read-only rules that live only in each repo leave
+  every cross-repository session stopped on `git status`, including the one installing this
+  guard into the next repo.
 - `--status` reports what is installed, which branch this repo integrates through,
   whether the cwd may write, and every worktree with what it is still holding.
-- `--uninstall` removes it. `--keep-legacy` leaves a predecessor concurrent-writer guard
-  registered instead of replacing it.
+- `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
+  a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
+  predecessor concurrent-writer guard registered instead of replacing it.
 
 New hooks apply to sessions started afterwards, so say so rather than letting the user
 assume the current session is covered.
@@ -308,6 +354,15 @@ way around, and do not re-run the same command hoping it lands.
 | An edit in a worktree that is on the integration branch | `git switch -c <short-topic-name>` first. |
 | An edit in a worktree whose PR has merged | That change is finished. Take a new worktree for the next one. |
 | `git stash`, anywhere | Commit instead: `git add <paths> && git commit -m "wip"`. |
+
+**First check it is this guard denying you.** A denial that names no next move, or that
+says permission rather than protocol, is the machine's permission layer and not the rule —
+and it is the one denial with no move available inside the session. Retrying it, rephrasing
+it, or wrapping the command to get it past are all the same wasted turn. Say what was
+stopped and stop; the operator adds a rule once and it never happens again. That layer is
+also scoped to the session's *project directory*, so a command allowed in one repository is
+stopped in another on the same machine — see
+[references/permissions.md](references/permissions.md).
 
 `git stash` is denied in worktrees too, and that is not an oversight: `refs/stash` is a
 single stack for the whole repository, so a push in one worktree renumbers every other
@@ -484,5 +539,9 @@ So the levers are on the briefing side:
   its modes, what it deliberately does not cover, and how to debug it.
 - [references/ticketing.md](references/ticketing.md) — working a ticket queue with
   several agents, including Matt Pocock's `to-tickets` → `implement` → `code-review` chain.
+- [references/permissions.md](references/permissions.md) — the two layers that stop this
+  protocol and why only one of them is the guard; the allowlist `install.py` writes, entry
+  by entry; the prefix-matching traps; and why wrapping a command to hide it from a
+  permission layer is the one wrapper never to write.
 - [references/replacing-a-concurrent-writer-guard.md](references/replacing-a-concurrent-writer-guard.md)
   — migrating a repo that already ships a hook of its own.
