@@ -666,7 +666,12 @@ def main() -> int:
               f"{', syncedFrom ' + synced[:12] if synced else ''})")
     for line in removed:
         print(f"removed predecessor guard  {line}")
-    write_json(target, settings, backup=True)
+    # Same rule as the uninstall path, and it was missing here: no `.bak` beside a
+    # *committed* settings file. Git is already the backup, and the stray file lands in the
+    # next person's `git status` — measured 2026-08-15 on a resync, where it showed up
+    # untracked beside the change it was supposed to be protecting. A user-scope settings
+    # file has no git behind it, so that one is still copied first.
+    write_json(target, settings, backup=repo is None)
     print(f"guard   -> {script}")
     if lander is not None:
         print(f"land    -> {lander} (run it as `{LAND_COMMAND}` from a worktree)")
