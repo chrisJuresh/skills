@@ -344,10 +344,9 @@ the session is actually in. `--python` overrides the interpreter where `python` 
 - Omit `--repo` to install at user scope for every repository on the machine. It applies
   one integration branch to repos that may not share it, so prefer per-repo.
 - `--permissions-only` writes the allowlist and nothing else — no hooks, no guard, no
-  config. Run it once at user scope on any machine doing this work: permissions are scoped
-  to the session's project directory, so read-only rules that live only in each repo leave
-  every cross-repository session stopped on `git status`, including the one installing this
-  guard into the next repo.
+  config. Run it once at user scope on any machine doing this work: a repo-scoped rule
+  cannot cover a session that has to read a *different* repository, and installing this
+  guard into the next repo is exactly that shape of task.
 - `--status` reports what is installed, which branch this repo integrates through,
   whether the cwd may write, and every worktree with what it is still holding.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
@@ -378,9 +377,10 @@ way around, and do not re-run the same command hoping it lands.
 says permission rather than protocol, is the machine's permission layer and not the rule —
 and it is the one denial with no move available inside the session. Retrying it, rephrasing
 it, or wrapping the command to get it past are all the same wasted turn. Say what was
-stopped and stop; the operator adds a rule once and it never happens again. That layer is
-also scoped to the session's *project directory*, so a command allowed in one repository is
-stopped in another on the same machine — see
+stopped and stop; the operator adds a rule once and it never happens again. Where no rule
+covers a command that layer *judges*, and the judgement is not stable — the same command
+can be stopped in one repository and allowed in another, or stopped and then allowed in the
+same one. So do not reason about when it will stop you; write the rule. See
 [references/permissions.md](references/permissions.md).
 
 `git stash` is denied in worktrees too, and that is not an oversight: `refs/stash` is a

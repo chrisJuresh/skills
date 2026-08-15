@@ -128,21 +128,28 @@ delete`, `gh secret`, `gh auth token`, `git push` in any form but the protocol's
 `git reset`, `git clean`, `git rebase`, `git merge`, `git checkout`, `git switch` other
 than `-c`.
 
-## Where the rules go, and the scoping that decides it
+## Where the rules go
 
 Repo scope (`.claude/settings.json`, committed, beside the hooks) is the usual home: the
 rules travel with the guard they belong to, and everyone working in that repository gets
 the same ones.
 
-**But a session's permissions are scoped to its project directory, and that is not always
-where the work is.** Measured 2026-08-15: a session rooted at one repository had `git fetch`
-allowed there and stopped in a second repository on the same machine — the same command,
-the same account, a different project directory. Anything that reaches across repositories
-sees this, and installing a skill into other repos is exactly that shape of task.
+**A rule that is not written down is judged, and the judgement is not stable.** Where no
+rule covers a command, an unattended session falls back to a classifier, and what it
+decides is not a property of the command alone. Measured 2026-08-15, in one session: the
+same `git fetch origin` was stopped in one repository and allowed in another minutes
+earlier — and later allowed in the first as well, with nothing about the command changed.
+`git worktree add`, `git branch -D` and a recursive delete were stopped in the same window
+and permitted afterwards.
 
-So put the **read-only** entries in `~/.claude/settings.json` as well. They are safe
-machine-wide by construction, and they are the ones whose absence in some other directory
-turns into a session that has stopped asking anything. Once per machine:
+Do not build a theory of *when* it stops things. The lesson is narrower and more useful:
+**anything you rely on, write a rule for.** A protocol whose routine steps are decided
+case by case is one that works until the day it does not, in the middle of a change.
+
+That is also why the **read-only** entries belong in `~/.claude/settings.json` and not only
+in each repo. A repo-scoped rule cannot cover a session that has to read another repository
+— installing this guard into the next one is exactly that shape — and those reads are the
+ones whose refusal teaches a session to stop asking anything at all. Once per machine:
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/install.py" --permissions-only
