@@ -26,6 +26,11 @@ It stops before removing the worktree, because nothing can remove the tree it is
 standing in — see SKILL.md step 4 for the two commands that follow, and the allowlist
 entries that let them run.
 
+It refuses a branch that has already merged, before pushing anything. That is not a
+nicety: after a change lands there is no remote branch and no open PR, so every later
+check reads like a change that was never delivered, and running this twice opens a
+second PR whose diff is empty and merges it.
+
 Usage:
     python .claude/scripts/land.py              push, PR if needed, merge, verify
     python .claude/scripts/land.py --dry-run    print the sequence, run none of it
@@ -175,15 +180,15 @@ def preflight(tree: Path, branch: str) -> str:
 # -------------------------------------------------------------------------- steps
 
 
-def pr_number(tree: Path, topic: str) -> int | None:
-    """The open PR whose head is `topic`, if there is one.
+def head_pr(tree: Path, topic: str, state: str) -> int | None:
+    """The PR whose head is `topic` and whose state is `state`, if there is one.
 
     Asked by head branch, never by number: the number is the input that would let this
     script merge something that has nothing to do with the worktree it was run from,
     which is the whole reason it is narrow enough to allowlist.
     """
     result = subprocess.run(
-        ["gh", "pr", "list", "--head", topic, "--state", "open",
+        ["gh", "pr", "list", "--head", topic, "--state", state,
          "--json", "number", "--jq", ".[0].number"],
         cwd=str(tree), capture_output=True, text=True,
     )
@@ -197,18 +202,44 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     print(f"branch:      {topic}  ->  {branch}")
     print()
 
+    # Asked BEFORE the push, because the push is what makes this undetectable. A landed
+    # change leaves no remote branch and no *open* PR, so every check after the push
+    # reads exactly like a change that has not been delivered yet: `git push -u origin
+    # HEAD` recreates the deleted branch and succeeds, the search for an open PR finds
+    # nothing, and a second PR is opened from a branch whose content is already on the
+    # integration branch. It merges, because an empty diff is a mergeable one.
+    #
+    # Measured 2026-08-15: this script run twice against one worktree put `(#55)` and
+    # `(#56)` on `main` for one change, the second changing no files. The push-failure
+    # branch below was written expecting to catch this and cannot -- the push is the
+    # step that succeeds.
+    #
+    # Refusing is right rather than merely safe: the protocol is one worktree, one
+    # branch, one change, so a branch that has already merged has nothing left to
+    # deliver. A second change gets a new worktree.
+    landed = head_pr(tree, topic, "merged")
+    if landed is not None:
+        raise Refused(
+            f"#{landed} has already merged `{topic}`, so this change is finished and "
+            "nothing here is undelivered.\n"
+            "Take this worktree down and cut a new one for the next change:\n"
+            f"    git worktree remove {tree}\n"
+            f"    git branch -D {topic}"
+        )
+
     print("push")
     pushed = run(["git", "push", "-u", "origin", "HEAD"], tree, args.dry_run)
     if pushed.returncode != 0:
-        # The common cause is a branch that was merged and deleted already, which is the
-        # spent-worktree case one level out. Say so rather than reporting git's wording.
+        # This used to say "if this branch has already merged, the change is finished",
+        # which was the right diagnosis attached to the wrong step: a merged branch is
+        # deleted, so pushing it back up succeeds. The check above catches that case now,
+        # and what is left here is the remote refusing the push on its own terms -- a
+        # protected branch, a rejected non-fast-forward, no credentials.
         raise Refused(
-            f"the push was refused:\n{(pushed.stderr or '').strip()}\n"
-            "If this branch has already merged, this change is finished — take a new "
-            "worktree for the next one."
+            f"the push was refused:\n{(pushed.stderr or '').strip()}"
         )
 
-    number = None if args.dry_run else pr_number(tree, topic)
+    number = None if args.dry_run else head_pr(tree, topic, "open")
     print("\npull request")
     if number is None:
         create = ["gh", "pr", "create", "--base", branch]
@@ -220,7 +251,7 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
         if not args.dry_run:
             if created.returncode != 0:
                 raise Refused(f"gh pr create failed:\n{(created.stderr or '').strip()}")
-            number = pr_number(tree, topic)
+            number = head_pr(tree, topic, "open")
             if number is None:
                 raise Refused(
                     "the PR was created but cannot be found by head branch, so this "
