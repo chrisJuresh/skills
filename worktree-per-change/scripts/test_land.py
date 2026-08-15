@@ -114,9 +114,19 @@ def main() -> int:
         # The sequence is printed in full, because an allowlisted script that is not
         # watched is one whose transcript is the only record of what it did.
         for step in ("git push -u origin HEAD", "gh pr create --base queue",
-                     "gh pr merge", "--squash", "--delete-branch"):
+                     "gh pr merge", "--squash", "git push origin --delete topic"):
             check(f"the dry run shows `{step}`", step in out.stdout, True)
         check("the dry run says it did nothing", "nothing was pushed" in out.stdout, True)
+
+        # `--delete-branch` is deliberately absent, and this is the check that keeps it
+        # absent. It makes `gh` do local git work after the API call — it checks out the
+        # base branch in order to delete the merged one — and under this protocol the main
+        # checkout is permanently sitting on the base, so it always fails, *after* the
+        # merge has already happened. Measured 2026-08-15 landing this script's own first
+        # change: `fatal: 'main' is already used by worktree at ...`, exit 1, and a MERGED
+        # pull request with its branch still standing.
+        check("it does not ask gh to delete the branch",
+              "--delete-branch" in out.stdout, False)
 
         # It never learns a PR number from its arguments — that is what keeps one
         # allowlist entry from being a grant over every PR on the machine.

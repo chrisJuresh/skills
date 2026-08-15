@@ -90,7 +90,9 @@ it, run them by hand and keep the verification:
 ```bash
 git push -u origin HEAD
 gh pr create --base <integration> --fill
-gh pr merge --squash --delete-branch
+gh pr merge --squash                       # NOT --delete-branch — see below
+gh pr view <n> --json state --jq .state    # expect MERGED, whatever gh exited
+git push origin --delete <short-topic-name>
 ```
 
 **The delivery step is the one a permission layer stops, and a stopped delivery is not a
@@ -113,12 +115,13 @@ branch that is missing your work. The `Stop` hook refuses to end a session that 
 walking away from uncommitted or unpushed work, and says which — and equally refuses one
 that walks away from a worktree it has already merged (step 4).
 
-**`--delete-branch` is not tidiness.** A merged branch left standing is a live push
+**Deleting the branch is not tidiness.** A merged branch left standing is a live push
 target after the PR that reviewed it has closed — the same failure the spent-worktree
 rule catches one level down, and harder to notice, because a commit pushed there looks
 like ordinary work on an ordinary branch and reaches the integration branch never.
 Deleting it makes that push fail loudly instead. It also keeps `git branch -r` readable,
-which is what makes a genuinely unmerged branch visible at all.
+which is what makes a genuinely unmerged branch visible at all. What must not do it for
+you is `gh`'s `--delete-branch` — see below.
 
 ```bash
 # 4. take the tree down — this is still finishing, not tidying
@@ -140,13 +143,29 @@ The order is forced: nothing can remove the working tree it is standing in, and 
 inside a worktree Claude Code refuses `git -C <main>` redirects back out. So the exit
 comes first and the removal second — two steps, and no way to fold them into one.
 
-**`--delete-branch` is not reliable on its own, and it fails quietly.** It deletes the
-local branch first and the remote second, and when the local delete fails it **abandons
-the remote one** — so it leaves standing exactly the branch you asked it to remove. The
-local delete fails whenever a worktree still has the branch checked out, which yours does
-at merge time, so this is the *normal* case here rather than an edge one. Measured twice
-in one afternoon: `gh` reported only `failed to delete local branch`, and the remote
-branch was still listed after a pruning fetch.
+**So do not pass `--delete-branch` under this protocol at all.** The flag makes `gh` do
+local git work after the API call, and there is no arrangement of worktrees in which that
+work can succeed here: to delete the merged branch it checks out the **base** branch, and
+the main checkout is permanently sitting on the base. Measured 2026-08-15, landing
+`land.py`'s own first change:
+
+```
+failed to run git: fatal: 'main' is already used by worktree at 'C:/Users/Chris/Desktop/skills'
+```
+
+`gh` exited 1, the pull request was **MERGED**, and the branch was still on the remote.
+That is the shape to remember, because it is the expensive one: the flag fails *after* the
+merge, so the exit code describes the cleanup and says nothing about whether the change
+landed. The earlier reading of this failure was that the local delete runs first and
+**abandons the remote one** when it fails — true, and it has the same consequence: the
+branch you asked it to remove is exactly the branch left standing.
+
+**A non-zero exit from `gh pr merge` is therefore a question, not an answer.** Ask the
+forge before believing it. Reporting a merged change as unlanded is worse than the merge
+failing outright, because the next session redoes work that is already on the integration
+branch. `land.py` does this: it merges without the flag, checks `state` whatever `gh`
+returned, deletes the remote branch itself, and says so when `gh` failed after a merge that
+landed.
 
 So verify, and finish by hand — asking the **remote**, not a tracking ref:
 
