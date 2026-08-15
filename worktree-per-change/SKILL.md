@@ -84,8 +84,22 @@ python .claude/scripts/land.py        # push, PR if there is none, merge, verify
 ```
 
 `land.py` is the same four commands with the verification that each of them needs, and it
-exists so that the delivery step can be *allowed* — see below. Where a repo does not have
-it, run them by hand and keep the verification:
+exists so that the delivery step can be *allowed* — see below.
+
+**It also refuses a branch that has already merged, before pushing anything**, and running
+it by hand means doing that check by hand. A landed change leaves no remote branch and no
+open PR, so every check *after* the push reads exactly like a change that was never
+delivered: the push recreates the deleted branch and succeeds, no open PR is found, and a
+second PR is opened from a branch whose content is already on the integration branch — which
+merges, because an empty diff is a mergeable one. Measured 2026-08-15: one change, landed
+twice, `(#55)` and `(#56)` on `main` and the second changing no files. Ask first:
+
+```bash
+gh pr list --head <short-topic-name> --state merged --json number --jq '.[0].number'
+```
+
+Anything printed there means the change is finished and the worktree is spent — take it
+down and cut a new one. Then the rest, keeping the verification:
 
 ```bash
 git push -u origin HEAD
