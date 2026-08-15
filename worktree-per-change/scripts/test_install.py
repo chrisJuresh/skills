@@ -54,6 +54,15 @@ def config_of(repo: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
+def permissions_of(repo: Path) -> list[str]:
+    path = repo / ".claude" / "settings.json"
+    if not path.is_file():
+        return []
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    allow = (settings.get("permissions") or {}).get("allow")
+    return allow if isinstance(allow, list) else []
+
+
 def registrations(repo: Path) -> list[str]:
     path = repo / ".claude" / "settings.json"
     if not path.is_file():
@@ -167,6 +176,90 @@ def main() -> int:
         check("uninstall clears the registrations", registrations(gone), [])
         check("uninstall removes the guard", (gone / ".claude" / "hooks" / "worktree-guard.py").exists(), False)
         check("uninstall removes the config", (gone / ".claude" / "worktree-per-change.json").exists(), False)
+
+        # --- the integration branch is asked for, never assumed --------------------
+        # The setting that is silently wrong. A guard installed against the wrong branch
+        # denies nothing and breaks nothing; it just aims every future PR at a branch
+        # nobody merges. So an install with no answer available has to stop, and the one
+        # thing it must never do is pick.
+        asked = fresh(root, "asked")
+        blind = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(asked), "--no-skill"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        check("an install with no answer refuses", blind.returncode, 2)
+        check("and says how to answer it", "--branch" in blind.stderr, True)
+        check("and installs nothing", (asked / ".claude" / "settings.json").exists(), False)
+        # An answer down a pipe is an answer. `isatty()` is false there, and under Git Bash
+        # on Windows it is *true* for stdin redirected from /dev/null — so what decides is
+        # whether a line arrives, not what stdin claims to be.
+        piped = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(asked), "--no-skill"],
+            capture_output=True, text=True, input="queue\n",
+        )
+        check("an answer down a pipe is taken", piped.returncode, 0)
+        check("and is what gets recorded", config_of(asked).get("integrationBranch"), "queue")
+
+        # --- the allowlist ---------------------------------------------------------
+        # Two different denials stop this protocol, and only one of them is the guard. A
+        # permission layer that stops `git status` teaches an agent to stop asking, and one
+        # that stops `gh pr merge` leaves the change on the disk it was made on.
+        allowed = permissions_of(repo)
+        # A rule is `Bash(<command>)`, tool name and all. A bare `git status:*` in the
+        # allow list is not a narrower rule, it is one that matches nothing — and it fails
+        # silently, because the file looks right and every command it covers is still
+        # stopped. So the spelling is asserted, not just the contents.
+        check("read-only git is allowed", "Bash(git status:*)" in allowed, True)
+        check("read-only gh is allowed", "Bash(gh pr view:*)" in allowed, True)
+        check("the lander is allowed",
+              "Bash(python .claude/scripts/land.py:*)" in allowed, True)
+        check("every entry is a Bash rule",
+              all(r.startswith("Bash(") and r.endswith(")") for r in allowed), True)
+
+        # The entries are prefix matches on the whole command, so a bare verb is a much
+        # larger grant than it looks. These three are the ones that would give away the
+        # protocol itself, `git config`, and every write the token can reach.
+        check("`git branch` is not allowed bare", "Bash(git branch:*)" in allowed, False)
+        check("`git config` is not allowed bare", "Bash(git config:*)" in allowed, False)
+        check("`gh api` is not allowed at all",
+              any(r.startswith("Bash(gh api") for r in allowed), False)
+        # ...and the one that would make the narrow lander pointless.
+        check("`gh pr merge` is not allowed wholesale",
+              any(r.startswith("Bash(gh pr merge") for r in allowed), False)
+
+        # A resync must not duplicate them, for the same reason it must not double-register
+        # the hooks: the file is read every session and grows every install.
+        install(repo)
+        check("a resync does not duplicate entries",
+              len(permissions_of(repo)), len(set(permissions_of(repo))))
+
+        # The lander is copied in and dated, because it is committed and so it is a fork
+        # the moment this skill moves — the same failure the guard's own record exists for.
+        check("the lander is copied in", (repo / ".claude" / "scripts" / "land.py").is_file(), True)
+        check("and its provenance is recorded",
+              bool((config_of(repo).get("land") or {}).get("sha256")), True)
+
+        # --- an operator's own decisions survive ------------------------------------
+        # The permissions block is the repo's, not this installer's. Somebody allowed
+        # `npm test` here; an uninstall that took the whole block would silently reverse a
+        # decision it was never asked about.
+        settings_file = repo / ".claude" / "settings.json"
+        blob = json.loads(settings_file.read_text(encoding="utf-8"))
+        blob["permissions"]["allow"].append("Bash(npm test:*)")
+        settings_file.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+        install(repo)
+        check("a rule the operator added survives a resync",
+              "Bash(npm test:*)" in permissions_of(repo), True)
+        install(repo, "--uninstall")
+        check("uninstall drops ours", "Bash(git status:*)" in permissions_of(repo), False)
+        check("and leaves theirs", "Bash(npm test:*)" in permissions_of(repo), True)
+
+        # --- opting out ------------------------------------------------------------
+        bare = fresh(root, "bare")
+        install(bare, "--no-permissions")
+        check("--no-permissions writes none", permissions_of(bare), [])
+        check("but still registers the hooks", registrations(bare),
+              ["PreToolUse", "SessionStart", "Stop"])
 
         # --- a predecessor guard is replaced, not left beside ----------------------
         legacy = fresh(root, "legacy")
