@@ -543,10 +543,9 @@ def main() -> int:
 
     if args.permissions_only:
         # The read-only half, and nothing else. This is the user-scope install that
-        # actually makes sense: a session's permissions are scoped to its project
-        # directory, so rules living only in each repo leave every cross-repository
-        # session — installing this guard into another repo, for one — stopped on
-        # `git status`. The hooks stay per repo, because the rule they enforce does.
+        # actually makes sense: a repo-scoped rule cannot cover a session that has to read
+        # a *different* repository, and installing this guard into another repo is exactly
+        # that shape of task. The hooks stay per repo, because the rule they enforce does.
         entries = [rule(command) for command in READ_ONLY]
         if repo:
             entries += [rule(command) for command in DELIVERY]
