@@ -137,6 +137,13 @@ def main() -> int:
         blob["ticketPrefix"] = "PORT"
         path.write_text(json.dumps(blob, indent=2), encoding="utf-8")
         check("resync succeeds", install(repo).returncode, 0)
+        # A repo install must not drop a `.bak` beside a file git already versions. Small
+        # mess, real cost: it is untracked, so it turns up in the `git status` of whoever
+        # installs or resyncs next, beside the change they are trying to read. Measured
+        # 2026-08-15 — this check exists because the rule was written down, applied to the
+        # uninstall path, and missed on this one, which is the path everyone takes.
+        check("a resync leaves no .bak beside a committed settings.json",
+              sorted(p.name for p in (repo / ".claude").glob("*.bak")), [])
         check("a key the repo added survives it", config_of(repo).get("ticketPrefix"), "PORT")
         check("the provenance survives it", bool((config_of(repo).get("guard") or {}).get("sha256")), True)
         check("it does not double-register", registrations(repo),
