@@ -250,6 +250,17 @@ output, local config and anything else `.gitignore` covers are simply absent:
 - **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
   start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
   and the failure looks like the tool being broken rather than the file being missing.
+- **The toolchain selection.** A worktree inherits the shell's default interpreter, not the
+  repository's pin — an `.nvmrc` is a file, not a shell hook, and a version manager that
+  needs one is no help to a session. What makes this awkward rather than routine is that
+  the obvious fix is unavailable: **while a session is inside `EnterWorktree`, Claude Code
+  refuses a `PATH=… <cmd>` prefix**, and `env PATH=… <cmd>` with it, as a command whose
+  effect it cannot verify. That is the harness's isolation and not this guard — outside a
+  worktree the same prefix runs fine. Address the binary absolutely instead:
+  `…/v22.16.0/bin/node …/npm/bin/npm-cli.js run <script>`, which reaches child processes
+  too, because npm puts its own node directory at the front of `PATH` for lifecycle
+  scripts. Measured 2026-08-19 on a repo whose gate scripts need Node 22, on a machine
+  whose shell defaults to 16.
 - **Untracked scratch state** the last session left in the main checkout.
 
 Two ways to fix it, and the second is better for anything a *human* also needs:
