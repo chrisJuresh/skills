@@ -142,6 +142,62 @@ def main() -> int:
         check("it targets the recorded branch", "fix  ->  main" in out.stdout, True)
         check("and opens the PR against it", "--base main" in out.stdout, True)
 
+        # --- merging the integration branch down ------------------------------------
+        # Off unless asked for, because in a repo where changes land one at a time it is a
+        # fetch and a merge commit that buy nothing. The default has to be *provable*: this
+        # is the flag whose accidental arrival would change what every existing consumer's
+        # `land.py` does on the happy path.
+        out = land(root / "wt-main", "--dry-run")
+        check("the merge-down is off by default", "merge main down first" in out.stdout, False)
+        out = land(root / "wt-main", "--dry-run", "--merge-integration")
+        check("the flag turns it on", "merge main down first" in out.stdout, True)
+        check("and it runs before the push",
+              out.stdout.index("merge main down first") < out.stdout.index("push"), True)
+
+        recorded = repo_with_commit(root, "records-merge", "main")
+        config = recorded / ".claude" / "worktree-per-change.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            json.dumps({"integrationBranch": "main", "mergeIntegrationBeforeLanding": True}),
+            encoding="utf-8",
+        )
+        git(recorded, "worktree", "add", "-q", "-b", "topic", str(root / "wt-merge"), "main")
+        out = land(root / "wt-merge", "--dry-run")
+        check("the repo can record it instead", "merge main down first" in out.stdout, True)
+        out = land(root / "wt-merge", "--dry-run", "--no-merge-integration")
+        check("and one run can still opt out", "merge main down first" in out.stdout, False)
+
+        # A real conflict, resolved by nobody: the point of doing this locally is that the
+        # refusal arrives with the conflict in the tree and before anything is pushed. A
+        # script that resolved it would be landing a guess about somebody's code.
+        conflicted = repo_with_commit(root, "conflicting", "main")
+        config = conflicted / ".claude" / "worktree-per-change.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"integrationBranch": "main"}), encoding="utf-8")
+        git(conflicted, "worktree", "add", "-q", "-b", "mine", str(root / "wt-conflict"), "main")
+        mine = root / "wt-conflict"
+        (mine / "README.md").write_text("mine\n", encoding="utf-8")
+        git(mine, "commit", "-qam", "mine")
+        # `main` moves under it, touching the same line. `origin` is the repo itself, so
+        # the fetch has something real to fetch and no network is involved.
+        (conflicted / "README.md").write_text("theirs\n", encoding="utf-8")
+        git(conflicted, "commit", "-qam", "theirs")
+        git(mine, "remote", "add", "origin", str(conflicted))
+        out = land(mine, "--merge-integration")
+        check("a conflicting merge-down refuses", out.returncode, 2)
+        check("and says the base moved", "has moved since this branch was cut" in out.stderr, True)
+        check("and says nothing was pushed", "Nothing has been pushed" in out.stderr, True)
+        check("and leaves the conflict in the tree to be resolved",
+              "<<<<<<<" in (mine / "README.md").read_text(encoding="utf-8"), True)
+
+        # Rerun after a resolution: the second attempt gets past the merge step, which is
+        # the half of the design that makes the refusal cheap rather than terminal.
+        (mine / "README.md").write_text("settled\n", encoding="utf-8")
+        git(mine, "add", "README.md")
+        git(mine, "commit", "-qm", "resolve")
+        out = land(mine, "--dry-run", "--merge-integration")
+        check("and a resolved tree gets through it", "already contains origin/main" in out.stdout, True)
+
         # --- a tree outside a repository -------------------------------------------
         loose = root / "not-a-repo"
         loose.mkdir()

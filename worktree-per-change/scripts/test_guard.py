@@ -544,6 +544,39 @@ def main() -> int:
             "",
         )
 
+        # --- where the remedy sends you ----------------------------------------
+        # The path in the remedy is the one thing the guard says that a session then
+        # ACTS on, and it is the one thing the guard cannot verify: whether a directory
+        # is a worktree is a stat on `.git`, so a wrong path here denies nothing and
+        # breaks nothing — it just sends the next session to make untracked files in a
+        # repo that does not ignore them. Hence a config key, and hence these two.
+        check(
+            "the remedy names the default worktrees root when the repo says nothing",
+            ".claude/worktrees/<name>" in reason(run(write(repo, str(repo / "README.md")))),
+            True,
+        )
+        config = repo / ".claude" / "worktree-per-change.json"
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "worktreesRoot": "../trees/repo"}),
+            encoding="utf-8",
+        )
+        relocated = reason(run(write(repo, str(repo / "README.md"))))
+        check(
+            "a repo that puts its worktrees elsewhere gets its own path in the remedy",
+            "../trees/repo/<name>" in relocated,
+            True,
+        )
+        check(
+            "and the path it has ruled out is not also offered",
+            ".claude/worktrees/<name>" in relocated,
+            False,
+        )
+        # Restored, because every check after this one reads the default remedy.
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+
         # --- modes and fail-open ------------------------------------------------
         check(
             "`off` disables it",
