@@ -86,6 +86,27 @@ python .claude/scripts/land.py        # push, PR if there is none, merge, verify
 `land.py` is the same four commands with the verification that each of them needs, and it
 exists so that the delivery step can be *allowed* — see below.
 
+**Where several changes are in flight against one integration branch, bring it down before
+you push.** This protocol creates that situation rather than encountering it: every change
+that lands moves the base under every change still open. The next PR is then refused for a
+conflict *by the forge*, after the push — so `gh pr merge` fails on a PR that is now
+unmergeable, nothing local is set up to fix it, and the exit code describes the API call
+rather than the conflict. Doing it locally first costs a fetch, and the failure lands
+somewhere useful:
+
+```bash
+git fetch origin <integration>
+git merge --no-edit origin/<integration>    # clean: invisible. conflicted: fix it here
+```
+
+`land.py` does this when the repository records
+`"mergeIntegrationBeforeLanding": true`, or for one run with `--merge-integration`. It is
+**off by default**, because in a repo where changes land one at a time it is a fetch and a
+merge commit that buy nothing. It refuses rather than resolving: choosing between two
+versions of somebody's code is the work, and a script that guessed would land the guess.
+The guard permits the resolution — an unfinished merge outranks the spent marker for
+exactly this reason — and nothing has been pushed when the refusal arrives.
+
 **It also refuses a branch that has already merged, before pushing anything**, and running
 it by hand means doing that check by hand. A landed change leaves no remote branch and no
 open PR, so every check *after* the push reads exactly like a change that was never
@@ -274,6 +295,9 @@ Two ways to fix it, and the second is better for anything a *human* also needs:
   inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
   needs its ignore narrowed to name them, keeping `settings.local.json` and
   `.claude/worktrees/` out.
+- **Or accept that it is untracked, and write it into every worktree yourself.** Some
+  repositories cannot take the commit at all — see "Installing where nothing may be
+  committed" below.
 
 A repo that commits the hook should also test it, in its own test suite and idiom — the
 committed copy is what actually runs, and a hook that silently stopped denying looks
@@ -297,8 +321,17 @@ from the next resync on, which is this same failure one level up:
 
 ```json
 { "integrationBranch": "queue",
+  "worktreesRoot": ".claude/worktrees",
   "guard": { "source": "…/worktree_guard.py", "syncedFrom": "<sha>", "sha256": "<hash>" } }
 ```
+
+`worktreesRoot` is where this repo's worktrees go, and it is quoted in the remedy text and
+used for nothing else — whether a directory *is* a worktree is a stat on `.git`, never path
+arithmetic, so a wrong value here cannot mis-classify a tree. It is still worth setting,
+because it can be wrong in the way that costs a turn: a repo that does not gitignore
+`.claude/` cannot put worktrees there without every tree arriving as untracked files in
+`git status`, and a remedy naming a path the repo has ruled out is a remedy nobody can
+take. Default `.claude/worktrees`; `install.py --worktrees-root` records another.
 
 It merges rather than replaces, so re-running it to resync keeps the branch and anything
 else the repo keeps in that file. `syncedFrom` is absent when the skill directory is not a
@@ -365,6 +398,48 @@ committed, so it must not carry the installing machine's interpreter path or thi
 checkout's absolute location, and `${CLAUDE_PROJECT_DIR}` resolves to whichever worktree
 the session is actually in. `--python` overrides the interpreter where `python` is not on
 `PATH`.
+
+### Installing where nothing may be committed
+
+A committed install is right when the repository's team is adopting the rule. It is wrong
+when it is *one person's* setup in a checkout other people work in, and the reason is not
+etiquette: this guard **denies writes**, so committing it changes what a colleague's
+session is allowed to do, in their own working directory, without them having agreed to
+it. That is a conversation to have, not a side effect of an install. Documentation is not
+like this — a paragraph added to a `CONTEXT.md` changes nobody's session — which is why
+"don't commit agent config here" and "don't touch the docs" are different rules.
+
+```bash
+python install.py --repo . --branch develop \
+    --settings-file settings.local.json \
+    --guard-root ~/tooling/.claude \
+    --worktrees-root ../trees
+```
+
+`--settings-file` registers the hooks in the gitignored file instead of the committed one.
+`--guard-root` keeps the guard and `land.py` outside the repository and references them by
+absolute path — one copy for every repo installed this way, and `${CLAUDE_PROJECT_DIR}`
+would be exactly wrong for it, since that resolves to the tree the file deliberately is not
+in. `.claude/worktree-per-change.json` still goes in the repo, untracked, because the guard
+and `land.py` read it from the **main checkout** — and a `.git/info/exclude` entry covers it
+in every worktree at once, lives in the common git directory, and is never pushed.
+
+**The cost is one thing, and it is the thing that makes this install look like it worked
+when it did not: a worktree is a checkout of TRACKED files, so an untracked settings file
+is absent from every worktree the guard sends a session into.** The rule would then apply
+in the main checkout — where nothing is supposed to happen anyway — and nowhere else. So
+whatever creates worktrees here has to write one into each of them, and that is not
+optional. `install.py` prints that warning instead of leaving it to be discovered, and
+`--status` reads `settings.local.json` too and marks a local install with the same note —
+a status that reported "not installed" about a guard that is running is how somebody
+installs it twice.
+
+It also removes the drift gate's usual justification, and the removal is real rather than
+convenient. The copy-plus-hash machinery exists because a *committed* copy is a fork the
+moment upstream moves; a single untracked copy that every repo references is one file to
+resync and no forks to find. `install.py` still records `syncedFrom` and `sha256` in each
+repo's config, so the copy can still be dated — what goes away is the CI check, which had
+nothing to check.
 
 - Omit `--repo` to install at user scope for every repository on the machine. It applies
   one integration branch to repos that may not share it, so prefer per-repo.

@@ -18,11 +18,23 @@ be inferred and cannot be silently wrong: a repo told the wrong one opens every 
 against a branch nobody merges, and nothing about that looks broken until someone goes
 looking for the work. `--branch` answers it without a prompt, for scripted installs.
 
+Some repositories cannot take a committed install at all — a shared checkout where
+agent configuration would change a *teammate's* session is the case this was written
+for, and there the answer is not to commit it anyway. `--settings-file
+settings.local.json` registers the hooks in the gitignored file instead, and
+`--guard-root <dir>` keeps the guard and `land.py` outside the repository and
+references them absolutely. What that buys is a real install with nothing added to the
+repo; what it costs is that **a fresh worktree does not contain an untracked settings
+file**, so whatever creates worktrees has to put one there. The installer says so
+rather than leaving it to be discovered.
+
 Usage:
     python install.py --status                what is installed, and where the work is
     python install.py --repo . --dry-run      show the exact settings.json changes
     python install.py --repo .                install into this repository, committed
     python install.py --repo . --branch queue  ... integrating through `queue`
+    python install.py --repo . --settings-file settings.local.json \
+        --guard-root ~/tooling/.claude    ... committing nothing to the repository
     python install.py                         install at user scope
     python install.py --repo . --uninstall    remove it
 """
@@ -52,6 +64,31 @@ DEFAULT_BRANCH = "development"
 # spelled the same way — a relative path from the worktree root, which is where the
 # session's cwd already is, and the same on every platform.
 LAND_COMMAND = f"python .claude/scripts/{LAND_FILENAME}"
+
+
+def land_command(lander: Path | None, repo: Path | None,
+                 interpreter: str = "python") -> str:
+    """How `land.py` will actually be typed, which is what the allowlist has to match.
+
+    In the ordinary install it is committed inside the repo and typed relative to the
+    worktree root, which is where the session's cwd already is. Under `--guard-root` it
+    lives outside the repository and there is no relative path that reaches it from every
+    worktree, so the entry carries the absolute one. Getting this wrong is the quiet
+    failure `rule()` warns about: the file looks right and every call is still stopped.
+
+    The interpreter is part of the entry for the same reason, and `python` is a guess that
+    a committed install has to make and a machine-local one does not: on a macOS box
+    `python` is frequently not on `PATH` at all, so an entry naming it covers a command
+    nobody can run. A local install already knows which interpreter exists here.
+    """
+    if lander is None:
+        return LAND_COMMAND
+    try:
+        if repo is not None and lander.is_relative_to(repo):
+            return f"{interpreter} {lander.relative_to(repo).as_posix()}"
+    except (AttributeError, ValueError):  # is_relative_to is 3.9+
+        pass
+    return f"{interpreter} {lander}"
 
 # Commands that never change a working tree, a branch, a remote or an account. They are
 # listed so they are never *stopped*, which is a different question from whether they are
@@ -101,12 +138,16 @@ READ_ONLY = [
 # `Bash(gh pr merge:*)` is what this list exists to avoid. It would merge any PR in any
 # repository the machine is authenticated to, on any base, which is a far larger grant
 # than "this agent may finish the change it is working on".
-DELIVERY = [
-    f"{LAND_COMMAND}:*",
+_DELIVERY_GIT = [
     "git add:*", "git commit:*", "git push -u origin HEAD:*",
     "git switch -c:*", "git worktree add:*", "git worktree remove:*",
     "git worktree prune:*", "git branch -D:*",
 ]
+DELIVERY = [f"{LAND_COMMAND}:*", *_DELIVERY_GIT]
+
+
+def delivery(land: str = LAND_COMMAND) -> list[str]:
+    return [f"{land}:*", *_DELIVERY_GIT]
 
 
 def rule(command: str) -> str:
@@ -132,8 +173,8 @@ SKILL_SOURCE = GUARD_SOURCE.parent.parent
 SKILL_NAME = SKILL_SOURCE.name
 
 
-def settings_path(root: Path) -> Path:
-    return root / "settings.json"
+def settings_path(root: Path, name: str = "settings.json") -> Path:
+    return root / name
 
 
 def guard_path(root: Path) -> Path:
@@ -166,12 +207,24 @@ def add_permissions(settings: dict, entries: list[str]) -> tuple[dict, int]:
     return settings, len(added)
 
 
+# An allowlist entry for `land.py` exactly as this installer writes one: an interpreter,
+# a path ending in the script, and the trailing wildcard. Removing by exact string cannot
+# do this job, because the interpreter and the path both depend on flags the uninstall is
+# usually run without — and an entry left behind is a standing grant for a script that is
+# gone. It is deliberately narrow: an operator who NARROWED the rule by hand
+# (`… land.py --dry-run:*`) has made a decision, and this does not match it.
+LAND_ENTRY = re.compile(r"^Bash\((?:\S+\s+)?\S*" + re.escape(LAND_FILENAME) + r":\*\)$")
+
+
 def drop_permissions(settings: dict, entries: list[str]) -> dict:
     block = settings.get("permissions")
     if not isinstance(block, dict) or not isinstance(block.get("allow"), list):
         return settings
     ours = set(entries)
-    block["allow"] = [rule for rule in block["allow"] if rule not in ours]
+    block["allow"] = [
+        rule for rule in block["allow"]
+        if rule not in ours and not (isinstance(rule, str) and LAND_ENTRY.match(rule))
+    ]
     if not block["allow"]:
         block.pop("allow")
     if not block:
@@ -446,10 +499,17 @@ def git(tree: Path, *args: str) -> str | None:
 
 
 def report_status(user_root: Path, repo: Path | None) -> int:
-    for label, root in (("user", user_root), ("repo", (repo / ".claude") if repo else None)):
-        if root is None:
+    # Both spellings, because `--settings-file settings.local.json` is a real install and a
+    # status that reads only settings.json reports it as absent. "Not installed" about a
+    # guard that is running is the one answer here that makes somebody install it twice.
+    scopes = [("user", user_root, "settings.json")]
+    if repo is not None:
+        scopes += [("repo", repo / ".claude", "settings.json"),
+                   ("local", repo / ".claude", "settings.local.json")]
+    for label, root, name in scopes:
+        if label == "local" and not settings_path(root, name).is_file():
             continue
-        settings = load(settings_path(root))
+        settings = load(settings_path(root, name))
         events, legacy = [], []
         for event, matchers in (settings.get("hooks") or {}).items():
             for matcher in matchers if isinstance(matchers, list) else []:
@@ -459,7 +519,10 @@ def report_status(user_root: Path, repo: Path | None) -> int:
                     elif isinstance(hook, dict) and is_legacy(hook):
                         legacy.append(event)
         state = f"installed ({', '.join(sorted(set(events)))})" if events else "not installed"
-        print(f"{label:5} {settings_path(root)}  ->  {state}")
+        print(f"{label:5} {settings_path(root, name)}  ->  {state}")
+        if events and label == "local":
+            print("      ! untracked, so absent from every fresh worktree unless something "
+                  "writes it there")
         if legacy:
             print(f"      ! a predecessor guard is still registered ({', '.join(sorted(set(legacy)))})")
 
@@ -527,6 +590,15 @@ def main() -> int:
                         help="skip the allowlist for read-only and protocol commands")
     parser.add_argument("--permissions-only", action="store_true",
                         help="write only the allowlist — no hooks, no guard, no config")
+    parser.add_argument("--settings-file", metavar="NAME", default="settings.json",
+                        help="settings file to register in (e.g. settings.local.json, "
+                             "for a repo where agent config must not be committed)")
+    parser.add_argument("--guard-root", metavar="DIR",
+                        help="keep the guard and land.py in DIR and reference them "
+                             "absolutely, instead of copying them into the repository")
+    parser.add_argument("--worktrees-root", metavar="PATH",
+                        help="where this repo's worktrees go, quoted in the guard's "
+                             "remedy text (default .claude/worktrees)")
     args = parser.parse_args()
 
     try:  # Windows consoles default to a codepage that mangles the report's punctuation.
@@ -537,6 +609,19 @@ def main() -> int:
     user_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
     repo = Path(args.repo).resolve() if args.repo else None
     root = (repo / ".claude") if repo else user_root
+    # Where the guard and land.py are PUT, which is no longer always where the settings
+    # file is. Kept separate from `root` so the settings file, the config record and the
+    # scripts can each end up in the place that repository allows.
+    files_root = Path(args.guard_root).expanduser().resolve() if args.guard_root else root
+    # Committed means "git is the backup and a `.bak` beside it lands in someone's `git
+    # status`". A settings.local.json is gitignored by convention everywhere this matters,
+    # so it gets the backup that a committed file must not have.
+    committed = repo is not None and args.settings_file == "settings.json" and not args.guard_root
+    # A committed install is read on other machines and must not carry this one's paths;
+    # a local one is nobody else's file, and pinning what actually exists here beats
+    # naming `python` and hoping. Computed here because the allowlist entry for `land.py`
+    # has to be spelled with the same interpreter that will type it.
+    interpreter = args.python or ("python" if committed else sys.executable)
 
     if args.status:
         return report_status(user_root, repo)
@@ -548,15 +633,16 @@ def main() -> int:
         # that shape of task. The hooks stay per repo, because the rule they enforce does.
         entries = [rule(command) for command in READ_ONLY]
         if repo:
-            entries += [rule(command) for command in DELIVERY]
-        target = settings_path(root)
+            entries += [rule(command) for command in
+                        delivery(land_command(land_path(files_root), repo, interpreter))]
+        target = settings_path(root, args.settings_file)
         settings = load(target)
         settings, granted = add_permissions(settings, entries)
         if args.dry_run:
             print(f"would allow {granted} command(s) in {target}\n"
                   + "\n".join(f"  {r}" for r in entries))
             return 0
-        write_json(target, settings, backup=repo is None)
+        write_json(target, settings, backup=not committed)
         print(f"allow   -> {target} ({granted} added, {len(entries) - granted} already there)")
         print("Restart or /reload any running sessions for the rules to take effect.")
         return 0
@@ -565,7 +651,7 @@ def main() -> int:
         print(f"guard script missing: {GUARD_SOURCE}", file=sys.stderr)
         return 1
 
-    target = settings_path(root)
+    target = settings_path(root, args.settings_file)
     settings = load(target)
     before = json.dumps(settings, indent=2)
     settings, removed = strip(settings, also_legacy=not args.keep_legacy)
@@ -574,15 +660,20 @@ def main() -> int:
         # Only the entries this installer added, and only by exact match. An operator who
         # allowed something else, or narrowed one of ours by hand, has made a decision;
         # an uninstaller that took the whole block would silently reverse it.
-        settings = drop_permissions(settings, [rule(c) for c in READ_ONLY + DELIVERY])
+        # Both spellings of the land.py entry, not just the one this invocation would
+        # write. An uninstall is frequently run without the `--guard-root` the install
+        # had, and an entry left behind is a grant nobody remembers making.
+        stale = (READ_ONLY + delivery()
+                 + delivery(land_command(land_path(files_root), repo, interpreter)))
+        settings = drop_permissions(settings, [rule(c) for c in dict.fromkeys(stale)])
         after = json.dumps(settings, indent=2)
         if args.dry_run:
             print(f"would rewrite {target}\n--- before\n{before}\n--- after\n{after}")
             return 0
         # No `.bak` beside a committed settings file: git is already the backup, and the
         # stray file shows up in `git status` for whoever installs next.
-        write_json(target, settings, backup=repo is None)
-        for path in (guard_path(root), land_path(root),
+        write_json(target, settings, backup=not committed)
+        for path in (guard_path(files_root), land_path(files_root),
                      (repo / ".claude" / CONFIG_FILENAME) if repo else None):
             if path is None:
                 continue
@@ -600,28 +691,36 @@ def main() -> int:
         print(f"removed the guard from {target}")
         return 0
 
-    script = guard_path(root)
+    script = guard_path(files_root)
     # A repo install is committed and read on other machines and in every worktree, so it
     # must not carry this machine's interpreter path or this checkout's absolute location:
     # `${CLAUDE_PROJECT_DIR}` resolves to whichever tree the session is actually in, and
     # `python` resolves to whatever that machine has. A user-scope install is the opposite
     # case — it is nobody else's file and there is no project dir to expand — so it pins
     # the interpreter that ran the installer.
-    interpreter = args.python or ("python" if repo else sys.executable)
-    reference = "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + GUARD_FILENAME if repo else str(script)
+    # `--guard-root` puts the guard outside the repository, and then `${CLAUDE_PROJECT_DIR}`
+    # is exactly the wrong reference: it resolves to whichever tree the session is in, which
+    # is where the file deliberately is not. The absolute path is also what makes ONE copy
+    # serve every worktree of every repo installed this way, which is the point of the flag.
+    reference = (
+        "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + GUARD_FILENAME
+        if repo and not args.guard_root
+        else str(script)
+    )
     settings = add_ours(settings, interpreter, reference)
     # A user-scope install gets the read-only entries and not the delivery ones. The
     # delivery entries are safe *because the guard scopes them* — `git commit:*` is
     # bounded by a hook that denies it outside a worktree — and at user scope they would
     # apply to repositories that have no such hook.
+    lander = land_path(files_root) if repo else None
     wanted = [] if args.no_permissions else [
-        rule(command) for command in (READ_ONLY + DELIVERY if repo else READ_ONLY)
+        rule(command) for command in
+        (READ_ONLY + delivery(land_command(lander, repo, interpreter)) if repo else READ_ONLY)
     ]
     settings, granted = add_permissions(settings, wanted)
     after = json.dumps(settings, indent=2)
     branch = choose_branch(repo, args.branch)
     config = (repo / ".claude" / CONFIG_FILENAME) if repo else None
-    lander = land_path(root) if repo else None
 
     if args.dry_run:
         print(f"would copy  {GUARD_SOURCE}\n        ->  {script}")
@@ -632,8 +731,9 @@ def main() -> int:
         if config is not None:
             # The hash is of the file that WOULD be copied, so the dry run shows the record
             # the real run will write rather than a placeholder for it.
-            print(f"would write {config}  ->  integrationBranch = {branch}, "
-                  f"guard = {json.dumps(provenance(GUARD_SOURCE))}")
+            print(f"would write {config}  ->  integrationBranch = {branch}"
+                  + (f", worktreesRoot = {args.worktrees_root}" if args.worktrees_root else "")
+                  + f", guard = {json.dumps(provenance(GUARD_SOURCE))}")
         for line in removed:
             print(f"would remove predecessor guard  {line}")
         if not args.no_skill:
@@ -653,6 +753,11 @@ def main() -> int:
         # a replace would drop the lot.
         blob = load(config)
         blob["integrationBranch"] = branch
+        if args.worktrees_root:
+            # Recorded only when asked for. The guard defaults to `.claude/worktrees`, and
+            # writing that default in explicitly would turn a value the skill can change
+            # into one every repo has pinned to today's answer.
+            blob["worktreesRoot"] = args.worktrees_root
         blob["guard"] = provenance(script)
         if lander is not None and lander.is_file():
             # Recorded for the same reason the guard's copy is: it is committed, so it is
@@ -670,10 +775,11 @@ def main() -> int:
     # next person's `git status` — measured 2026-08-15 on a resync, where it showed up
     # untracked beside the change it was supposed to be protecting. A user-scope settings
     # file has no git behind it, so that one is still copied first.
-    write_json(target, settings, backup=repo is None)
+    write_json(target, settings, backup=not committed)
     print(f"guard   -> {script}")
     if lander is not None:
-        print(f"land    -> {lander} (run it as `{LAND_COMMAND}` from a worktree)")
+        print(f"land    -> {lander} (run it as "
+              f"`{land_command(lander, repo, interpreter)}` from a worktree)")
     if not args.no_skill:
         print(link_skill(user_root, dry_run=False))
     print(f"hooks   -> {target} ({', '.join(EVENTS)})")
@@ -681,10 +787,20 @@ def main() -> int:
         scope = "read-only git/gh, and the protocol's own writes" if repo else "read-only git/gh"
         print(f"allow   -> {target} ({granted} command(s): {scope})")
     print("Restart or /reload any running sessions for the hooks to take effect.")
-    if repo:
+    if committed:
         files = [target, script, config] + ([lander] if lander is not None else [])
         print("Commit " + ", ".join(str(p.relative_to(repo)) for p in files)
               + " for everyone working here to get it.")
+    elif repo:
+        # The honest version of the sentence above, and the one thing about this install
+        # that will otherwise be found out the hard way. A worktree is a checkout of
+        # TRACKED files, so an untracked settings file is absent from every worktree this
+        # guard sends a session into — the rule would apply in the main checkout, where
+        # nothing is supposed to happen, and nowhere else.
+        print(f"Nothing here is committed: {target.name} is not tracked, so it does NOT "
+              "exist in a fresh worktree.")
+        print("Whatever creates worktrees here has to write one into each of them, or the "
+              "guard covers only the main checkout.")
     return 0
 
 

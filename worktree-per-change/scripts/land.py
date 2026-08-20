@@ -31,9 +31,19 @@ nicety: after a change lands there is no remote branch and no open PR, so every 
 check reads like a change that was never delivered, and running this twice opens a
 second PR whose diff is empty and merges it.
 
+Where several changes are in flight against one integration branch, each one that lands
+moves the base under the others, and the forge then refuses their PRs for a conflict —
+after the push, from the far side of an API call, with nothing set up locally to fix it.
+`mergeIntegrationBeforeLanding` in `.claude/worktree-per-change.json` (or
+`--merge-integration`) brings the integration branch down into the topic branch first, so
+a clean merge costs nothing and a conflicting one stops here, in a tree already set up for
+the resolution. It is **off by default**: in a repo where changes land one at a time it is
+a fetch and a merge commit that buy nothing.
+
 Usage:
     python .claude/scripts/land.py              push, PR if needed, merge, verify
     python .claude/scripts/land.py --dry-run    print the sequence, run none of it
+    python .claude/scripts/land.py --merge-integration   ... merge the base down first
     python .claude/scripts/land.py --title T --body-file B    ... for the PR it creates
 """
 
@@ -119,6 +129,22 @@ def locate(start: Path) -> tuple[Path, Path]:
     raise Refused(f"{start} is not inside a git repository.")
 
 
+def config(main_root: Path) -> dict:
+    """This repository's record, or an empty one. Read from the MAIN checkout.
+
+    Every worktree of the repo has to agree about the integration branch, and `.claude/`
+    is checked out separately in each of them — so the main checkout is the only copy
+    there is one of.
+    """
+    try:
+        blob = json.loads(
+            (main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8")
+        )
+        return blob if isinstance(blob, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def integration_branch(main_root: Path) -> str:
     """The branch this repository's PRs target.
 
@@ -134,15 +160,9 @@ def integration_branch(main_root: Path) -> str:
     override = (os.environ.get("CLAUDE_INTEGRATION_BRANCH") or "").strip()
     if override:
         return override
-    try:
-        blob = json.loads(
-            (main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8")
-        )
-        name = blob.get("integrationBranch")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    except (OSError, ValueError):
-        pass
+    name = config(main_root).get("integrationBranch")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
     return DEFAULT_INTEGRATION_BRANCH
 
 
@@ -178,6 +198,54 @@ def preflight(tree: Path, branch: str) -> str:
 
 
 # -------------------------------------------------------------------------- steps
+
+
+def merge_integration(tree: Path, branch: str, dry_run: bool) -> None:
+    """Bring `origin/<branch>` down into this topic branch before anything is pushed.
+
+    This is for the case the protocol creates rather than an unusual one: several changes
+    in flight against one integration branch, each landing one moving the base under the
+    rest. Without it, the conflict is discovered by the FORGE, after the push, and what
+    comes back is `gh pr merge` failing on a PR that is now unmergeable — a state with no
+    local setup for fixing it and an exit code that says nothing about which half went
+    wrong.
+
+    Done here, a clean merge is invisible and a conflicting one stops with the conflict in
+    the working tree, which is where it has to be resolved anyway. The guard permits that:
+    an unfinished merge outranks the spent marker precisely so conflict resolution stays
+    editable.
+
+    Refusing rather than resolving is the whole design. Choosing between two versions of
+    someone's code is the work, and a script that guessed would land the guess.
+    """
+    print(f"merge {branch} down first")
+    fetched = run(["git", "fetch", "origin", branch], tree, dry_run)
+    if not dry_run and fetched.returncode != 0:
+        raise Refused(
+            f"could not fetch origin/{branch}, so there is no way to tell whether this "
+            f"branch is behind it:\n{(fetched.stderr or '').strip()}"
+        )
+    # Asked even in a dry run. It changes nothing, and a dry run that skipped it would
+    # print a merge for a branch that needs none — which is the one thing a dry run is for.
+    behind = subprocess.run(
+        ["git", "-C", str(tree), "merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if behind.returncode == 0:
+        print(f"  already contains origin/{branch}")
+        return
+    merged = run(["git", "merge", "--no-edit", f"origin/{branch}"], tree, dry_run)
+    if dry_run:
+        return
+    if merged.returncode != 0:
+        raise Refused(
+            f"`{branch}` has moved since this branch was cut, and merging it down "
+            f"conflicts:\n{(merged.stdout or '').strip()}\n{(merged.stderr or '').strip()}\n"
+            "The conflict is in this worktree now, which is where it has to be settled — "
+            "resolve the files, `git add` them, `git commit`, then run this again.\n"
+            "Nothing has been pushed, no PR has been opened, and the change is intact."
+        )
+    print(f"  merged origin/{branch}")
 
 
 def head_pr(tree: Path, topic: str, state: str) -> int | None:
@@ -226,6 +294,10 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
             f"    git worktree remove {tree}\n"
             f"    git branch -D {topic}"
         )
+
+    if args.merge_integration:
+        merge_integration(tree, branch, args.dry_run)
+        print()
 
     print("push")
     pushed = run(["git", "push", "-u", "origin", "HEAD"], tree, args.dry_run)
@@ -328,6 +400,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the sequence, run none of it")
     parser.add_argument("--title", metavar="TEXT", help="title for the PR, if one is created")
     parser.add_argument("--body-file", metavar="PATH", help="body file for the PR, if one is created")
+    # Three states, not two: the repo's recorded answer is the default, and either flag
+    # overrides it for one run. A plain boolean would make "the repo says yes" and "this
+    # run says no" indistinguishable.
+    parser.add_argument("--merge-integration", action="store_true", default=None,
+                        help="merge origin/<integration> down before pushing")
+    parser.add_argument("--no-merge-integration", dest="merge_integration",
+                        action="store_false", help="skip it, whatever the repo records")
     args = parser.parse_args()
 
     try:
@@ -338,6 +417,8 @@ def main() -> int:
     try:
         tree, main_root = locate(Path.cwd().resolve())
         branch = integration_branch(main_root)
+        if args.merge_integration is None:
+            args.merge_integration = bool(config(main_root).get("mergeIntegrationBeforeLanding"))
         topic = preflight(tree, branch)
         return land(tree, main_root, branch, topic, args)
     except Refused as refusal:

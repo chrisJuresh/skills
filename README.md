@@ -57,9 +57,20 @@ New hooks apply to sessions started afterwards, not the one you are in.
 | `--python EXE` | Interpreter to run the guard with, where `python` is not on `PATH` |
 | `--keep-legacy` | Leave a predecessor concurrent-writer guard registered instead of replacing it |
 | `--no-skill` | Skip the skill link — only if the skill is already installed another way |
+| `--settings-file NAME` | Register in a different settings file, e.g. `settings.local.json` |
+| `--guard-root DIR` | Keep the guard and `land.py` in `DIR` and reference them absolutely |
+| `--worktrees-root PATH` | Where this repo's worktrees go, quoted in the guard's remedy text |
 
 Omit `--repo` to install at user scope for every repository on the machine; it applies one
 integration branch to repos that may not share it, so prefer per-repo.
+
+Some repositories cannot take the commit at all — a shared checkout where this would change
+what a *colleague's* session is allowed to do in their own working directory. There,
+`--settings-file settings.local.json --guard-root <dir>` gives a real install with nothing
+added to the repo. The catch is worth knowing before you choose it: a worktree is a checkout
+of tracked files, so an untracked settings file is absent from every worktree, and whatever
+creates worktrees has to write one into each of them. The installer says so, and `--status`
+marks it.
 
 Requires Python 3 and git. No third-party packages.
 

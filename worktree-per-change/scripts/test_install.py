@@ -285,6 +285,81 @@ def main() -> int:
         check("while ours is registered", registrations(legacy),
               ["PreToolUse", "SessionStart", "Stop"])
 
+        # --- installing where nothing may be committed ----------------------------
+        # A committed guard changes what a COLLEAGUE's session may do in their own working
+        # directory. Where that is not wanted, the install still has to be a real install:
+        # hooks that fire, an allowlist that matches, and a record that can be dated.
+        local = fresh(root, "uncommitted")
+        outside = root / "tooling" / ".claude"
+        outside.mkdir(parents=True)
+        out = install(local, "--settings-file", "settings.local.json",
+                      "--guard-root", str(outside), "--worktrees-root", "../trees")
+        check("a local install succeeds", out.returncode, 0)
+        check("nothing is written to the committed settings file",
+              (local / ".claude" / "settings.json").exists(), False)
+        local_settings = json.loads(
+            (local / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        check("all three events are registered in the local file",
+              sorted(local_settings.get("hooks") or {}),
+              ["PreToolUse", "SessionStart", "Stop"])
+        check("the guard is not copied into the repository",
+              (local / ".claude" / "hooks" / "worktree-guard.py").exists(), False)
+        check("it is written to the guard root instead",
+              (outside / "hooks" / "worktree-guard.py").is_file(), True)
+        # `${CLAUDE_PROJECT_DIR}` resolves to the tree the session is in, which is exactly
+        # where this file is not. An install that kept it would register a hook that never
+        # runs — and a hook that never runs is indistinguishable from one with nothing to
+        # deny.
+        registered = json.dumps(local_settings)
+        check("the hook is referenced absolutely, not through the project dir",
+              "CLAUDE_PROJECT_DIR" in registered, False)
+        check("and it names the file that exists", str(outside / "hooks") in registered, True)
+        # The allowlist is a prefix match on the command string, so `python` in the entry
+        # and `python3` in the call is an entry that matches nothing — and says nothing.
+        entries = (local_settings.get("permissions") or {}).get("allow") or []
+        landers = [e for e in entries if "land.py" in e]
+        check("land.py gets exactly one entry", len(landers), 1)
+        check("spelled with an interpreter that exists here", sys.executable in landers[0], True)
+        check("and with the absolute path it will be called by",
+              str(outside / "scripts" / "land.py") in landers[0], True)
+        check("the worktrees root is recorded", config_of(local).get("worktreesRoot"), "../trees")
+        check("the branch is still recorded in the repo, where both readers look",
+              config_of(local).get("integrationBranch"), "development")
+        # The one failure mode of this install shape, said out loud rather than found out:
+        # a worktree holds tracked files only, so an untracked settings file is in none of
+        # them.
+        check("and the install says the worktrees will not have it",
+              "does NOT exist in a fresh worktree" in out.stdout, True)
+
+        out = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(local), "--status"],
+            capture_output=True, text=True,
+        )
+        check("--status finds a local install rather than reporting none",
+              "settings.local.json  ->  installed" in out.stdout, True)
+
+        # An uninstall is frequently run without the flags the install had. Leaving a
+        # grant behind is worse than leaving a hook behind: the hook announces itself, and
+        # an allowlist entry for a script that is gone is a grant nobody remembers making.
+        install(local, "--settings-file", "settings.local.json", "--uninstall")
+        left = json.loads(
+            (local / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        check("an uninstall without the original flags still clears the allowlist",
+              (left.get("permissions") or {}).get("allow"), None)
+        check("and clears the hooks", left.get("hooks"), None)
+
+        # ... but a rule the operator NARROWED by hand is a decision, and an uninstaller
+        # that swept it up would silently reverse it.
+        narrowed = fresh(root, "narrowed")
+        install(narrowed)
+        settings_file = narrowed / ".claude" / "settings.json"
+        blob = json.loads(settings_file.read_text(encoding="utf-8"))
+        blob["permissions"]["allow"].append("Bash(python .claude/scripts/land.py --dry-run:*)")
+        settings_file.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+        install(narrowed, "--uninstall")
+        check("a hand-narrowed land.py rule survives the uninstall",
+              permissions_of(narrowed), ["Bash(python .claude/scripts/land.py --dry-run:*)"])
+
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:
         print(f"  FAIL  {line}")

@@ -73,6 +73,15 @@ STATE_DIRNAME = "claude-worktree-gate"
 CONFIG_FILENAME = "worktree-per-change.json"
 DEFAULT_INTEGRATION_BRANCH = "development"
 
+# Where a new worktree goes, relative to the main checkout. This is quoted in the remedy
+# text and used for nothing else: whether a directory IS a worktree is a stat on `.git`
+# (see find_tree), never path arithmetic, so a wrong value here cannot mis-classify a
+# tree. It is configurable because it can still be wrong in the way that costs a turn —
+# a repository that does not gitignore `.claude/` cannot put worktrees there without
+# every tree arriving as untracked files in `git status`, and a remedy naming a path the
+# repo has ruled out is a remedy nobody can take.
+DEFAULT_WORKTREES_ROOT = ".claude/worktrees"
+
 # How many times `Stop` may refuse before it gives up and lets the session end. A hook
 # that can block forever is a hook that hangs a session, and an agent that has ignored
 # the same instruction twice is not going to take it on the third telling.
@@ -217,6 +226,33 @@ def integration_branch(main_root: Path | None) -> str:
         except (OSError, ValueError, AttributeError):
             pass
     return DEFAULT_INTEGRATION_BRANCH
+
+
+def worktrees_root(main_root: Path | None) -> str:
+    """Where this repository's worktrees go, as the remedy text should spell it.
+
+    Read from the same per-repo config as the branch, for the same reason: repositories
+    differ and neither answer is wrong. A repo that gitignores `.claude/` wants the
+    default; one that does not needs them somewhere outside itself, and a few keep them
+    beside the checkout so an editor indexes one tree at a time.
+
+    Text only. Getting it wrong misleads a reader and cannot mis-classify a directory —
+    which is exactly why it is worth reading rather than assuming, because a remedy that
+    names a path the repo ignores nowhere sends the next session to create untracked
+    files it will then be told off for.
+    """
+    override = (os.environ.get("CLAUDE_WORKTREES_ROOT") or "").strip()
+    if override:
+        return override
+    if main_root is not None:
+        try:
+            blob = json.loads((main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8"))
+            name = blob.get("worktreesRoot")
+            if isinstance(name, str) and name.strip():
+                return name.strip().rstrip("/\\")
+        except (OSError, ValueError, AttributeError):
+            pass
+    return DEFAULT_WORKTREES_ROOT
 
 
 # --------------------------------------------------------------------------- state
@@ -575,7 +611,7 @@ BASE_NOTE = (
     "The base is `origin/{branch}` — the FETCHED remote tip — and never local HEAD, never "
     "whatever branch the main checkout is sitting on, and never an unfetched local ref. So "
     "create the worktree with git first and enter that path:\n"
-    "`git fetch origin {branch} && git worktree add .claude/worktrees/<name> -b <branch> "
+    "`git fetch origin {branch} && git worktree add {worktrees}/<name> -b <branch> "
     "origin/{branch}` then EnterWorktree with that path. `worktree.baseRef` never accepts a "
     "branch name — it chooses between the repository's default branch and local HEAD, and "
     "here BOTH are wrong — so a bare EnterWorktree cuts from the wrong place and carries "
@@ -628,7 +664,7 @@ def cleanup_steps(tree: Path | str, topic: str | None) -> str:
     )
 
 
-def reason_main_checkout(what: str, branch: str) -> str:
+def reason_main_checkout(what: str, branch: str, worktrees: str) -> str:
     return (
         f"Denied: {what} in the main checkout. Every change in this repository is made "
         "in its own worktree, on its own branch, and reaches the integration branch as a "
@@ -637,7 +673,7 @@ def reason_main_checkout(what: str, branch: str) -> str:
         "else's commit.\n\n"
         + PROTOCOL.format(branch=branch)
         + "\n\n"
-        + BASE_NOTE.format(branch=branch)
+        + BASE_NOTE.format(branch=branch, worktrees=worktrees)
         + "\n\n"
         + ESCAPE
     )
@@ -653,7 +689,7 @@ def reason_integration_branch(branch: str) -> str:
     )
 
 
-def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path) -> str:
+def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path, worktrees: str) -> str:
     landed = marker.get("why") or "its PR merged"
     return (
         f"Denied: this worktree's change looks finished ({landed}), so editing it again "
@@ -671,7 +707,7 @@ def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path) -> st
         # merge refused for a failing check leaves no rebase and still lands here.
         + spent_doubt(spent_marker(common, tree_root))
         + "\n\n"
-        + BASE_NOTE.format(branch=branch)
+        + BASE_NOTE.format(branch=branch, worktrees=worktrees)
         + "\n\n"
         + ESCAPE
     )
@@ -892,6 +928,7 @@ def main() -> None:
     common = common_git_dir(git_dir)
     main_root = common.parent if common.name == ".git" else None
     branch = integration_branch(main_root)
+    worktrees = worktrees_root(main_root)
 
     if event == "SessionStart":
         context = (
@@ -899,7 +936,7 @@ def main() -> None:
             "checkout are denied by a hook, including one-line ones.\n\n"
             + PROTOCOL.format(branch=branch)
             + "\n\n"
-            + BASE_NOTE.format(branch=branch)
+            + BASE_NOTE.format(branch=branch, worktrees=worktrees)
             + "\n\nA change is finished when its worktree is gone too: after the merge, "
             "`ExitWorktree` (`action: \"keep\"`), then `git worktree remove <path>` and "
             "`git branch -D <branch>` from the main checkout."
@@ -964,7 +1001,7 @@ def main() -> None:
                 continue  # Outside this repository — not this repository's rule.
             target_root, target_git_dir, target_linked = scope
             if not target_linked:
-                deny(reason_main_checkout("file edits are not made", branch), warn_only)
+                deny(reason_main_checkout("file edits are not made", branch, worktrees), warn_only)
                 return
             topic = branch_of(target_git_dir)
             if topic == branch:
@@ -972,7 +1009,7 @@ def main() -> None:
                 return
             marker = is_spent(common, target_root, topic)
             if marker:
-                deny(reason_spent(marker, branch, common, target_root), warn_only)
+                deny(reason_spent(marker, branch, common, target_root, worktrees), warn_only)
                 return
         return
 
@@ -1013,7 +1050,7 @@ def main() -> None:
             deny(reason_stash(), warn_only)
             return
         if not target_linked and subcommand in MUTATORS:
-            deny(reason_main_checkout(f"`git {subcommand}` does not run", branch), warn_only)
+            deny(reason_main_checkout(f"`git {subcommand}` does not run", branch, worktrees), warn_only)
             return
 
 
