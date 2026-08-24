@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Land the change in the worktree this is run from: push, PR, merge, verify.
 
+A repository can name branches it will not merge into — `protectedMergeTargets` in
+`.claude/worktree-per-change.json`, empty by default. Those are pushed to and opened
+against, then left for a person, because a trunk that takes reviewed PRs is one where
+the PR *is* the review. See the refusal in `land()` for why that check sits at the
+merge step and not in `preflight`.
+
 This exists to be *allowlisted*, and everything about it is shaped by that.
 
 The protocol's last three steps — push, open a PR, merge it — are the ones a
@@ -58,6 +64,52 @@ from pathlib import Path
 
 CONFIG_FILENAME = "worktree-per-change.json"
 DEFAULT_INTEGRATION_BRANCH = "development"
+
+# Branches this script pushes to and opens against, but will not merge.
+#
+# **Empty by default, and that is deliberate.** For most repositories the integration
+# branch *is* `development` or `main`, squash-merging into it is the whole protocol, and a
+# hard-coded list here would break them. The repositories that need this are the ones whose
+# trunk takes reviewed PRs — where the PR into it *is* the review, so merging it is a
+# person's decision rather than this script's.
+#
+# Turned on per repository with `protectedMergeTargets` in `.claude/worktree-per-change.json`:
+#
+#     "protectedMergeTargets": ["develop", "main"]
+#
+# Note which direction the config runs. It can only ever ADD a refusal — there is no key
+# that removes one and no environment variable that turns this off, so a repository that
+# has opted in cannot be talked out of it by a later `CLAUDE_INTEGRATION_BRANCH` or by a
+# session editing the branch name.
+DEFAULT_PROTECTED_MERGE_TARGETS: frozenset[str] = frozenset()
+
+
+def protected_targets(main_root: Path) -> frozenset[str]:
+    """What this repository refuses to merge into. Read from the MAIN checkout.
+
+    Same source and same reason as `integration_branch`: every worktree of a repo has to
+    agree, and `.claude/` is checked out separately in each of them.
+    """
+    extra = config(main_root).get("protectedMergeTargets")
+    if isinstance(extra, list):
+        names = {str(n).strip().lower() for n in extra if str(n).strip()}
+        return DEFAULT_PROTECTED_MERGE_TARGETS | frozenset(names)
+    return DEFAULT_PROTECTED_MERGE_TARGETS
+
+
+def is_protected(branch: str, protected: frozenset[str]) -> bool:
+    """Match on the bare branch name, `origin/`-qualified or not, case-insensitively.
+
+    Normalised rather than compared literally so that `Develop`, `origin/develop` and
+    `refs/heads/develop` cannot each be a way past the check.
+    """
+    name = (branch or "").strip().lower()
+    for prefix in ("refs/heads/", "refs/remotes/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name in protected
 
 
 class Refused(Exception):
@@ -268,6 +320,10 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     print(f"repository:  {main_root}")
     print(f"worktree:    {tree}")
     print(f"branch:      {topic}  ->  {branch}")
+    # Said before anything runs, not just at the merge step, because the whole reason to
+    # read a dry run is to find out what it is about to do to which branch.
+    if is_protected(branch, protected_targets(main_root)):
+        print(f"merge:       NO — `{branch}` is protected; this will push and open a PR only")
     print()
 
     # Asked BEFORE the push, because the push is what makes this undetectable. A landed
@@ -347,6 +403,31 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     # it is one API call that cannot be confused by what this checkout has checked out.
     print("\nmerge")
     target = str(number) if number is not None else "<n>"
+
+    # The one step this script will not take. Everything above it — push, open — is
+    # delivery and happens unasked; merging into a shared trunk is a person's call, and
+    # the PR that is now open is how they make it.
+    #
+    # Placed here rather than in `preflight` on purpose: refusing at the top would abort
+    # before the push and leave the change undelivered, which is the failure this whole
+    # script exists to prevent. Refusing *here* means the branch is pushed, the PR is
+    # open, and the only thing that did not happen is the thing that should not.
+    if is_protected(branch, protected_targets(main_root)):
+        print(f"  NOT MERGING — `{branch}` is a protected branch.")
+        print(f"  #{number} is open and waiting for a human to merge it.")
+        print()
+        print(f"  This is not a failure: the change is delivered. `{branch}` takes")
+        print("  reviewed pull requests, so the review is the point and merging it is")
+        print("  not this script's to do.")
+        print()
+        print("  The branch is left on the remote, because deleting it would close the")
+        print("  PR's head before anyone has read it.")
+        print()
+        print(f"  Merge it yourself when it has been reviewed, or point this at a batch")
+        print("  branch you own — `integrationBranch` in .claude/worktree-per-change.json")
+        print("  — which is the case squash-merging without review was written for.")
+        return 0
+
     merged = run(["gh", "pr", "merge", target, "--squash"], tree, args.dry_run)
 
     # A non-zero exit is a question, not an answer. `gh` can merge the PR and then fail on

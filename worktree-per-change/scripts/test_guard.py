@@ -577,6 +577,67 @@ def main() -> int:
             json.dumps({"integrationBranch": "development"}), encoding="utf-8"
         )
 
+        # --- a protected merge target ------------------------------------------
+        # The other half of the same rule land.py enforces. Without this, opting a repo
+        # in would only redirect the well-behaved path and leave `gh pr merge` typed by
+        # hand as an open shortcut straight onto the trunk.
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "protectedMergeTargets": ["development"]}),
+            encoding="utf-8",
+        )
+        check(
+            "`gh pr merge` into a protected branch is denied",
+            decision(run(shell(topic, "gh pr merge --squash"))),
+            "deny",
+        )
+        denial = reason(run(shell(topic, "gh pr merge --squash")))
+        check("the denial names the branch", "development" in denial, True)
+        check("and points at push-and-open instead", "gh pr create --base" in denial, True)
+        check(
+            "it is refused in the main checkout too, not only in a worktree",
+            decision(run(shell(repo, "gh pr merge 12 --squash"))),
+            "deny",
+        )
+        # A denied merge never ran, so the worktree must NOT be spent by it — spending it
+        # here would strand a live change in a tree the guard then refuses to edit, and
+        # the change would need a new worktree to finish something that never started.
+        # Asked of a FRESH tree: `topic` was already spent by the allowed merge above,
+        # and a spent tree would answer "deny" for a reason that has nothing to do with
+        # this — which is exactly how this check would pass while the ordering was wrong.
+        unspent = repo / ".claude" / "worktrees" / "unspent"
+        git(repo, "worktree", "add", str(unspent), "-b", "unspent-topic", "development")
+        check(
+            "the fresh tree starts writable",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        check(
+            "the merge is denied there too",
+            decision(run(shell(unspent, "gh pr merge --squash"))),
+            "deny",
+        )
+        check(
+            "a denied merge does not spend the worktree",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        # Unrelated gh calls are untouched; this is not a block on `gh`.
+        check(
+            "`gh pr create` is unaffected",
+            decision(run(shell(topic, "gh pr create --base development --fill"))),
+            "allow",
+        )
+        # Restored, because every check after this one expects the unprotected default.
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+        check(
+            "with nothing configured `gh pr merge` is allowed again",
+            decision(run(shell(topic, "gh pr merge --squash"))),
+            "allow",
+        )
+
         # --- modes and fail-open ------------------------------------------------
         check(
             "`off` disables it",

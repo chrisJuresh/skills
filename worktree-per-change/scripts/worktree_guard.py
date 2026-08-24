@@ -129,6 +129,15 @@ _SEGMENT = re.compile(r"&&|\|\||[;\n|]")
 # spends the current worktree: the next edit has to start from a new one.
 _MERGED = re.compile(r"\bgh\s+pr\s+merge\b", re.I)
 
+# Branches a merge is never run into from a session. The same `protectedMergeTargets`
+# key land.py reads, and empty by default for the same reason: for most repositories the
+# integration branch *is* `development` or `main` and merging into it is the protocol.
+#
+# This is the half that catches `gh pr merge` typed directly, where land.py is not
+# involved at all — without it, opting a repo in would only redirect the well-behaved
+# path and leave the shortcut open.
+DEFAULT_PROTECTED_MERGE_TARGETS: frozenset[str] = frozenset()
+
 
 # --------------------------------------------------------------------------- paths
 
@@ -226,6 +235,57 @@ def integration_branch(main_root: Path | None) -> str:
         except (OSError, ValueError, AttributeError):
             pass
     return DEFAULT_INTEGRATION_BRANCH
+
+
+def protected_targets(main_root: Path | None) -> frozenset[str]:
+    """What this repository refuses to merge into, from its own record.
+
+    Read from the same per-repo config as the branch, and additive only: there is no key
+    that removes a name and no environment override, so a repo that has opted in cannot be
+    talked back out of it by a later `CLAUDE_INTEGRATION_BRANCH`.
+    """
+    if main_root is not None:
+        try:
+            blob = json.loads((main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8"))
+            extra = blob.get("protectedMergeTargets")
+            if isinstance(extra, list):
+                names = {str(n).strip().lower() for n in extra if str(n).strip()}
+                return DEFAULT_PROTECTED_MERGE_TARGETS | frozenset(names)
+        except (OSError, ValueError, AttributeError):
+            pass
+    return DEFAULT_PROTECTED_MERGE_TARGETS
+
+
+def is_protected(branch: str, protected: frozenset[str]) -> bool:
+    """Match the bare branch name, `origin/`-qualified or not, case-insensitively.
+
+    Normalised rather than compared literally so `Develop`, `origin/develop` and
+    `refs/heads/develop` are not three ways past the same check.
+    """
+    name = (branch or "").strip().lower()
+    for prefix in ("refs/heads/", "refs/remotes/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name in protected
+
+
+def reason_protected_merge(branch: str) -> str:
+    """Why a merge into a shared trunk is refused, and what to do instead."""
+    return (
+        f"**`gh pr merge` is not run against `{branch}`.**\n\n"
+        f"`{branch}` is a protected branch: the pull request into it *is* the review, so "
+        "merging it is a person's decision and not one this session takes.\n\n"
+        "The change is still delivered the same way — push and open the PR:\n\n"
+        "```\ngit push -u origin HEAD\ngh pr create --base "
+        f"{branch} --fill\n```\n\n"
+        "Then leave it open and say so. `land.py` does exactly this and stops at the same "
+        "point.\n\n"
+        "Squash-merging without review is for a batch branch you own; point "
+        "`integrationBranch` in `.claude/worktree-per-change.json` at one if that is what "
+        "this is."
+    )
 
 
 def worktrees_root(main_root: Path | None) -> str:
@@ -1018,6 +1078,18 @@ def main() -> None:
 
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
+        return
+
+    if _MERGED.search(command) and is_protected(branch, protected_targets(main_root)):
+        # Denied BEFORE `mark_spent` below, and the order is the whole point: a denied
+        # merge never ran, so spending the worktree here would strand a live change in a
+        # tree the guard then refuses to edit — the change would need a new worktree to
+        # finish something that never started.
+        #
+        # Not gated on `linked`, unlike the marking. A merge into a shared trunk is
+        # refused wherever it is typed; the main checkout is if anything the more likely
+        # place for someone to try it.
+        deny(reason_protected_merge(branch), warn_only)
         return
 
     if linked and _MERGED.search(command):

@@ -19,6 +19,7 @@ needs `git` and does not need `gh`, an account, or a remote.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -62,10 +63,13 @@ def repo_with_commit(root: Path, name: str, branch: str) -> Path:
     return repo
 
 
-def record_branch(repo: Path, branch: str) -> None:
+def record_branch(repo: Path, branch: str, protected: list[str] | None = None) -> None:
     config = repo / ".claude" / "worktree-per-change.json"
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(json.dumps({"integrationBranch": branch}), encoding="utf-8")
+    blob: dict = {"integrationBranch": branch}
+    if protected is not None:
+        blob["protectedMergeTargets"] = protected
+    config.write_text(json.dumps(blob), encoding="utf-8")
 
 
 def main() -> int:
@@ -197,6 +201,65 @@ def main() -> int:
         git(mine, "commit", "-qm", "resolve")
         out = land(mine, "--dry-run", "--merge-integration")
         check("and a resolved tree gets through it", "already contains origin/main" in out.stdout, True)
+
+        # --- a protected target is pushed and opened, never merged -----------------
+        # The point of the whole script is that delivery happens unasked, so the refusal
+        # is placed at the merge step rather than in preflight: refusing at the top would
+        # abort before the push and leave the change undelivered, which is the failure
+        # this script exists to prevent. Push and open still happen; only the merge does
+        # not, and the exit code says success because the change IS delivered.
+        guarded = repo_with_commit(root, "guarded", "develop")
+        record_branch(guarded, "develop", protected=["develop"])
+        git(guarded, "worktree", "add", "-q", "-b", "feature", str(root / "wt-guarded"), "develop")
+        gtree = root / "wt-guarded"
+        (gtree / "f.txt").write_text("work\n", encoding="utf-8")
+        git(gtree, "add", "f.txt")
+        git(gtree, "commit", "-qm", "work")
+
+        out = land(gtree, "--dry-run")
+        check("a protected target still succeeds", out.returncode, 0)
+        check("the header says it will not merge", "merge:       NO" in out.stdout, True)
+        check("the push still runs", "git push -u origin HEAD" in out.stdout, True)
+        check("the PR is still opened", "gh pr create --base develop" in out.stdout, True)
+        check("the merge is refused", "NOT MERGING" in out.stdout, True)
+        check("and gh pr merge is never printed", "gh pr merge" in out.stdout, False)
+        # Deleting the branch would close the head of a PR nobody has read yet.
+        check("the branch is not deleted", "--delete origin" in out.stdout, False)
+        check("it is not reported as a failure", "refused" in out.stderr, False)
+
+        # Matched on the bare name, so neither case nor an `origin/` qualifier is a way
+        # past it — both are plausible values for `CLAUDE_INTEGRATION_BRANCH`.
+        for spelling in ("Develop", "origin/develop", "refs/heads/develop"):
+            env = dict(os.environ, CLAUDE_INTEGRATION_BRANCH=spelling)
+            out = subprocess.run(
+                [sys.executable, str(LAND), "--dry-run"],
+                cwd=str(gtree), capture_output=True, text=True, env=env,
+            )
+            check(f"`{spelling}` is still protected", "NOT MERGING" in out.stdout, True)
+
+        # The override cannot switch the protection OFF either: pointing it at a branch
+        # this repo does not protect is allowed, which is what makes the batch flow work,
+        # but `develop` stays refused however it is spelled (checked just above).
+        env = dict(os.environ, CLAUDE_INTEGRATION_BRANCH="ENS-1-batch")
+        out = subprocess.run(
+            [sys.executable, str(LAND), "--dry-run"],
+            cwd=str(gtree), capture_output=True, text=True, env=env,
+        )
+        check("an unprotected batch branch still merges", "gh pr merge" in out.stdout, True)
+
+        # --- the default is empty, so existing repositories are unaffected ----------
+        # Most repositories integrate through `development` or `main` and squash-merging
+        # into it IS the protocol. A default list here would break every one of them.
+        plain = repo_with_commit(root, "unprotected", "main")
+        record_branch(plain, "main")
+        git(plain, "worktree", "add", "-q", "-b", "t2", str(root / "wt-plain"), "main")
+        ptree = root / "wt-plain"
+        (ptree / "g.txt").write_text("work\n", encoding="utf-8")
+        git(ptree, "add", "g.txt")
+        git(ptree, "commit", "-qm", "work")
+        out = land(ptree, "--dry-run")
+        check("an unconfigured repo merges into main as before", "gh pr merge" in out.stdout, True)
+        check("and says nothing about protection", "NOT MERGING" in out.stdout, False)
 
         # --- a tree outside a repository -------------------------------------------
         loose = root / "not-a-repo"
