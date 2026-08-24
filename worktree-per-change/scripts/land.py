@@ -414,7 +414,7 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     # open, and the only thing that did not happen is the thing that should not.
     if is_protected(branch, protected_targets(main_root)):
         print(f"  NOT MERGING — `{branch}` is a protected branch.")
-        print(f"  #{number} is open and waiting for a human to merge it.")
+        print(f"  #{target} is open and waiting for a human to merge it.")
         print()
         print(f"  This is not a failure: the change is delivered. `{branch}` takes")
         print("  reviewed pull requests, so the review is the point and merging it is")
