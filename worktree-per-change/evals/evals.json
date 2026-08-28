@@ -71,6 +71,21 @@
         "Warns that the attribute must not be applied to authored/prose files, because both sides land unreviewed",
         "Does not propose untracking or gitignoring the generated index as the fix"
       ]
+    },
+    {
+      "id": 5,
+      "name": "already-wrote-in-the-shared-tree",
+      "prompt": "i've been going about 40 minutes and just realised i never made a worktree - i've been editing in ~/acme-console the whole time, and at some point i ran git switch invoice-export in there too. there's definitely another claude session running in this repo. hooks were installed this morning but i think my session started before that. what do i do - should i git switch back to development and then redo this properly in a worktree?",
+      "expected_output": "Do not restore the HEAD. Report which command moved it, commit the work rather than stashing it, and move to a worktree cut off origin/development, carrying the commit across.",
+      "files": ["fixture/"],
+      "assertions": [
+        "Says explicitly NOT to switch back / restore the previous HEAD, because the value to restore to is another session's and is not knowable from inside this one",
+        "Tells the session to report the command it ran, naming it, rather than silently repairing",
+        "Commits the work in place instead of stashing it, and says refs/stash is shared across the whole repository",
+        "Moves to a new worktree cut from origin/development and carries the commit over rather than finishing in the shared tree",
+        "Does not treat the guard as broken for having allowed this — a session predating the install is not covered",
+        "Does not tell the session to keep going in the shared tree until it reaches a stopping point"
+      ]
     }
   ]
 }

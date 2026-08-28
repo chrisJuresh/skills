@@ -7,8 +7,9 @@ description: >-
   installed, when a write, `git switch`, `git add` or `git stash` is denied, when
   EnterWorktree cuts from the wrong base, when a change is finished and has to be pushed,
   merged and then taken down, when a session is refused permission to stop, when a second
-  change starts in a session that already merged one, and when the user wants this rule
-  installed in a repository or on a machine.
+  change starts in a session that already merged one, when a session finds it has already
+  been writing in the main checkout or has moved a shared tree's `HEAD`, and when the user
+  wants this rule installed in a repository or on a machine.
 ---
 
 # One change, one worktree, one branch, one merged PR
@@ -414,9 +415,39 @@ not tidiness: a linter, a formatter, a test runner or a type checker pointed at 
 will walk every worktree on disk, so the gate slows down with the number of trees standing
 and starts reporting *other branches'* failures as yours.
 
-Each tool has to be told separately, and one of them may already be right for a reason
-worth establishing rather than assuming. Measured on the first repository to adopt this:
-ESLint needed `.claude/**` adding to `ignores` and Prettier needed `.claude/` in
+**The first tool that sees them is git, so `.gitignore` gets the entry before anything
+else does.** This is the one that is easy to skip, because the noise it makes is small:
+git stops at each nested `.git` rather than descending, so the main checkout's
+`git status --short` grows exactly one line, `?? .claude/worktrees/`, however many trees
+stand. It is a permanent line, though, and while it is there "is the main checkout clean"
+is not a question the status answers. What it costs is the next `git add -A` run in the
+main checkout — by a person in an editor, or by any session in a repo where the guard is
+not installed yet, in `warn`, or failing open. Measured on a two-worktree probe:
+
+```
+$ git add -A                     # exit 0, and the only complaint is a hint
+warning: adding embedded git repository: .claude/worktrees/topic
+$ git ls-tree HEAD .claude/worktrees/
+160000 commit 7895d72…  .claude/worktrees/other
+160000 commit 7895d72…  .claude/worktrees/topic
+```
+
+Those are gitlinks to commits no clone can resolve, and they are quiet in both directions:
+the commit succeeds, and every worktree cut from it afterwards materialises empty
+directories named after other people's branches and then reports itself **clean**. So:
+
+```gitignore
+.claude/worktrees/
+```
+
+A repo that ignores `.claude/` wholesale already has this and needs the *narrowing*
+described above instead; a repo that ignores nothing under `.claude/` has neither, and
+nothing else in this protocol will tell it so. Measured: the repository this skill itself
+lives in was one of them.
+
+Each of the rest has to be told separately, and one of them may already be right for a
+reason worth establishing rather than assuming. Measured on the first repository to adopt
+this: ESLint needed `.claude/**` adding to `ignores` and Prettier needed `.claude/` in
 `.prettierignore`, while the test runner was already safe only because its `include` globs
 name three directories instead of the root. The type checker needed nothing — TypeScript's
 wildcard `include` skips dot-directories — but that was settled with a three-line probe
@@ -566,6 +597,39 @@ same goes for `CLAUDE_WORKTREE_GATE=warn`, which reports without denying and is 
 operator watches what a repo would block before committing to it. So if a denial is
 provably wrong, the move that works is to say so plainly in your reply — what you were
 doing, what it blocked, why the guard is wrong — and stop.
+
+## When the rule was already broken
+
+The guard has holes by design, and each one is defended somewhere above: it **fails open**
+on every question it cannot answer, it sees only Claude's own tool calls, `warn` reports
+without denying, and new hooks apply only to sessions started after the install. So
+arriving in the state this protocol exists to prevent — a write in the main checkout, two
+sessions in one tree — does not mean anything went wrong with the guard, and it is worth
+knowing the move before you need it. Both of them are the opposite of the instinct.
+
+**Never put back a `HEAD` you moved by accident.** A session that finds it has moved the
+shared tree — checked out a branch there, left it somewhere new — **says which command it
+ran and stops.** It does not restore anything, and it does not go looking through the
+reflog for the value to restore. "Back" is not knowable from inside one session: the value
+you are trying to return to is another session's, you cannot see what that session had, and
+a wrong guess silently swaps the files under a live worker — which is the failure this whole
+protocol is built to prevent, arriving disguised as the repair for it. Two sessions each
+guessing leaves the tree somewhere neither of them intended, with the second guess hiding
+the first. The session that owns the branch is the only one that can put it back, and it can
+only do that if it is told. Reporting it is therefore the fix and not the preamble to one.
+
+**If you find mid-change that you have been sharing a tree, move rather than finish.**
+The instinct is to get to a stopping point first, and it is wrong in the direction that
+costs most: the shared tree gets worse with every file written, and untangling it happens
+later, when nobody can still say which hunk was whose. So stop where you are, **commit**
+what is genuinely yours — never stash it, `refs/stash` is one stack for the whole
+repository and the entry a later `pop` takes may not be the one you pushed — then cut a
+worktree off the correct base, `git cherry-pick` the commit across, and carry on there.
+A commit is the cheap move here precisely because it is addressable: it belongs to a
+branch, it survives the next session's `git switch`, and it can be named in a reply.
+
+Say both in the reply. An operator who is told which command moved the tree can put it
+back in one step; one who is told nothing pays for it in the next session's diff.
 
 ## What a worktree still does not isolate
 
