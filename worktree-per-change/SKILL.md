@@ -40,6 +40,14 @@ What it buys, in the order the failures actually happen:
 
 ## The loop
 
+This is the default, and a repository may have replaced its last three steps. Check
+`.claude/worktree-per-change.json` for a `delivery` block before following the loop: a repo
+that lands without pull requests, or enters worktrees by path rather than with
+`EnterWorktree`, declares it there and the guard's own messages follow that instead. The
+**invariant** never moves — one change, one worktree, one branch, and a branch that exists
+only on this disk is not a delivered change — only the commands do. See
+[references/guard-internals.md](references/guard-internals.md#configuration).
+
 ```bash
 # 1. before the first edit — a worktree cut from the FETCHED integration branch
 git fetch origin <integration>
@@ -240,8 +248,8 @@ The same trap catches `git branch --merged <integration>`: it lists nothing afte
 merge, so it is not a sweep, and a branch missing from it has not necessarily survived.
 
 A second change in the same session gets a **new** worktree and a **new** branch, cut
-from the integration branch you just merged into. The guard marks a worktree spent once
-`gh pr merge` has run in it and denies further edits there — a merged branch that grows
+from the integration branch you just merged into. The guard marks a worktree spent once a
+merge — `gh pr merge`, or `land.py` — has run **in** it, and denies further edits there — a merged branch that grows
 a new commit reaches nobody, because the PR that would have carried it is already
 closed.
 
@@ -578,6 +586,81 @@ can be stopped in one repository and allowed in another, or stopped and then all
 same one. So do not reason about when it will stop you; write the rule. See
 [references/permissions.md](references/permissions.md).
 
+### Four gates refuse worktree work, and they read alike
+
+Naming the wrong one is worse than writing nothing down, because it sends the next session
+to fix a repository that cannot fix it. Measured in the first repository to adopt this:
+**three log entries and five refusals**, all filed against this guard, none of them its
+doing — and an upstream fix for any of them would have moved nothing.
+
+| gate | how you recognise it | where the fix is |
+|---|---|---|
+| this guard, `PreToolUse` | its own vocabulary: the main checkout, the integration branch, a spent worktree, `git stash` | upstream, in the skill — never in a repo's committed copy |
+| this guard, `Stop` | it counts what the worktree is holding, then prescribes delivery and teardown | upstream too — but note it is **not** a `PreToolUse` hook, so grepping the guard's rule set for its words finds nothing and proves nothing |
+| the machine's permission layer | it says permission rather than protocol, and names no next move | an allowlist entry, once — see [references/permissions.md](references/permissions.md) |
+| Claude Code's own worktree isolation | `"This session is isolated in the worktree …"`, arriving as a tool **error**, not a hook denial | nowhere. No repository can change it — see below |
+
+**Grep the refusal against the repo's committed `worktree-guard.py` before writing "fix it
+upstream".** If the words are not in that file, this guard did not say them.
+
+### What `EnterWorktree` costs
+
+Entering is what the loop above asks for, and it buys a real thing: Claude Code enforces
+the boundary itself from that moment, and the session reports the worktree as its `cwd`
+rather than going on advertising the main checkout to every other session.
+
+It is also a **second** gate on top of this guard, and it refuses more than the boundary.
+It rejects every compound command it cannot statically verify — a heredoc, a pipe, a `for`
+loop over two `curl` calls, an `echo "$VAR"` — including ones that touch no git and no path
+outside the worktree and could not leave it by construction. And it refuses every `cd` to
+the main checkout, including the legitimate one: removing a *sibling* worktree, which
+nothing inside that worktree can do for itself.
+
+```
+This session is isolated in the worktree <path>, but this command is too complex to
+verify that it stays inside the worktree; break it into plain, separate commands.
+```
+
+Measured: five refusals across four sessions in one repository, one call and one rewrite
+each. If you are isolated and hit it — one command per call, a pipe counts as complexity,
+the Write tool replaces a heredoc, and `git worktree remove ../<sibling>` is the relative
+spelling that does the same job as the `cd` it refuses.
+
+**A repository may decide the trade is not worth it**, and one has: where the guard is
+installed, it already judges the *path a write targets*, so a session that never entered
+still cannot write in the main checkout. Such a repository declares
+`"delivery": {"enterWorktree": false}` (see
+[references/guard-internals.md](references/guard-internals.md#configuration)), and every
+message the guard prints then stops naming `EnterWorktree`. In one, work in the tree by
+path — better still, start the session inside it, since entering mid-session pays the cold
+start twice.
+
+**Absent that declaration, enter.** This is a repository's decision to record, not a
+session's to make on the day, and none of the above is licence to `cd` instead of entering
+in a repository that has not made it. The refusals are a cost to know about when you meet
+one, and they are the reason the declaration exists at all.
+
+**In a repository that has made it, read the next paragraph, because "by path" does not
+work for git.**
+
+### Working in a worktree by path: `cd` once, alone, spelled out
+
+Write and Edit are judged on the path they target, so they work on a worktree from a
+session sitting anywhere. **`git` is judged on the directory the command runs in**, and
+this guard works that out by reading the command's *tokens* — so a `cd` or a `-C` whose
+argument is a shell **variable** is unreadable, the hook falls back to the tool's cwd, and
+the call is denied as though it were in the main checkout:
+
+```
+Denied: `git add` does not run in the main checkout.
+```
+
+Both `cd "$W" && git add <paths>` and `git -C "$W" add <paths>` are denied, and neither is
+a wrong denial — `git -C "$W" switch` is the guard's own worked example of a directory
+argument it cannot read. The variable is the trap, not the `cd`. What works is one call
+that is **only** `cd /full/literal/path`, with no `&&` and no variable; the tool's cwd
+persists, so every later `git` in that session resolves inside the tree.
+
 `git stash` is denied in worktrees too, and that is not an oversight: `refs/stash` is a
 single stack for the whole repository, so a push in one worktree renumbers every other
 worktree's entries and a later `pop` or `drop` in *either* takes the wrong one. It is the
@@ -734,6 +817,33 @@ with `gh pr view <n> --json state` before removing anything and read uncommitted
 a merge that did not land. A tree holding an unfinished rebase or merge is left out of the
 report entirely and keeps its right to be edited — conflict resolution is the work, and it
 is the most expensive thing a wrong cleanup could destroy.
+
+### When `git worktree remove` is refused by a lock
+
+`EBUSY: resource busy or locked, rmdir` on the worktree directory, or git's own refusal to
+remove it. **The change has already landed by then** — the merge is first and the teardown
+second, on purpose — so this is never a reason to redo anything, and never a reason to
+stash. Three causes, in the order worth checking:
+
+1. **Your own shell's cwd is inside the tree.** This is the default outcome rather than an
+   edge case, because the teardown is run from the worktree. `cd` to the main checkout in a
+   call of its own, then remove it.
+2. **A server or watcher you started in it.** A `cmd &` inside one tool call does not
+   survive the call; a backgrounded *tool* invocation does — stop that one first. A dev
+   server that picked a different port than the one it was asked for is the version of this
+   that wastes an afternoon: check what is actually listening, and confirm the process's
+   command line points into *this* tree before killing it, because the obvious port is
+   often another worktree's.
+3. **A blocking `PreToolUse` hook from some other plugin, hung with the tree as its cwd.**
+   The tell is that the directory is **empty** and still locked: the recursive delete got
+   all the way through and only the top-level directory is held. A `--blocking` hook still
+   alive minutes after the command that spawned it is hung, not working, and killing it
+   loses nothing.
+
+What it is usually *not* is `node_modules` still holding a file, though that does happen
+and does clear: measured, a removal that failed succeeded about a minute later with nothing
+done in between. So a teardown script should retry for a few seconds before reporting. If
+waiting does not clear it, it is one of the three above.
 
 One consequence of cleaning up routinely: worktree **paths get reused**, because the next
 change to the same area wants the same obvious name. The guard's spent marker is keyed by

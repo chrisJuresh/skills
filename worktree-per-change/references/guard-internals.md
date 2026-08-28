@@ -118,9 +118,36 @@ branch, which is the permissive direction and correct: nothing merges into a det
 
 "A new worktree every time" is only a real rule if reusing a finished one is refused.
 
-The guard watches shell commands for `gh pr merge` and, when it sees one in a worktree,
-writes `<git-common-dir>/claude-worktree-gate/spent/<worktree-name>.json`. Every later
-`Edit`/`Write` in that tree is denied with a pointer at `EnterWorktree`.
+The guard watches shell commands for a **merge** — `gh pr merge`, or `land.py` under an
+interpreter or on its own — and writes
+`<git-common-dir>/claude-worktree-gate/spent/<worktree-name>.json` for the worktree that
+merge would run in. Every later `Edit`/`Write` in that tree is denied.
+
+**It parses, and it did not always.** `merge_calls()` walks the same token stream as
+`git_calls()`: it reads the command position of each segment, composes a leading `cd` the
+way a shell does, and drops heredoc bodies first. Until then it was
+`re.search(r"\bgh\s+pr\s+merge\b", command)` over the whole string, which was wrong in
+three ways that each cost a measured session:
+
+- **Anything that mentioned the phrase spent the tree.** A `grep` for it, an `echo`, or a
+  heredoc writing a document that quotes it. Measured 2026-08-22, on a session writing
+  this protocol's own documentation: the next edit was denied, and `gh pr list --head
+  <branch> --state all` returned nothing, because there was no pull request at all.
+- **`land.py` was invisible.** Its command string holds no `gh pr merge`, so the delivery
+  route SKILL.md recommends left no mark, the sweep never listed the tree, and the
+  cleanup gate never fired for it.
+- **The mark went on the session's tree, not the merging one.** Measured 2026-08-23:
+  `cd <other-worktree> && gh pr merge` marked the session's own harness-made tree — with a
+  branch that had no PR, which then refused that session's `Stop` — and left the tree that
+  merged unmarked and still editable. Two costs from one missing reading.
+
+The command position is read and the rest of the segment is not, which is the opposite of
+`git_calls`, and the asymmetry is deliberate: a missed `git` on the write path is an
+unguarded mutation, while a missed merge is only a mark not written — and that mark's own
+denial tells you to confirm with the forge regardless. Over-report on the write path,
+under-report on the mark. Heredoc bodies are dropped for the same reason: `bash <<EOF`
+does run its body, but a body wrongly read as `git add` costs one workable denial, where a
+body wrongly read as a merge costs the tree.
 
 The marker is written **before** the merge runs, because `PreToolUse` is the only hook that
 sees the command and there is no after-hook that can tell a merge from a merge that failed.
@@ -191,9 +218,34 @@ writes can ever show up in `git status`.
 ## The Stop hook
 
 `Stop` refuses to end a session sitting in a worktree that is holding uncommitted files or
-commits that `origin/<integration>` has not got, and names which. That is the only place
-the guard shells out to git: `status --porcelain` and `rev-list --count`, once per stop
-attempt, never on the write path.
+**undelivered** commits, and names which. That is the only place the guard shells out to
+git: `status --porcelain`, `rev-parse --verify` and `rev-list --count`, a few times per
+stop attempt, never on the write path.
+
+**Undelivered is not the same as "not on the integration branch"**, and reading it as the
+second is the one wrong answer here that is actively destructive. `undelivered()` asks two
+questions instead:
+
+- `rev-list --count HEAD --not --remotes` — commits on **no remote at all**. Unpushed
+  work, the strong case, and the literal reading of "a branch that exists only on this
+  disk".
+- if this worktree's own branch is pushed, `origin/<integration>..origin/<topic>` —
+  commits published on the topic branch and not yet landed. A branch left standing with
+  nobody merging it.
+
+It used to count `origin/<integration>..HEAD` and nothing else. Where the default branch
+is `main` and the integration branch is `development`, that counts the **divergence
+between them**, so every worktree the harness cuts — which is cut from the default branch
+— trips the gate at every `Stop`, forever, however completely the session delivered.
+Measured 2026-08-24: one commit counted, and `git branch -r --contains` answered
+`origin/main`. Following the block's five steps would have pushed that history and
+squash-merged some fifty thousand deletions onto `development`, so the gate was not merely
+noisy: its remedy was destructive exactly when it was wrong.
+
+If `refs/remotes/origin/<integration>` does not resolve at all, the check returns nothing
+rather than guessing. That is the fail-open posture, and here it is also load-bearing:
+`--not --remotes` in a repository with no remote refs excludes nothing and counts the
+whole history.
 
 It refuses just as firmly when the tree's PR **has** merged and the tree is still standing,
 printing the four teardown commands. That is the half of the protocol nothing used to hold —
@@ -225,6 +277,52 @@ The integration branch is per repository, read in this order:
 It is committed next to the hook rather than inferred from the remote's default branch,
 because the default branch is frequently *not* the integration branch, and guessing it wrong
 sends every PR at the wrong target and every new worktree at the wrong base.
+
+### `delivery` — when the repository has replaced the protocol's last three steps
+
+Push, PR, `gh pr merge`, `ExitWorktree`, remove is what the guard prescribes, and it is
+right for most repositories. Where it is not, a gate that prescribes it anyway is worse
+than one that prescribes nothing: it fires correctly on the invariant and then contradicts
+the repository's own decisions, and nothing in the refusal tells the session which
+document wins. Measured 2026-08-23 — a repository that had dropped pull requests by
+recorded decision and lands with a single command got a `Stop` block whose five steps
+disagreed with three of its decisions, one of them (`ExitWorktree`) unreachable there by
+construction.
+
+So the **invariant** stays the guard's and the **steps** become the repository's, in the
+same file as the branch:
+
+```json
+{
+  "integrationBranch": "development",
+  "delivery": {
+    "command": "pnpm feature land",
+    "teardown": "pnpm feature clean <name>",
+    "enterWorktree": false
+  }
+}
+```
+
+| key | what it replaces |
+|---|---|
+| `command` | `git push` / `gh pr create` / `gh pr merge` in every message that prescribes them |
+| `teardown` | the four teardown steps, in the `Stop` blocks and the `SessionStart` briefing |
+| `enterWorktree` | when `false`, "call **EnterWorktree**" becomes the `cd` rule, and the `ExitWorktree` teardown step is dropped rather than renumbered around |
+
+`<name>` and `<branch>` in the **teardown** are filled in with the worktree's leaf name and
+its branch, so what a block prints is runnable rather than a template. Not in `command` —
+the `SessionStart` briefing prints that one before any worktree exists, and a placeholder
+that fills in some messages and not others is worse than one that never fills.
+
+Every key is optional, and absence is not a declaration: only an explicit `false` turns
+`enterWorktree` off, and a repository that has said nothing gets exactly the messages it
+got before this existed. That is the point — the repository that needs this has already
+written its protocol down somewhere, and no other repository should have to learn the
+mechanism is here.
+
+Declaring it is a hand edit. `install.py` merges this file rather than replacing it —
+"the file is the repo's, not this installer's" — so a `delivery` block survives a resync
+without the installer knowing about it.
 
 `CLAUDE_WORKTREE_GATE` controls the guard itself: `on` (default), `warn` — allow, but print
 the reason it would have denied, which is how to watch what a repo would block before

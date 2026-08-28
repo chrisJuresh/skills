@@ -116,9 +116,21 @@ _CHDIR = {"cd", "pushd"}
 # argument — which is the false positive tokenizing first exists to remove.
 _SEGMENT = re.compile(r"&&|\|\||[;\n|]")
 
-# What "the change has landed" looks like on the command line. Seeing one of these
-# spends the current worktree: the next edit has to start from a new one.
-_MERGED = re.compile(r"\bgh\s+pr\s+merge\b", re.I)
+# What "the change has landed" looks like on the command line. Running one of these
+# spends the worktree it ran in: the next edit has to start from a new one. They are
+# found by `merge_calls`, which parses — see there for why a regex over the whole
+# command string was both too eager and not eager enough.
+_GH = {"gh", "gh.exe"}
+_PYTHON = {"python", "python3", "py", "python.exe", "python3.exe", "py.exe"}
+_LAND = {"land.py"}
+
+# `FOO=bar gh pr merge` — a shell reads the assignments as environment for the command
+# that follows, so the command is the first token that is not one.
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# `<<EOF`, `<<-'EOF'`, `<< "EOF"` — the start of a heredoc, whose body is data. `<<<` is
+# a here-string and not one, which the leading character class already excludes.
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 # --------------------------------------------------------------------------- paths
@@ -217,6 +229,132 @@ def integration_branch(main_root: Path | None) -> str:
         except (OSError, ValueError, AttributeError):
             pass
     return DEFAULT_INTEGRATION_BRANCH
+
+
+def phrase(value) -> str | None:
+    """A configured string, or None for anything that is not usably one."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+class Delivery:
+    """How *this* repository delivers a change and takes a worktree down.
+
+    Push, PR, `gh pr merge`, `ExitWorktree`, remove is the default, and it is right for
+    most repositories. It is not right for all of them, and a gate that prescribes it
+    anyway is worse than one that prescribes nothing. Measured 2026-08-23, in a repository
+    that had dropped pull requests by recorded decision and delivers with a single
+    command: the `Stop` block fired correctly on the invariant — a branch that exists only
+    on this disk is not a delivered change, which was exactly that repository's own
+    position — and then handed over five steps contradicting three of its decisions, one
+    of them (`ExitWorktree`) unreachable there by construction. The session's cost is
+    deciding which of two documents to believe, and nothing in the refusal answers it.
+
+    So the invariant stays the guard's and the steps become the repository's, declared
+    beside the integration branch in `.claude/worktree-per-change.json`:
+
+        "delivery": {
+          "command": "pnpm feature land",
+          "teardown": "pnpm feature clean <name>",
+          "enterWorktree": false
+        }
+
+    `<name>` and `<branch>` in the **teardown** are filled in with the worktree's leaf name
+    and its branch, so what the gate prints is runnable rather than a template. Not in
+    `command`: the briefing that prints it runs at `SessionStart`, where there is no
+    worktree yet, and a placeholder filled in some messages and left standing in others is
+    worse than one that never fills.
+
+    Every key is optional and absence means the default, so a repository that has declared
+    nothing reads exactly as it did before this existed. That is the point: the repository
+    that needs this is the one that has already written its protocol down somewhere, and
+    every other one should never learn that the mechanism is here.
+    """
+
+    def __init__(self, blob=None):
+        blob = blob if isinstance(blob, dict) else {}
+        self.command = phrase(blob.get("command"))
+        self.teardown = phrase(blob.get("teardown"))
+        # Only an explicit `false` turns it off. An absent key is not a repository saying
+        # it enters by path; it is a repository that has not been asked.
+        self.enter = blob.get("enterWorktree") is not False
+
+    def fill(self, command: str, tree, topic: str | None) -> str:
+        return command.replace("<name>", Path(tree).name).replace("<branch>", topic or "<branch>")
+
+    def entering(self) -> str:
+        """How a session gets into a worktree, as an instruction."""
+        if self.enter:
+            return "call **EnterWorktree** with that path"
+        return (
+            "`cd` into that path — in a command of its own, with the path spelled out in "
+            "full. Not through a shell variable and not joined to the next command with "
+            "`&&`: this hook reads a `cd` or a `-C` argument as *tokens*, so `cd $W && git "
+            "add …` and `git -C \"$W\" add …` are both unreadable, both fall back to the "
+            "session's own directory, and both are therefore denied as the main checkout"
+        )
+
+    def protocol(self, branch: str) -> str:
+        if not self.command:
+            return PROTOCOL.format(branch=branch, enter=self.entering())
+        return (
+            f"The protocol: {self.entering()} before the first edit. Work, commit, then "
+            f"`{self.command}` — this repository declares that as its own delivery, in "
+            "place of push, PR and merge. A second change in the same session starts a "
+            "new worktree — one worktree, one branch, one change."
+        )
+
+    def base_note(self, branch: str) -> str:
+        if self.enter:
+            return BASE_NOTE.format(branch=branch)
+        # Half of BASE_NOTE is about `worktree.baseRef` choosing the wrong base, which is
+        # a property of EnterWorktree and reads as noise in a repository that never calls
+        # it. The rule it exists to protect — cut from the FETCHED remote tip — is not.
+        return (
+            f"The base is `origin/{branch}` — the FETCHED remote tip — and never local "
+            "HEAD, never whatever branch the main checkout is sitting on, and never an "
+            "unfetched local ref. A stale base silently reintroduces work already landed "
+            "as a conflict:\n"
+            f"`git fetch origin {branch} && git worktree add .claude/worktrees/<name> "
+            f"-b <branch> origin/{branch}`"
+        )
+
+    def finishing(self) -> str:
+        """The teardown as one sentence, for the `SessionStart` briefing."""
+        if self.teardown:
+            return f"`{self.teardown}` takes it down."
+        exit_first = '`ExitWorktree` (`action: "keep"`), then ' if self.enter else ""
+        return (
+            f"after the merge, {exit_first}`git worktree remove <path>` and "
+            "`git branch -D <branch>` from the main checkout."
+        )
+
+    def deliver(self, branch: str) -> str:
+        """The steps from an uncommitted worktree to a landed change."""
+        commit = '1. `git add <paths> && git commit -m "..."` — name the paths; never `git add -A`.\n'
+        if self.command:
+            return (
+                commit
+                + f"2. `{self.command}` — this repository's declared delivery command. It "
+                "is what this repository has instead of the push-PR-merge sequence, so do "
+                "not reconstruct that sequence by hand here."
+            )
+        return (
+            commit
+            + "2. `git push -u origin HEAD`\n"
+            f"3. `gh pr create --base {branch} --fill`\n"
+            "4. `gh pr merge --squash --delete-branch` (add `--admin` only if the "
+            "repo's checks do not apply here)\n"
+        )
+
+
+def delivery(main_root: Path | None) -> Delivery:
+    if main_root is None:
+        return Delivery()
+    try:
+        blob = json.loads((main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8"))
+        return Delivery(blob.get("delivery"))
+    except (OSError, ValueError, AttributeError):
+        return Delivery()
 
 
 # --------------------------------------------------------------------------- state
@@ -561,11 +699,110 @@ def git_calls(command: str):
     return calls
 
 
+def merges(tokens: list[str]) -> str | None:
+    """What this one command would merge the change with, or None if it would not.
+
+    Only the **command position** is read, unlike `git_calls`, which reads every `git` in
+    a segment. That difference is deliberate and it is the whole fix: `echo gh pr merge`,
+    a `grep` for the phrase, and a heredoc writing a document that quotes it all put those
+    three words in a command string without running anything, and a scan that read them
+    anywhere would spend the worktree for each. Measured 2026-08-22: a repository writing
+    its own protocol docs through a heredoc marked its tree merged and was denied its next
+    edit, with no pull request anywhere to have merged.
+
+    Under-reporting is the safe direction *here*, and only here. A missed `git` on the
+    write path is an unguarded mutation, so `git_calls` over-reports on purpose. A missed
+    merge is a mark not written — and the mark is a convenience whose own denial tells you
+    to confirm with the forge anyway. A mark written wrongly, by contrast, denies every
+    further edit in a tree that has delivered nothing.
+    """
+    index = 0
+    while index < len(tokens) and _ASSIGNMENT.match(unquote(tokens[index])):
+        index += 1
+    if index >= len(tokens):
+        return None
+    head = tokens[index]
+    rest = (unquote(token) for token in tokens[index + 1 :])
+    words = [word for word in rest if word and not word.startswith("-")]
+    if names(head, _GH):
+        # `gh pr merge`, and not `gh pr view` or `gh pr list`. The pair is looked for
+        # anywhere in the arguments rather than at their head, because `gh --repo o/r pr
+        # merge` puts a flag's *value* in front of the subcommand and dropping tokens that
+        # merely start with `-` does not remove it.
+        adjacent = any(words[at : at + 2] == ["pr", "merge"] for at in range(len(words)))
+        return "gh pr merge" if adjacent else None
+    if names(head, _LAND):
+        return "land.py"
+    if names(head, _PYTHON):
+        # `python .claude/scripts/land.py`, which is the shape SKILL.md now recommends and
+        # which the old regex never saw at all: the string holds no `gh pr merge`, so the
+        # supported delivery route left no mark, the `SessionStart` sweep never reported
+        # the tree, and the cleanup gate never fired for it.
+        return "land.py" if any(Path(word).name in _LAND for word in words) else None
+    return None
+
+
+def without_heredocs(command: str) -> str:
+    """The command with every heredoc BODY dropped, keeping the commands around it.
+
+    A heredoc body is the text a command is *given*, not text a shell runs, and the
+    lexer cannot know that: `|`, `&` and `;` inside it are read as operators, so a line
+    of a markdown table splits into segments and any word can end up looking like a
+    command. That is how the measured false positive happened — a session writing this
+    protocol's own documentation through `cat > contract.md <<EOF`, with a table row
+    naming `gh pr merge` as the thing that spends a worktree, spent its worktree and was
+    denied its next edit.
+
+    Used for the merge reading only. `git_calls` still reads heredoc bodies, and should:
+    a body it wrongly reads as `git add` in the main checkout costs a denial the session
+    can work around in one call, while `bash <<EOF` and `cat <<EOF | sh` genuinely do run
+    theirs. The asymmetry is the same one `merges` is built on — over-report on the write
+    path, under-report on the mark.
+    """
+    lines = command.splitlines()
+    kept, index = [], 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for match in _HEREDOC.finditer(line):
+            delimiter = match.group(2)
+            while index < len(lines) and lines[index].strip() != delimiter:
+                index += 1
+            index += 1  # the terminator line itself, which is not body either
+    return "\n".join(kept)
+
+
+def merge_calls(command: str) -> list[tuple[str, str | None]]:
+    """Every merge in a shell command, as (what, where) — the same reading as `git_calls`.
+
+    `where` matters as much as `what`. The mark used to be filed against the tree the
+    *session* was in, which is only the tree that merged when the merge was run bare.
+    Measured 2026-08-23: a session ran `cd <other-worktree> && gh pr merge`, and the mark
+    landed on its own harness-made tree — stamped with a branch that had no pull request,
+    refusing that session's `Stop` — while the tree that actually merged went unmarked and
+    would have been editable afterwards. Both halves are wrong from one missing reading,
+    and `cd` composition is a thing this parser already does.
+    """
+    calls: list[tuple[str, str | None]] = []
+    chain = None
+    for tokens in segments(without_heredocs(command)):
+        if not tokens:
+            continue
+        if names(tokens[0], _CHDIR):
+            chain = joined(chain, dir_token(tokens[1])) if len(tokens) > 1 else None
+            continue
+        what = merges(tokens)
+        if what is not None:
+            calls.append((what, chain))
+    return calls
+
+
 # ------------------------------------------------------------------------- reports
 
 
 PROTOCOL = (
-    "The protocol: call **EnterWorktree** before the first edit. Work, commit, "
+    "The protocol: {enter} before the first edit. Work, commit, "
     "`git push -u origin HEAD`, open a PR into `{branch}` with `gh pr create --base "
     "{branch}`, then `gh pr merge`. A second change in the same session starts a new "
     "worktree — one worktree, one branch, one PR, one change."
@@ -594,7 +831,7 @@ ESCAPE = (
 )
 
 
-def cleanup_steps(tree: Path | str, topic: str | None) -> str:
+def cleanup_steps(tree: Path | str, topic: str | None, plan: Delivery) -> str:
     """How a landed worktree comes down, spelled out because two of the four steps trap.
 
     `ExitWorktree` with `action: "remove"` is the one everybody reaches for, and it cannot
@@ -603,21 +840,41 @@ def cleanup_steps(tree: Path | str, topic: str | None) -> str:
     refuses outright, saying the session does not own the worktree and to use `"keep"`. So
     the cost is a wasted call rather than a tree that quietly stays, and asking for `"keep"`
     up front is what turns four steps into four steps instead of five.
+
+    A repository that has declared its own teardown gets that instead, and one that does
+    not enter worktrees loses the `ExitWorktree` step rather than being told to take a
+    step it cannot reach. See `Delivery`.
     """
     name = topic or "<branch>"
-    return (
-        f"1. `gh pr view <n> --json state --jq .state` — expect `MERGED`. Ask the forge, "
+    if plan.teardown:
+        return (
+            f"`{plan.fill(plan.teardown, tree, topic)}` — this repository's declared "
+            "teardown, which is what it has in place of the four commands. Confirm the "
+            "change landed first if it does not confirm that itself: the worktree, the "
+            "local branch and the remote branch only mean anything together, and a "
+            "teardown run on a merge the forge refused throws away the branch that still "
+            "has to reach the integration branch."
+        )
+    steps = [
+        "`gh pr view <n> --json state --jq .state` — expect `MERGED`. Ask the forge, "
         "not git: `git branch -d`, `--merged` and `merge-base --is-ancestor` all read a "
         "squash-merged branch as unmerged, so under this protocol all three are false "
-        "negatives.\n"
-        '2. `ExitWorktree` with `action: "keep"` — it returns the session to the main '
-        'checkout. **Not `"remove"`**: that removes only a worktree EnterWorktree created '
-        "itself, and refuses on one it merely entered by path, so it cannot take this tree "
-        "down.\n"
-        f"3. `git worktree remove {tree}` — from the main checkout, which is where it is "
+        "negatives."
+    ]
+    if plan.enter:
+        steps.append(
+            '`ExitWorktree` with `action: "keep"` — it returns the session to the main '
+            'checkout. **Not `"remove"`**: that removes only a worktree EnterWorktree '
+            "created itself, and refuses on one it merely entered by path, so it cannot "
+            "take this tree down."
+        )
+    steps.append(
+        f"`git worktree remove {tree}` — from the main checkout, which is where it is "
         "allowed and the only place it can run. Nothing can remove the tree it is "
-        "standing in.\n"
-        f"4. `git branch -D {name}`, then `git ls-remote --heads origin {name}` and "
+        "standing in."
+    )
+    steps.append(
+        f"`git branch -D {name}`, then `git ls-remote --heads origin {name}` and "
         f"`git push origin --delete {name}` if that prints anything. "
         "`--delete-branch` deletes the local branch first and abandons the remote one when "
         "that fails, which is the normal case here because your worktree still has the "
@@ -626,16 +883,17 @@ def cleanup_steps(tree: Path | str, topic: str | None) -> str:
         "the one likely to die on `cannot lock ref`, and then either it takes the check down "
         "with it or the check answers from a stale cache and the branch looks already gone."
     )
+    return "\n".join(f"{number}. {step}" for number, step in enumerate(steps, start=1))
 
 
-def reason_main_checkout(what: str, branch: str) -> str:
+def reason_main_checkout(what: str, branch: str, plan: Delivery) -> str:
     return (
         f"Denied: {what} in the main checkout. Every change in this repository is made "
         "in its own worktree, on its own branch, and reaches the integration branch as a "
         "merged PR — there is no size of change that skips that, because the exception is "
         "what puts two writers back in one directory and half-finished work into someone "
         "else's commit.\n\n"
-        + PROTOCOL.format(branch=branch)
+        + plan.protocol(branch)
         + "\n\n"
         + BASE_NOTE.format(branch=branch)
         + "\n\n"
@@ -653,15 +911,15 @@ def reason_integration_branch(branch: str) -> str:
     )
 
 
-def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path) -> str:
+def reason_spent(marker: dict, branch: str, common: Path, tree_root: Path, plan: Delivery) -> str:
     landed = marker.get("why") or "its PR merged"
     return (
         f"Denied: this worktree's change looks finished ({landed}), so editing it again "
         "grows a branch that has been reviewed and merged, and the new edit reaches nobody "
         "until someone notices and opens a second PR from a tree that looks done.\n\n"
-        "The next change is a new one: call **EnterWorktree** again for a fresh worktree "
-        "and branch, cut from the current "
-        f"`origin/{branch}` so it already contains what you just merged.\n\n"
+        "The next change is a new one: cut a fresh worktree and branch from the current "
+        f"`origin/{branch}`, so it already contains what you just merged, and then "
+        f"{plan.entering()}.\n\n"
         # The mark records that `gh pr merge` RAN, not that it succeeded, and this is the
         # one denial in the guard that can therefore be flatly wrong about the state of
         # the world. Saying so here is not hedging: measured 2026-08-13, a session whose
@@ -685,7 +943,7 @@ def spent_doubt(marker_path: Path) -> str:
     directly; this one is about something that happened earlier and might not have worked.
     """
     return (
-        "**But this mark records that `gh pr merge` RAN, not that it landed** — it is "
+        "**But this mark records that the merge command RAN, not that it landed** — it is "
         "written before the command, because no later hook can tell a merge from a merge "
         "that failed. A merge GitHub refuses (a conflict with a base that moved, a failing "
         "check) leaves exactly this mark. So ask the forge before believing it:\n"
@@ -749,7 +1007,57 @@ def git(tree: Path, *args: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def unlanded(tree: Path, branch: str) -> str | None:
+def counted(value: str | None) -> int:
+    return int(value) if (value or "").isdigit() else 0
+
+
+def has_ref(tree: Path, ref: str) -> bool:
+    return git(tree, "rev-parse", "--verify", "--quiet", ref) is not None
+
+
+def undelivered(tree: Path, branch: str, topic: str | None) -> str | None:
+    """The commits in this worktree that nobody else can reach yet, as a phrase.
+
+    `origin/<branch>..HEAD` was the whole test and it is not the question. It counts
+    every commit the integration branch has not got — including the ones the repository's
+    **default** branch has and the integration branch does not, which in a repo that
+    integrates through `development` while defaulting to `main` is the entire divergence
+    between them. Every worktree the harness cuts is on that history, so the gate fired at
+    every `Stop` forever, in a session that had delivered everything it did.
+
+    Measured 2026-08-24: one commit counted, and it was `origin/main`'s tip. The five
+    steps the block then prescribes would have pushed that history and squash-merged some
+    fifty thousand deletions onto `development` — so this is not a noisy gate, it is a
+    gate whose remedy is destructive when it is wrong.
+
+    Two questions instead of one, because the two undelivered states are genuinely
+    different and only the first was ever really about "exists only on this disk":
+
+    * commits on no remote at all — unpushed work, the strong case;
+    * commits pushed to this worktree's own branch and not yet on the integration
+      branch — a branch left standing with nobody merging it.
+
+    A commit that is published on some *other* remote branch is neither. It is somebody
+    else's landed work that this tree happens to sit on, and it is not this session's to
+    deliver.
+    """
+    if not has_ref(tree, f"refs/remotes/origin/{branch}"):
+        # No tracking ref for the integration branch: a local-only clone, or a fetch that
+        # has never run. Nothing here can be compared against what was published — and
+        # `--not --remotes` with no remote refs at all would count the whole history,
+        # which is how a fail-open check becomes a session that cannot stop.
+        return None
+    only_here = counted(git(tree, "rev-list", "--count", "HEAD", "--not", "--remotes"))
+    if only_here:
+        return f"{only_here} commit(s) that are on no remote"
+    if topic and has_ref(tree, f"refs/remotes/origin/{topic}"):
+        pushed = counted(git(tree, "rev-list", "--count", f"origin/{branch}..origin/{topic}"))
+        if pushed:
+            return f"{pushed} commit(s) pushed to origin/{topic} and not in origin/{branch}"
+    return None
+
+
+def unlanded(tree: Path, branch: str, topic: str | None) -> str | None:
     """What this worktree is holding that the integration branch has not got.
 
     Returns a human sentence, or None when there is nothing to keep the session open
@@ -759,20 +1067,17 @@ def unlanded(tree: Path, branch: str) -> str | None:
     dirty = git(tree, "status", "--porcelain")
     if dirty is None:
         return None
-    ahead = git(tree, "rev-list", "--count", f"origin/{branch}..HEAD")
-    commits = int(ahead) if (ahead or "").isdigit() else 0
-    if not dirty and not commits:
-        return None
 
     parts = []
     if dirty:
         parts.append(f"{len(dirty.splitlines())} uncommitted file(s)")
-    if commits:
-        parts.append(f"{commits} commit(s) not in origin/{branch}")
-    return " and ".join(parts)
+    held = undelivered(tree, branch, topic)
+    if held:
+        parts.append(held)
+    return " and ".join(parts) if parts else None
 
 
-def block_stop(tree: Path, branch: str, topic: str | None, holding: str) -> None:
+def block_stop(tree: Path, branch: str, topic: str | None, holding: str, plan: Delivery) -> None:
     emit(
         {
             "decision": "block",
@@ -782,14 +1087,9 @@ def block_stop(tree: Path, branch: str, topic: str | None, holding: str) -> None
                 "nobody will look in, and the next session cuts its worktree from an "
                 f"`origin/{branch}` that is missing your work.\n\n"
                 "Finish it before stopping:\n"
-                "1. `git add <paths> && git commit -m \"...\"` — name the paths; never "
-                "`git add -A`.\n"
-                "2. `git push -u origin HEAD`\n"
-                f"3. `gh pr create --base {branch} --fill`\n"
-                "4. `gh pr merge --squash --delete-branch` (add `--admin` only if the "
-                "repo's checks do not apply here)\n"
-                "5. Then take the worktree down — the four steps below.\n\n"
-                + cleanup_steps(tree, topic)
+                + plan.deliver(branch)
+                + "\nThen take the worktree down:\n\n"
+                + cleanup_steps(tree, topic, plan)
                 + "\n\nIf the change is genuinely abandoned, say so plainly in your reply "
                 "and leave the worktree standing — do not delete it, and do not stash."
             ),
@@ -797,7 +1097,7 @@ def block_stop(tree: Path, branch: str, topic: str | None, holding: str) -> None
     )
 
 
-def block_stop_cleanup(tree: Path, branch: str, topic: str | None, marker: dict) -> None:
+def block_stop_cleanup(tree: Path, branch: str, topic: str | None, marker: dict, plan: Delivery) -> None:
     """Refuse to end a session sitting in a worktree whose change has already landed.
 
     Cleanup is the half of the protocol nothing used to hold. Delivery had a hook and a
@@ -812,16 +1112,16 @@ def block_stop_cleanup(tree: Path, branch: str, topic: str | None, marker: dict)
         {
             "decision": "block",
             "reason": (
-                f"This worktree recorded a merge ({landed}) and is still standing. Step 1 "
-                "below is what confirms it: the record is written before the merge runs, so "
-                "a merge the forge refused leaves the same one. If it did not land, finish "
-                "the change instead — do not take the tree down.\n\n"
+                f"This worktree recorded a merge ({landed}) and is still standing. Confirm "
+                "that against the forge before acting on it: the record is written before "
+                "the merge runs, so a merge the forge refused leaves the same one. If it "
+                "did not land, finish the change instead — do not take the tree down.\n\n"
                 "Otherwise, taking it down is part of finishing, not an errand to hand over: "
                 "a worktree with no live branch is a stale checkout, a merged branch is a "
                 "push target after the PR that reviewed it has closed, and either one left "
                 "behind costs the next session a status check before it can trust what it "
                 "is looking at.\n\n"
-                + cleanup_steps(tree, topic)
+                + cleanup_steps(tree, topic, plan)
                 + "\n\nIf the operator asked for this tree to stay — to look at the diff, or "
                 "to keep a dev server on it — leave it and say so plainly in your reply, "
                 "with the path. That is the one reason to stop with it standing."
@@ -892,17 +1192,17 @@ def main() -> None:
     common = common_git_dir(git_dir)
     main_root = common.parent if common.name == ".git" else None
     branch = integration_branch(main_root)
+    plan = delivery(main_root)
 
     if event == "SessionStart":
         context = (
             "This repository writes only from worktrees. Edits to the main "
             "checkout are denied by a hook, including one-line ones.\n\n"
-            + PROTOCOL.format(branch=branch)
+            + plan.protocol(branch)
             + "\n\n"
-            + BASE_NOTE.format(branch=branch)
-            + "\n\nA change is finished when its worktree is gone too: after the merge, "
-            "`ExitWorktree` (`action: \"keep\"`), then `git worktree remove <path>` and "
-            "`git branch -D <branch>` from the main checkout."
+            + plan.base_note(branch)
+            + "\n\nA change is finished when its worktree is gone too: "
+            + plan.finishing()
         )
         # The sweep runs at SessionStart deliberately: it is the one moment nothing is in
         # flight, so a landed tree still on disk is somebody's leftovers rather than the
@@ -913,7 +1213,7 @@ def main() -> None:
                 "\n\nWorktrees still on disk that recorded a merge, left by an earlier "
                 "session:\n"
                 + "\n".join(f"- {path}" for path in standing)
-                + "\nEach ran `gh pr merge` from inside itself. That is recorded *before* "
+                + "\nEach ran a merge command from inside itself. That is recorded *before* "
                 "the merge, so a merge the forge refused leaves the same record as one that "
                 "landed — confirm with `gh pr view <n> --json state` before removing "
                 "anything, and treat uncommitted changes as a merge that did not land. Then "
@@ -944,12 +1244,12 @@ def main() -> None:
         marker = is_spent(common, tree_root, topic)
         if marker:
             stop_blocks(common, session, bump=True)
-            block_stop_cleanup(tree_root, branch, topic, marker)
+            block_stop_cleanup(tree_root, branch, topic, marker, plan)
             return
-        holding = unlanded(tree_root, branch)
+        holding = unlanded(tree_root, branch, topic)
         if holding:
             stop_blocks(common, session, bump=True)
-            block_stop(tree_root, branch, topic, holding)
+            block_stop(tree_root, branch, topic, holding, plan)
         return
 
     if event != "PreToolUse":
@@ -964,7 +1264,7 @@ def main() -> None:
                 continue  # Outside this repository — not this repository's rule.
             target_root, target_git_dir, target_linked = scope
             if not target_linked:
-                deny(reason_main_checkout("file edits are not made", branch), warn_only)
+                deny(reason_main_checkout("file edits are not made", branch, plan), warn_only)
                 return
             topic = branch_of(target_git_dir)
             if topic == branch:
@@ -972,7 +1272,7 @@ def main() -> None:
                 return
             marker = is_spent(common, target_root, topic)
             if marker:
-                deny(reason_spent(marker, branch, common, target_root), warn_only)
+                deny(reason_spent(marker, branch, common, target_root, plan), warn_only)
                 return
         return
 
@@ -983,7 +1283,7 @@ def main() -> None:
     if not isinstance(command, str):
         return
 
-    if linked and _MERGED.search(command):
+    for what, where in merge_calls(command):
         # Recorded *before* the merge runs rather than after, because there is no
         # after-hook that can tell a merge apart from a merge that failed.
         #
@@ -995,11 +1295,19 @@ def main() -> None:
         # leaving an open PR that can never merge. So: an unfinished rebase outranks the
         # mark, and the denial names the forge check and the marker path rather than
         # asserting the change is done.
+        scope = targeted(where, Path(cwd), located, common)
+        if scope is None:
+            continue  # Another repository's merge. Its worktrees, its marks.
+        merged_root, merged_git_dir, merged_linked = scope
+        if not merged_linked:
+            # A merge run from the main checkout spends no worktree: there is no branch
+            # here whose next edit would reach nobody.
+            continue
         mark_spent(
             common,
-            tree_root,
-            branch_of(git_dir),
-            "gh pr merge was run from this worktree",
+            merged_root,
+            branch_of(merged_git_dir),
+            f"{what} was run from this worktree",
         )
 
     for subcommand, _args, where in git_calls(command):
@@ -1013,7 +1321,7 @@ def main() -> None:
             deny(reason_stash(), warn_only)
             return
         if not target_linked and subcommand in MUTATORS:
-            deny(reason_main_checkout(f"`git {subcommand}` does not run", branch), warn_only)
+            deny(reason_main_checkout(f"`git {subcommand}` does not run", branch, plan), warn_only)
             return
 
 
