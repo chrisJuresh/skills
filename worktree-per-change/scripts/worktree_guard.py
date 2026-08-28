@@ -448,20 +448,37 @@ def mid_operation(tree: Path) -> bool:
     )
 
 
-def sweep_spent(common: Path) -> list[str]:
-    """Landed worktrees still on disk, and a marker file dropped for each one that isn't.
+def sweep_spent(common: Path) -> tuple[list[str], list[str]]:
+    """Landed worktrees still on disk, directories that are only their remains, and a
+    marker file dropped for everything that is no longer a worktree.
 
-    Both halves are cleanup. The list is what a session inherits from one that crashed or
-    was killed between `gh pr merge` and taking its tree down, which nothing else reports:
-    a merged worktree is indistinguishable from an in-progress one to anybody reading
-    `git worktree list`.
+    All three are cleanup. The first list is what a session inherits from one that crashed
+    or was killed between `gh pr merge` and taking its tree down, which nothing else
+    reports: a merged worktree is indistinguishable from an in-progress one to anybody
+    reading `git worktree list`.
 
-    Dropping the marker for a tree that is gone is not tidiness either. Markers are keyed
-    by the worktree's *leaf name*, so a stale one denies the first edit in the next
-    worktree that happens to be named the same — a fresh tree reported as already merged,
-    which is the most confusing denial this guard can produce.
+    The second list is the same sweep telling the truth about a *half-finished* teardown.
+    `git worktree remove` deregisters the worktree first and deletes the files second, and
+    when the delete fails it keeps the deregistration — so git goes quiet while the whole
+    checkout is still sitting there. A directory in that state is not a worktree and must
+    not be reported as one, because the remedy for a worktree is the command that has
+    already run and now refuses: `fatal: '<path>' is not a working tree`. Measured
+    2026-08-28 in the first repository to adopt this guard: three leftover directories
+    under `.claude/worktrees/`, one of them a full checkout with `node_modules` in it,
+    while `git worktree list` named only the main checkout — and the sweep had been asking
+    every new session to `git worktree remove` one of them since the day it was left.
 
-    A tree mid-rebase is left out of the list entirely, and its marker is left alone. The
+    The test is the same single stat the rest of this guard turns on: `.git` is a *file* in
+    a linked worktree, and a directory git has let go of does not have one at all.
+
+    Dropping the marker for a tree that is gone — or that is now only a directory — is not
+    tidiness either. Markers are keyed by the worktree's *leaf name*, so a stale one denies
+    the first edit in the next worktree that happens to be named the same — a fresh tree
+    reported as already merged, which is the most confusing denial this guard can produce.
+    The marker also has nothing left to protect once the tree is deregistered: whatever is
+    inside that directory now resolves to the main checkout, which is denied anyway.
+
+    A tree mid-rebase is left out of the lists entirely, and its marker is left alone. The
     marker is written *before* `gh pr merge` runs, so a merge that failed leaves exactly the
     same file as one that landed; measured on 2026-08-13, a `DIRTY` PR whose merge was
     refused had a spent marker, an unresolved rebase and ten modified files, and this sweep
@@ -470,11 +487,12 @@ def sweep_spent(common: Path) -> list[str]:
     thing this hook could destroy, so the in-progress trees are the ones it stays quiet
     about.
     """
-    standing = []
+    standing: list[str] = []
+    remains: list[str] = []
     try:
         entries = sorted((state_dir(common) / "spent").iterdir())
     except OSError:
-        return standing
+        return standing, remains
     for marker in entries:
         try:
             tree = json.loads(marker.read_text(encoding="utf-8")).get("tree")
@@ -482,15 +500,18 @@ def sweep_spent(common: Path) -> list[str]:
             continue
         if not isinstance(tree, str) or not tree:
             continue
-        if Path(tree).is_dir():
-            if not mid_operation(Path(tree)):
-                standing.append(tree)
-        else:
-            try:
-                marker.unlink()
-            except OSError:
-                pass
-    return standing
+        path = Path(tree)
+        if path.is_dir():
+            if (path / ".git").exists():
+                if not mid_operation(path):
+                    standing.append(tree)
+                continue
+            remains.append(tree)
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return standing, remains
 
 
 def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
@@ -1207,7 +1228,7 @@ def main() -> None:
         # The sweep runs at SessionStart deliberately: it is the one moment nothing is in
         # flight, so a landed tree still on disk is somebody's leftovers rather than the
         # work in progress two minutes from its own merge.
-        standing = sweep_spent(common)
+        standing, remains = sweep_spent(common)
         if standing:
             context += (
                 "\n\nWorktrees still on disk that recorded a merge, left by an earlier "
@@ -1221,6 +1242,18 @@ def main() -> None:
                 "checkout, for the ones that are yours. A worktree another session is "
                 "holding is its business even after its branch merges: leave it, and say it "
                 "is there."
+            )
+        if remains:
+            context += (
+                "\n\nDirectories that recorded a merge and are no longer worktrees "
+                "at all:\n"
+                + "\n".join(f"- {path}" for path in remains)
+                + "\n`git worktree remove` deregistered each of these and then failed "
+                "to delete the files, so `git worktree list` is clean while the checkout "
+                "is still there, and running that command again refuses with `is not a "
+                "working tree`. Delete the directory itself, and expect that to fail "
+                "while another process still holds a file inside it. None of this is a "
+                "live worktree, so none of it is anybody's work in progress."
             )
         emit(
             {

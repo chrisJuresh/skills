@@ -268,6 +268,79 @@ def main() -> int:
         check("but still registers the hooks", registrations(bare),
               ["PreToolUse", "SessionStart", "Stop"])
 
+        # --- the two files git will not carry for the protocol ---------------------
+        # Both are silent when absent. An unignored `.claude/worktrees/` gets a live
+        # checkout committed into the repository as a gitlink no clone can resolve; a
+        # worktree with no `settings.local.json` falls back to the default permission
+        # mode and starts refusing the protocol's own writes for no visible reason. The
+        # installer is what puts worktrees under `.claude/worktrees/` in the first place,
+        # so it is the installer that owes the repository both entries.
+        carried = fresh(root, "carried")
+        # Written as bytes so the fixture really has LF endings: `write_text` would
+        # translate them on Windows, and the assertion below would be about the
+        # fixture rather than about what the installer appended.
+        (carried / ".gitignore").write_bytes(b"node_modules/" + bytes([10]))
+        install(carried)
+        ignored = (carried / ".gitignore").read_text(encoding="utf-8")
+        check("the worktree directory is ignored", ".claude/worktrees/" in ignored, True)
+        check("and this machine's permission mode with it",
+              ".claude/settings.local.json" in ignored, True)
+        check("what was already in the file is left where it was",
+              ignored.startswith("node_modules/\n"), True)
+        check(
+            "the permission mode is copied into every new worktree instead",
+            ".claude/settings.local.json"
+            in (carried / ".worktreeinclude").read_text(encoding="utf-8"),
+            True,
+        )
+        # Appended as bytes, because `write_text` would translate every existing LF on
+        # Windows and turn a two-line addition into a whole-file diff.
+        check("and the file's existing line endings survive the append",
+              (carried / ".gitignore").read_bytes().count(bytes([13])), 0)
+
+        unchanged = (carried / ".gitignore").read_bytes()
+        install(carried)
+        check("a second install does not append them again",
+              (carried / ".gitignore").read_bytes(), unchanged)
+
+        install(carried, "--uninstall")
+        check(
+            # Un-ignoring `.claude/worktrees/` is how a stale checkout gets committed, and
+            # that outlives the guard. The uninstaller says it left them rather than acting.
+            "uninstalling leaves both files as it found them",
+            ".claude/worktrees/" in (carried / ".gitignore").read_text(encoding="utf-8"),
+            True,
+        )
+
+        # The question is whether the REPOSITORY carries the rule, so the machine's own
+        # ignores cannot answer it. Measured on the machine this was written on, whose
+        # global ignore already names `**/.claude/settings.local.json`: `check-ignore` said
+        # it was covered, the installer wrote nothing, and the repo went out to everybody
+        # else without the entry — right where it was installed, false where it travels.
+        elsewhere = fresh(root, "elsewhere")
+        machine_ignore = root / "machine-ignore"
+        machine_ignore.write_text(".claude/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(elsewhere), "config",
+                        "core.excludesFile", str(machine_ignore)], check=True)
+        install(elsewhere)
+        check(
+            "a machine-local ignore does not stand in for the repository's own",
+            ".claude/worktrees/" in (elsewhere / ".gitignore").read_text(encoding="utf-8"),
+            True,
+        )
+
+        # A repo that already ignores them keeps its own spelling: this is the repo's file
+        # and a second literal line saying the same thing is noise.
+        broad = fresh(root, "broad")
+        (broad / ".gitignore").write_text(
+            ".claude/worktrees/\n.claude/settings.local.json\n", encoding="utf-8")
+        install(broad)
+        check(
+            "an entry the repo already ignores is not repeated",
+            (broad / ".gitignore").read_text(encoding="utf-8").count(".claude/worktrees/"),
+            1,
+        )
+
         # --- a predecessor guard is replaced, not left beside ----------------------
         legacy = fresh(root, "legacy")
         (legacy / ".claude").mkdir()
