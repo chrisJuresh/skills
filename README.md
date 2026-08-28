@@ -60,6 +60,7 @@ New hooks apply to sessions started afterwards, not the one you are in.
 | `--settings-file NAME` | Register in a different settings file, e.g. `settings.local.json` |
 | `--guard-root DIR` | Keep the guard and `land.py` in `DIR` and reference them absolutely |
 | `--worktrees-root PATH` | Where this repo's worktrees go, quoted in the guard's remedy text |
+| `--session-ownership` | Also install `worktree-owner.py`: one worktree, one session. **Off by default** |
 
 Omit `--repo` to install at user scope for every repository on the machine; it applies one
 integration branch to repos that may not share it, so prefer per-repo.
@@ -86,6 +87,12 @@ Requires Python 3 and git. No third-party packages.
   the one hazard a worktree looks like it isolates and does not
 
 A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most.
+
+With `--session-ownership`, a second hook adds one more denial: **a write into a worktree
+another live session is holding.** The guard isolates changes and has nothing to say about
+sessions — two agents in one tree pass every check above, share its build output, its port
+and its `git status`, and none of it raises an error. Reads are untouched, `git` is left to
+the guard, and a claim lapses once its session has been quiet for 45 minutes.
 
 Everything else proceeds: every read, `push`, `fetch`, `log`, `diff`, `status`, `branch`,
 `git worktree`, `stash list`, every `gh` call, and every edit in a live worktree on its own

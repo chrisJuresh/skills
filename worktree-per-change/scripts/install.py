@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Install, inspect or remove the worktree-per-change guard.
 
-The guard is three hook registrations pointing at one script. `--repo <path>` is the
+The guard is three hook registrations pointing at one script. `--session-ownership` adds
+two more, pointing at a second and separate one: the guard keeps two *changes* out of each
+other's way, and `worktree_owner.py` keeps two *sessions* out of one tree, which the guard
+has nothing to say about. `--repo <path>` is the
 usual install: the rule is a property of *the repository* — what its branches mean,
 what its PRs are for — so it belongs in that repository's committed
 `.claude/settings.json` where everyone working in it gets the same rule. Installing at
@@ -33,6 +36,7 @@ Usage:
     python install.py --repo . --dry-run      show the exact settings.json changes
     python install.py --repo .                install into this repository, committed
     python install.py --repo . --branch queue  ... integrating through `queue`
+    python install.py --repo . --session-ownership   ... one worktree, one session
     python install.py --repo . --settings-file settings.local.json \
         --guard-root ~/tooling/.claude    ... committing nothing to the repository
     python install.py                         install at user scope
@@ -54,6 +58,8 @@ from pathlib import Path
 
 GUARD_SOURCE = Path(__file__).resolve().parent / "worktree_guard.py"
 GUARD_FILENAME = "worktree-guard.py"
+OWNER_SOURCE = Path(__file__).resolve().parent / "worktree_owner.py"
+OWNER_FILENAME = "worktree-owner.py"
 LAND_SOURCE = Path(__file__).resolve().parent / "land.py"
 LAND_FILENAME = "land.py"
 CONFIG_FILENAME = "worktree-per-change.json"
@@ -163,6 +169,10 @@ def rule(command: str) -> str:
 
 MATCHER = "Write|Edit|NotebookEdit|Bash|PowerShell"
 EVENTS = ("PreToolUse", "SessionStart", "Stop")
+# The ownership hook has no `Stop` opinion: it arbitrates who may write in a tree, and a
+# session ending is not a write. Registering it there would cost a interpreter start per
+# stop to decide nothing.
+OWNER_EVENTS = ("PreToolUse", "SessionStart")
 STATE_DIRNAME = "claude-worktree-gate"
 
 # Guards this one supersedes. A repo that ships one of these is mid-migration, not
@@ -179,6 +189,10 @@ def settings_path(root: Path, name: str = "settings.json") -> Path:
 
 def guard_path(root: Path) -> Path:
     return root / "hooks" / GUARD_FILENAME
+
+
+def owner_path(root: Path) -> Path:
+    return root / "hooks" / OWNER_FILENAME
 
 
 def land_path(root: Path) -> Path:
@@ -306,8 +320,20 @@ def hook_text(hook: dict) -> str:
 
 
 def is_ours(hook: dict) -> bool:
+    # Both hooks, so `strip` clears an ownership registration whose script this run is not
+    # going to write back. Otherwise `--no-session-ownership` deletes the file and leaves
+    # the hook pointing at it, which is an error on every tool call rather than an
+    # uninstall.
     blob = hook_text(hook)
-    return GUARD_FILENAME in blob or "worktree_guard.py" in blob
+    return any(
+        name in blob
+        for name in (GUARD_FILENAME, "worktree_guard.py", OWNER_FILENAME, "worktree_owner.py")
+    )
+
+
+def is_owner(hook: dict) -> bool:
+    blob = hook_text(hook)
+    return OWNER_FILENAME in blob or "worktree_owner.py" in blob
 
 
 def is_legacy(hook: dict) -> bool:
@@ -380,26 +406,47 @@ def strip(settings: dict, also_legacy: bool) -> tuple[dict, list[str]]:
     return settings, removed
 
 
-def entry(interpreter: str, script: str, event: str) -> dict:
+def entry(interpreter: str, script: str, event: str, owner: bool = False) -> dict:
     # `-S` skips site initialisation, ~13% of interpreter startup and worth having on a
-    # hook that runs before every write-tool call. The guard is stdlib-only by design so
-    # that it can.
+    # hook that runs before every write-tool call. Both hooks are stdlib-only by design so
+    # that they can.
     hook = {"type": "command", "command": interpreter, "args": ["-S", script], "timeout": 10}
     if event == "PreToolUse":
-        hook["statusMessage"] = "Checking this change is in its own worktree"
+        hook["statusMessage"] = (
+            "Checking this worktree is this session's" if owner
+            else "Checking this change is in its own worktree"
+        )
         return {"matcher": MATCHER, "hooks": [hook]}
     if event == "Stop":
         hook["timeout"] = 20  # It shells out to git; only here, and only once per stop.
     return {"hooks": [hook]}
 
 
-def add_ours(settings: dict, interpreter: str, script: str) -> dict:
+def add_ours(settings: dict, interpreter: str, script: str, owner: str | None = None) -> dict:
+    """Register the guard, and the ownership hook when the repo asked for one.
+
+    Two separate registrations rather than one hook doing both jobs. They answer different
+    questions — "is this tree a worktree, on the right branch, not already merged" against
+    "is it *yours*" — they keep separate state, and a repo can run either alone. It also
+    keeps the guard a file downstream repos can vendor by digest, which they cannot do
+    with one that grew a second rule.
+
+    Order matters slightly and in the guard's favour: it is appended first, so a call that
+    breaks both rules is denied with the protocol's own message rather than with a
+    remedy that assumes the tree was legitimate to begin with.
+    """
     hooks = settings.setdefault("hooks", {})
     for event in EVENTS:
         bucket = hooks.setdefault(event, [])
         if not isinstance(bucket, list):
             hooks[event] = bucket = []
         bucket.append(entry(interpreter, script, event))
+    if owner:
+        for event in OWNER_EVENTS:
+            bucket = hooks.setdefault(event, [])
+            if not isinstance(bucket, list):
+                hooks[event] = bucket = []
+            bucket.append(entry(interpreter, owner, event, owner=True))
     return settings
 
 
@@ -510,23 +557,33 @@ def report_status(user_root: Path, repo: Path | None) -> int:
         if label == "local" and not settings_path(root, name).is_file():
             continue
         settings = load(settings_path(root, name))
-        events, legacy = [], []
+        events, owner_events, legacy = [], [], []
         for event, matchers in (settings.get("hooks") or {}).items():
             for matcher in matchers if isinstance(matchers, list) else []:
                 for hook in (matcher or {}).get("hooks") or []:
-                    if isinstance(hook, dict) and is_ours(hook):
+                    if not isinstance(hook, dict):
+                        continue
+                    # Owner first: `is_ours` covers both so that `strip` clears both, so
+                    # asking it first would report every ownership registration as a
+                    # guard one and the status would say the rule is installed twice.
+                    if is_owner(hook):
+                        owner_events.append(event)
+                    elif is_ours(hook):
                         events.append(event)
-                    elif isinstance(hook, dict) and is_legacy(hook):
+                    elif is_legacy(hook):
                         legacy.append(event)
         state = f"installed ({', '.join(sorted(set(events)))})" if events else "not installed"
         print(f"{label:5} {settings_path(root, name)}  ->  {state}")
+        if owner_events:
+            print(f"      + session ownership ({', '.join(sorted(set(owner_events)))})")
         if events and label == "local":
             print("      ! untracked, so absent from every fresh worktree unless something "
                   "writes it there")
         if legacy:
             print(f"      ! a predecessor guard is still registered ({', '.join(sorted(set(legacy)))})")
 
-    print(f"\nmode: {os.environ.get('CLAUDE_WORKTREE_GATE') or 'on (default)'}")
+    print(f"\nmode: {os.environ.get('CLAUDE_WORKTREE_GATE') or 'on (default)'}"
+          f"   ownership: {os.environ.get('CLAUDE_WORKTREE_OWNER') or 'on (default)'}")
 
     located = find_tree(Path.cwd())
     if located is None:
@@ -549,6 +606,7 @@ def report_status(user_root: Path, repo: Path | None) -> int:
 
     listing = git(main_root, "worktree", "list", "--porcelain") or ""
     spent_dir = common / STATE_DIRNAME / "spent"
+    claims_dir = common / STATE_DIRNAME / "claims"
     trees = [line.split(" ", 1)[1] for line in listing.splitlines() if line.startswith("worktree ")]
     if len(trees) <= 1:
         print("  no worktrees — the next change needs one")
@@ -565,6 +623,12 @@ def report_status(user_root: Path, repo: Path | None) -> int:
         flags = []
         if spent:
             flags.append("merged/spent")
+        # Reported whether or not the ownership hook is installed here. A claim file is
+        # left behind by a session that held this tree, and knowing that is useful exactly
+        # when the hook has since been turned off and the collision is possible again.
+        claim = load(claims_dir / f"{stem}.json")
+        if claim.get("session"):
+            flags.append(f"held by {str(claim['session']).split('-')[0]}")
         if dirty:
             flags.append(f"{len(dirty.splitlines())} uncommitted")
         if unlanded:
@@ -599,6 +663,14 @@ def main() -> int:
     parser.add_argument("--worktrees-root", metavar="PATH",
                         help="where this repo's worktrees go, quoted in the guard's "
                              "remedy text (default .claude/worktrees)")
+    # Three states, not two: the repo's recorded answer is the default, and either flag
+    # overrides it for one run. A plain boolean would make "the repo asked for this"
+    # indistinguishable from "this resync forgot to", and a resync that silently retires a
+    # rule people are relying on is the worst of the three outcomes.
+    parser.add_argument("--session-ownership", action="store_true", default=None,
+                        help="also install worktree-owner.py: one worktree, one session")
+    parser.add_argument("--no-session-ownership", dest="session_ownership",
+                        action="store_false", help="skip it, whatever the repo records")
     args = parser.parse_args()
 
     try:  # Windows consoles default to a codepage that mangles the report's punctuation.
@@ -622,6 +694,17 @@ def main() -> int:
     # naming `python` and hoping. Computed here because the allowlist entry for `land.py`
     # has to be spelled with the same interpreter that will type it.
     interpreter = args.python or ("python" if committed else sys.executable)
+
+    if args.session_ownership is None and repo is not None:
+        args.session_ownership = bool(
+            load(repo / ".claude" / CONFIG_FILENAME).get("sessionOwnership")
+        )
+    # Never at user scope. The ownership hook keys its claims off the repository's common
+    # git dir, so it is per-repo state by construction, and a user-scope registration would
+    # run it against every repository on the machine — including the ones with no worktree
+    # protocol at all, where it has nothing to say and one interpreter start to say it in.
+    if repo is None:
+        args.session_ownership = False
 
     if args.status:
         return report_status(user_root, repo)
@@ -650,6 +733,12 @@ def main() -> int:
     if not GUARD_SOURCE.is_file():
         print(f"guard script missing: {GUARD_SOURCE}", file=sys.stderr)
         return 1
+    if args.session_ownership and not OWNER_SOURCE.is_file():
+        # Refused rather than quietly downgraded to a guard-only install. The operator
+        # asked for a rule; installing three quarters of one and printing nothing is how a
+        # repo ends up believing it is protected.
+        print(f"ownership hook missing: {OWNER_SOURCE}", file=sys.stderr)
+        return 1
 
     target = settings_path(root, args.settings_file)
     settings = load(target)
@@ -673,7 +762,7 @@ def main() -> int:
         # No `.bak` beside a committed settings file: git is already the backup, and the
         # stray file shows up in `git status` for whoever installs next.
         write_json(target, settings, backup=not committed)
-        for path in (guard_path(files_root), land_path(files_root),
+        for path in (guard_path(files_root), owner_path(files_root), land_path(files_root),
                      (repo / ".claude" / CONFIG_FILENAME) if repo else None):
             if path is None:
                 continue
@@ -707,7 +796,15 @@ def main() -> int:
         if repo and not args.guard_root
         else str(script)
     )
-    settings = add_ours(settings, interpreter, reference)
+    owner_script = owner_path(files_root) if args.session_ownership else None
+    owner_reference = None
+    if owner_script is not None:
+        owner_reference = (
+            "${CLAUDE_PROJECT_DIR}/.claude/hooks/" + OWNER_FILENAME
+            if repo and not args.guard_root
+            else str(owner_script)
+        )
+    settings = add_ours(settings, interpreter, reference, owner_reference)
     # A user-scope install gets the read-only entries and not the delivery ones. The
     # delivery entries are safe *because the guard scopes them* — `git commit:*` is
     # bounded by a hook that denies it outside a worktree — and at user scope they would
@@ -724,6 +821,8 @@ def main() -> int:
 
     if args.dry_run:
         print(f"would copy  {GUARD_SOURCE}\n        ->  {script}")
+        if owner_script is not None:
+            print(f"would copy  {OWNER_SOURCE}\n        ->  {owner_script}")
         if lander is not None:
             print(f"would copy  {LAND_SOURCE}\n        ->  {lander}")
         if granted:
@@ -733,6 +832,7 @@ def main() -> int:
             # the real run will write rather than a placeholder for it.
             print(f"would write {config}  ->  integrationBranch = {branch}"
                   + (f", worktreesRoot = {args.worktrees_root}" if args.worktrees_root else "")
+                  + f", sessionOwnership = {bool(args.session_ownership)}"
                   + f", guard = {json.dumps(provenance(GUARD_SOURCE))}")
         for line in removed:
             print(f"would remove predecessor guard  {line}")
@@ -743,6 +843,17 @@ def main() -> int:
 
     script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(GUARD_SOURCE, script)
+    if owner_script is not None:
+        owner_script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(OWNER_SOURCE, owner_script)
+    elif args.session_ownership is False:
+        # Asked for explicitly, so the file goes as well as the registration. A script left
+        # behind after `--no-session-ownership` is one a later resync would find and take
+        # for a deliberate copy.
+        try:
+            owner_path(files_root).unlink()
+        except OSError:
+            pass
     if lander is not None and LAND_SOURCE.is_file():
         lander.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(LAND_SOURCE, lander)
@@ -759,6 +870,14 @@ def main() -> int:
             # into one every repo has pinned to today's answer.
             blob["worktreesRoot"] = args.worktrees_root
         blob["guard"] = provenance(script)
+        # Recorded either way, so a resync without the flag keeps whichever answer this
+        # repo gave. `worktreesRoot` is recorded only when asked for because its default
+        # is the skill's to change; this one is a rule the repo either adopted or did not.
+        blob["sessionOwnership"] = bool(args.session_ownership)
+        if owner_script is not None and owner_script.is_file():
+            blob["owner"] = provenance(owner_script, OWNER_SOURCE)
+        else:
+            blob.pop("owner", None)
         if lander is not None and lander.is_file():
             # Recorded for the same reason the guard's copy is: it is committed, so it is
             # a fork the moment this skill moves, and a repo's gate can only ask whether
@@ -777,18 +896,24 @@ def main() -> int:
     # file has no git behind it, so that one is still copied first.
     write_json(target, settings, backup=not committed)
     print(f"guard   -> {script}")
+    if owner_script is not None:
+        print(f"owner   -> {owner_script} (one worktree, one session; "
+              f"release a tree with `python3 {owner_script} --release <tree>`)")
     if lander is not None:
         print(f"land    -> {lander} (run it as "
               f"`{land_command(lander, repo, interpreter)}` from a worktree)")
     if not args.no_skill:
         print(link_skill(user_root, dry_run=False))
-    print(f"hooks   -> {target} ({', '.join(EVENTS)})")
+    print(f"hooks   -> {target} ({', '.join(EVENTS)}"
+          + (f"; ownership on {', '.join(OWNER_EVENTS)}" if owner_script is not None else "")
+          + ")")
     if granted:
         scope = "read-only git/gh, and the protocol's own writes" if repo else "read-only git/gh"
         print(f"allow   -> {target} ({granted} command(s): {scope})")
     print("Restart or /reload any running sessions for the hooks to take effect.")
     if committed:
-        files = [target, script, config] + ([lander] if lander is not None else [])
+        files = ([target, script, config] + ([owner_script] if owner_script is not None else [])
+                 + ([lander] if lander is not None else []))
         print("Commit " + ", ".join(str(p.relative_to(repo)) for p in files)
               + " for everyone working here to get it.")
     elif repo:
