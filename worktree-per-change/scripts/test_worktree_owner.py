@@ -227,6 +227,17 @@ def main() -> int:
             "Read it in place" in reason(run(shell(repo, f"cd {first}", B, alive_b))),
             True,
         )
+        # A path spelled the way Windows spells it, asserted on every platform. The lexer
+        # was `shlex.split(raw)` in POSIX mode, which eats a backslash as an escape: the
+        # token came back as `C:Userschristreesalpha`, existed nowhere, named no directory,
+        # and the call was allowed. That silently turned four of the denials above and the
+        # hint below them into allows on the one platform where `\` is the separator.
+        backslashed = str(first).replace("/", chr(92))
+        check(
+            "a backslash-separated path is still read as the tree it names",
+            decision(run(shell(repo, f"cd {backslashed} && pnpm dev", B, alive_b))),
+            "deny",
+        )
 
         # A repo that records a different layout gets a remedy it can actually carry out.
         config = repo / ".claude" / "worktree-per-change.json"

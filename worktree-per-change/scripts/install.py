@@ -706,9 +706,13 @@ def report_status(user_root: Path, repo: Path | None) -> int:
     print(f"\nmode: {os.environ.get('CLAUDE_WORKTREE_GATE') or 'on (default)'}"
           f"   ownership: {os.environ.get('CLAUDE_WORKTREE_OWNER') or 'on (default)'}")
 
-    located = find_tree(Path.cwd())
+    # `--repo` names the repository being reported on, so the working half reads it too.
+    # It used to read `Path.cwd()` unconditionally, which put the named repo's settings and
+    # some *other* repo's worktrees under one heading with nothing saying they differed.
+    where = repo if repo is not None else Path.cwd()
+    located = find_tree(where)
     if located is None:
-        print("cwd is not a git repository — the guard stands down here.")
+        print(f"{where} is not a git repository — the guard stands down there.")
         return 0
     tree, git_dir, linked = located
     common = git_dir
@@ -723,7 +727,8 @@ def report_status(user_root: Path, repo: Path | None) -> int:
     )
     print(f"\nrepository: {main_root}")
     print(f"integrates through: {branch}")
-    print(f"cwd is: {'a worktree — writes allowed' if linked else 'the MAIN CHECKOUT — writes denied'}")
+    print(f"{where} is: "
+          + ("a worktree — writes allowed" if linked else "the MAIN CHECKOUT — writes denied"))
 
     # Both of these are silent when wrong, and neither is repaired by anything the guard
     # does at runtime — a repo installed before the installer wrote them has to be told.

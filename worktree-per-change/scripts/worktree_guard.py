@@ -302,7 +302,9 @@ class Delivery:
     def entering(self) -> str:
         """How a session gets into a worktree, as an instruction."""
         if self.enter:
-            return "call **EnterWorktree** with that path"
+            # Not "with that path": this sentence is also the first line of the
+            # `SessionStart` briefing, where no path has been named yet.
+            return "call **EnterWorktree** on the worktree you just created"
         return (
             "`cd` into that path — in a command of its own, with the path spelled out in "
             "full. Not through a shell variable and not joined to the next command with "
@@ -346,9 +348,15 @@ class Delivery:
             "`git branch -D <branch>` from the main checkout."
         )
 
-    def deliver(self, branch: str) -> str:
-        """The steps from an uncommitted worktree to a landed change."""
-        commit = '1. `git add <paths> && git commit -m "..."` — name the paths; never `git add -A`.\n'
+    def deliver(self, branch: str, protected: bool = False) -> str:
+        """The steps from an uncommitted worktree to a delivered change.
+
+        `protected` is this repository having declared that no session merges into this
+        branch. The steps then stop at the open pull request: prescribing a merge that the
+        guard denies a moment later is the same self-contradiction a declared `delivery`
+        block exists to remove.
+        """
+        commit = COMMIT_STEP
         if self.command:
             return (
                 commit
@@ -356,14 +364,25 @@ class Delivery:
                 "is what this repository has instead of the push-PR-merge sequence, so do "
                 "not reconstruct that sequence by hand here."
             )
+        if protected:
+            last = (
+                f"4. Leave the pull request open. `{branch}` is a protected branch here, "
+                "so merging it is a person's decision — say in your reply that it is "
+                "open and waiting, and do not delete the branch it is opened from."
+            )
+        else:
+            last = (
+                "4. `gh pr merge --squash` (add `--admin` only if the repo's checks do "
+                "not apply here). Never `--delete-branch`: it makes `gh` check out the "
+                "base branch this main checkout permanently holds, so it fails *after* "
+                "the merge and leaves the branch it was asked to delete on the remote."
+            )
         return (
             commit
             + "2. `git push -u origin HEAD`\n"
             f"3. `gh pr create --base {branch} --fill`\n"
-            "4. `gh pr merge --squash` (add `--admin` only if the repo's checks do "
-            "not apply here). Never `--delete-branch`: it makes `gh` check out the "
-            "base branch this main checkout permanently holds, so it fails *after* "
-            "the merge and leaves the branch it was asked to delete on the remote.\n"
+            + last
+            + "\n"
         )
 
 
@@ -948,6 +967,12 @@ ESCAPE = (
 )
 
 
+# The first step of every delivery, named once so the branches below cannot drift.
+COMMIT_STEP = (
+    '1. `git add <paths> && git commit -m "..."` — name the paths; never `git add -A`.\n'
+)
+
+
 def cleanup_steps(tree: Path | str, topic: str | None, plan: Delivery) -> str:
     """How a landed worktree comes down, spelled out because two of the four steps trap.
 
@@ -1133,7 +1158,8 @@ def has_ref(tree: Path, ref: str) -> bool:
     return git(tree, "rev-parse", "--verify", "--quiet", ref) is not None
 
 
-def undelivered(tree: Path, branch: str, topic: str | None) -> str | None:
+def undelivered(tree: Path, branch: str, topic: str | None,
+                protected: bool = False) -> str | None:
     """The commits in this worktree that nobody else can reach yet, as a phrase.
 
     `origin/<branch>..HEAD` was the whole test and it is not the question. It counts
@@ -1158,6 +1184,15 @@ def undelivered(tree: Path, branch: str, topic: str | None) -> str | None:
     A commit that is published on some *other* remote branch is neither. It is somebody
     else's landed work that this tree happens to sit on, and it is not this session's to
     deliver.
+
+    The second question is dropped where the integration branch is a
+    `protectedMergeTargets` name, because there a pushed topic branch **is** the finished
+    state: no session merges into that branch, by that repository's own declaration, so a
+    session that committed, pushed and opened the PR has delivered everything it is
+    permitted to. Asking it anyway refuses `Stop` twice in a session that did the protocol
+    exactly, which is the same shape of wrong gate as the `origin/<branch>..HEAD` count
+    above — correct arithmetic, wrong question. Commits on no remote at all still count:
+    those are undelivered under any repository's rules.
     """
     if not has_ref(tree, f"refs/remotes/origin/{branch}"):
         # No tracking ref for the integration branch: a local-only clone, or a fetch that
@@ -1168,6 +1203,8 @@ def undelivered(tree: Path, branch: str, topic: str | None) -> str | None:
     only_here = counted(git(tree, "rev-list", "--count", "HEAD", "--not", "--remotes"))
     if only_here:
         return f"{only_here} commit(s) that are on no remote"
+    if protected:
+        return None
     if topic and has_ref(tree, f"refs/remotes/origin/{topic}"):
         pushed = counted(git(tree, "rev-list", "--count", f"origin/{branch}..origin/{topic}"))
         if pushed:
@@ -1175,7 +1212,8 @@ def undelivered(tree: Path, branch: str, topic: str | None) -> str | None:
     return None
 
 
-def unlanded(tree: Path, branch: str, topic: str | None) -> str | None:
+def unlanded(tree: Path, branch: str, topic: str | None,
+             protected: bool = False) -> str | None:
     """What this worktree is holding that the integration branch has not got.
 
     Returns a human sentence, or None when there is nothing to keep the session open
@@ -1189,13 +1227,14 @@ def unlanded(tree: Path, branch: str, topic: str | None) -> str | None:
     parts = []
     if dirty:
         parts.append(f"{len(dirty.splitlines())} uncommitted file(s)")
-    held = undelivered(tree, branch, topic)
+    held = undelivered(tree, branch, topic, protected)
     if held:
         parts.append(held)
     return " and ".join(parts) if parts else None
 
 
-def block_stop(tree: Path, branch: str, topic: str | None, holding: str, plan: Delivery) -> None:
+def block_stop(tree: Path, branch: str, topic: str | None, holding: str,
+               plan: Delivery, protected: bool = False) -> None:
     emit(
         {
             "decision": "block",
@@ -1205,7 +1244,7 @@ def block_stop(tree: Path, branch: str, topic: str | None, holding: str, plan: D
                 "nobody will look in, and the next session cuts its worktree from an "
                 f"`origin/{branch}` that is missing your work.\n\n"
                 "Finish it before stopping:\n"
-                + plan.deliver(branch)
+                + plan.deliver(branch, protected)
                 + "\nThen take the worktree down:\n\n"
                 + cleanup_steps(tree, topic, plan)
                 + "\n\nIf the change is genuinely abandoned, say so plainly in your reply "
@@ -1377,10 +1416,11 @@ def main() -> None:
             stop_blocks(common, session, bump=True)
             block_stop_cleanup(tree_root, branch, topic, marker, plan)
             return
-        holding = unlanded(tree_root, branch, topic)
+        protected = is_protected(branch, protected_targets(main_root))
+        holding = unlanded(tree_root, branch, topic, protected)
         if holding:
             stop_blocks(common, session, bump=True)
-            block_stop(tree_root, branch, topic, holding, plan)
+            block_stop(tree_root, branch, topic, holding, plan, protected)
         return
 
     if event != "PreToolUse":

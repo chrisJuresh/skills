@@ -683,6 +683,26 @@ def main() -> int:
             decision(run(write(unspent, str(unspent / "README.md")))),
             "allow",
         )
+        # `land.py` reaches the same merge, so the same refusal has to reach it. It was
+        # invisible to the phrase-matching this check used to do, which would have left
+        # the route SKILL.md recommends as the way past a rule the repo opted into.
+        check(
+            "the declared delivery script is refused too",
+            decision(run(shell(unspent, "python .claude/scripts/land.py"))),
+            "deny",
+        )
+        check(
+            "and refusing it does not spend the tree either",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        # The protected check reads the same parse as the mark, so prose costs nothing
+        # here for the same reason it costs nothing there.
+        check(
+            "quoting the phrase is not attempting a merge",
+            decision(run(shell(unspent, "grep -rn 'gh pr merge' docs/"))),
+            "allow",
+        )
         # Unrelated gh calls are untouched; this is not a block on `gh`.
         check(
             "`gh pr create` is unaffected",
@@ -1083,6 +1103,43 @@ def main() -> int:
               "gh pr create --base development" in default, True)
         check("and still gets the ExitWorktree step",
               "ExitWorktree" in default, True)
+
+        # --- a protected target changes what "delivered" means -------------------
+        # Where the repository has declared that no session merges into the integration
+        # branch, a pushed topic branch IS the finished state: the session committed,
+        # pushed, opened the PR and handed it to a person. Counting it as undelivered
+        # refuses `Stop` twice in a session that followed the protocol exactly — the same
+        # shape of wrong gate as counting `origin/<branch>..HEAD` was.
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "protectedMergeTargets": ["development"]}),
+            encoding="utf-8",
+        )
+        check(
+            "Stop lets a pushed, unmerged branch end where the target is protected",
+            decision(run({"session_id": "p7", "hook_event_name": "Stop", "cwd": str(onremote)})),
+            "allow",
+        )
+        # Unpushed work is undelivered under any repository's rules, so that half stands.
+        guarded = run({"session_id": "p8", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        check(
+            "but an unpushed commit still holds the session open",
+            guarded.get("decision"),
+            "block",
+        )
+        check(
+            "and the steps stop at the open PR rather than prescribing a denied merge",
+            "gh pr merge" in guarded.get("reason", ""),
+            False,
+        )
+        check(
+            "saying so, so the session knows the PR is the end of its job",
+            "Leave the pull request open" in guarded.get("reason", ""),
+            True,
+        )
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:

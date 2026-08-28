@@ -85,6 +85,9 @@ Requires Python 3 and git. No third-party packages.
   every time" a rule rather than a habit
 - `git stash`, **everywhere** — `refs/stash` is one stack shared by every worktree, so it is
   the one hazard a worktree looks like it isolates and does not
+- a merge into a branch the repo named in `protectedMergeTargets` — empty by default, and
+  for the repository whose trunk takes reviewed PRs. `land.py` stops at the open PR there
+  too, so opting in cannot be undone by typing `gh pr merge` instead
 
 A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most.
 

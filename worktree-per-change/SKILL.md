@@ -451,6 +451,17 @@ else the repo keeps in that file. `syncedFrom` is absent when the skill director
 git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
 sha is not.
 
+**That merge is also what makes the rest of this file the repository's to write.** Four more
+keys have accumulated there, one incident each, and every one of them is optional and off
+when absent: `delivery` (a repo that lands without pull requests, or without entering
+worktrees), `sessionOwnership` (the second hook), `mergeIntegrationBeforeLanding` (bring the
+base down before pushing) and `protectedMergeTargets` (branches this repo never merges into
+from a session). The full list, with what reads each, is in
+[references/guard-internals.md](references/guard-internals.md#configuration) — read it
+before adding a key by hand, because a repository that has declared nothing gets exactly the
+behaviour it had before any of them existed, and that is the property they are all built to
+preserve.
+
 **`sha256` is over the file's LF-normalised bytes, and a gate checking it must normalise
 too.** The record crosses platforms and the bytes on disk do not: a repo pinning
 `* text=auto eol=lf` hands out LF everywhere, one leaving it to `core.autocrlf` hands out
@@ -625,9 +636,10 @@ nothing to check.
   config. Run it once at user scope on any machine doing this work: a repo-scoped rule
   cannot cover a session that has to read a *different* repository, and installing this
   guard into the next repo is exactly that shape of task.
-- `--status` reports what is installed, which branch this repo integrates through,
-  whether the cwd may write, every worktree with what it is still holding, and whether the
-  `.gitignore` and `.worktreeinclude` entries are there — which is how a repo installed
+- `--status` reports what is installed — including a local install and the ownership hook
+  — which branch this repo integrates through, whether the cwd may write, every worktree
+  with what it is still holding and which session is holding it, and whether the
+  `.gitignore` and `.worktreeinclude` entries are there, which is how a repo installed
   before the installer wrote them finds out, since nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
@@ -672,6 +684,26 @@ because a protected branch refuses it:
 gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/<integration>   # expect 422
 ```
 
+**And where the answer is a branch nobody may merge unreviewed, say that in the config
+rather than in a convention.** The first property above is the one repositories get wrong,
+and they get it wrong in the direction that costs most: pointing `integrationBranch` at a
+trunk where review is a *habit* rather than a required check. The forge then merges the
+agent's PR on request, unreviewed, and nothing anywhere reports a problem. Name that branch
+in `protectedMergeTargets` and both halves of the protocol stop at the open pull request —
+`land.py` pushes and opens and returns 0, and a `gh pr merge` typed by hand is denied, so
+opting in cannot be undone by taking the shortcut:
+
+```json
+{ "integrationBranch": "main", "protectedMergeTargets": ["main"] }
+```
+
+It is empty by default, because for most repositories the integration branch *is* the batch
+branch and squash-merging into it is the whole protocol. Where it is set, delivery ends at
+the PR: `Stop` counts a pushed branch as delivered, and the reply names the PR and says it
+is waiting for a person. It is additive only — no key removes a name and no environment
+variable turns it off — so a repository that has opted in cannot be talked back out of it by
+a session, which is the point of putting it here rather than in a habit.
+
 ## When the guard denies you
 
 Each denial has exactly one next move. Take it and carry on — do not go looking for a
@@ -684,6 +716,8 @@ way around, and do not re-run the same command hoping it lands.
 | An edit in a worktree that is on the integration branch | `git switch -c <short-topic-name>` first. |
 | An edit in a worktree whose PR has merged | That change is finished. Take a new worktree for the next one. |
 | `git stash`, anywhere | Commit instead: `git add <paths> && git commit -m "wip"`. |
+| A merge into a branch this repo named in `protectedMergeTargets` | Push and open the PR, then leave it for a person and say so in your reply. |
+| A write into a worktree another session holds (opt-in second hook) | Cut one of your own — the denial prints the command. Reading that tree in place stays allowed. |
 
 **First check it is this guard denying you.** A denial that names no next move, or that
 says permission rather than protocol, is the machine's permission layer and not the rule —
@@ -695,7 +729,7 @@ can be stopped in one repository and allowed in another, or stopped and then all
 same one. So do not reason about when it will stop you; write the rule. See
 [references/permissions.md](references/permissions.md).
 
-### Four gates refuse worktree work, and they read alike
+### Several gates refuse worktree work, and they read alike
 
 Naming the wrong one is worse than writing nothing down, because it sends the next session
 to fix a repository that cannot fix it. Measured in the first repository to adopt this:
@@ -704,13 +738,15 @@ doing — and an upstream fix for any of them would have moved nothing.
 
 | gate | how you recognise it | where the fix is |
 |---|---|---|
-| this guard, `PreToolUse` | its own vocabulary: the main checkout, the integration branch, a spent worktree, `git stash` | upstream, in the skill — never in a repo's committed copy |
+| this guard, `PreToolUse` | its own vocabulary: the main checkout, the integration branch, a spent worktree, `git stash`, a protected merge target | upstream, in the skill — never in a repo's committed copy |
 | this guard, `Stop` | it counts what the worktree is holding, then prescribes delivery and teardown | upstream too — but note it is **not** a `PreToolUse` hook, so grepping the guard's rule set for its words finds nothing and proves nothing |
+| `worktree-owner.py`, where the repo installed it | it names *another session* and offers `--release` | upstream, and it is a **separate file** from the guard — grepping `worktree-guard.py` for its words proves nothing either |
 | the machine's permission layer | it says permission rather than protocol, and names no next move | an allowlist entry, once — see [references/permissions.md](references/permissions.md) |
 | Claude Code's own worktree isolation | `"This session is isolated in the worktree …"`, arriving as a tool **error**, not a hook denial | nowhere. No repository can change it — see below |
 
-**Grep the refusal against the repo's committed `worktree-guard.py` before writing "fix it
-upstream".** If the words are not in that file, this guard did not say them.
+**Grep the refusal against the repo's committed hooks before writing "fix it upstream".**
+Both of them, and only the ones this repository actually has: if the words are in neither
+file, neither of these hooks said them.
 
 ### What `EnterWorktree` costs
 
@@ -1070,7 +1106,8 @@ So the levers are on the briefing side:
 ## Reference
 
 - [references/guard-internals.md](references/guard-internals.md) — what the guard checks,
-  its modes, what it deliberately does not cover, and how to debug it.
+  its modes, every key `.claude/worktree-per-change.json` takes, what it deliberately does
+  not cover, and how to debug it.
 - [references/ticketing.md](references/ticketing.md) — working a ticket queue with
   several agents, including Matt Pocock's `to-tickets` → `implement` → `code-review` chain.
 - [references/permissions.md](references/permissions.md) — the two layers that stop this

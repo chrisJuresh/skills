@@ -292,6 +292,30 @@ It is committed next to the hook rather than inferred from the remote's default 
 because the default branch is frequently *not* the integration branch, and guessing it wrong
 sends every PR at the wrong target and every new worktree at the wrong base.
 
+Everything else in that file is optional, and **absence is the default in every case** — a
+repository that has written only `integrationBranch` behaves exactly as it did before any
+of these keys existed. They are listed together here because they accumulated one incident
+at a time and are otherwise scattered across the two scripts that read them:
+
+| key | read by | what it changes |
+|---|---|---|
+| `integrationBranch` | guard, `land.py` | the branch every PR targets and every worktree is cut from |
+| `worktreesRoot` | guard | the path quoted in the remedy text. **Text only** — whether a directory *is* a worktree is a stat on `.git`, never path arithmetic, so a wrong value here misleads a reader and cannot mis-classify a tree |
+| `guard` | `install.py` | the provenance record: `source`, `syncedFrom`, `sha256`. Written by the installer, never by hand |
+| `delivery` | guard | the repository's own delivery and teardown commands, in place of push-PR-merge — see below |
+| `sessionOwnership` | `install.py` | whether `worktree-owner.py` is registered too. A resync keeps the repository's answer without the flag |
+| `mergeIntegrationBeforeLanding` | `land.py` | bring `origin/<integration>` down into the topic branch before pushing, so a conflict lands in a tree set up to resolve it instead of in an API response |
+| `protectedMergeTargets` | guard, `land.py` | branches that are pushed to and opened against but **never merged** by a session. Additive only: no key removes a name and no environment variable turns it off, so a repository that has opted in cannot be talked back out of it |
+
+`install.py` **merges** this file rather than replacing it, so every one of these survives a
+resync that the installer knows nothing about.
+
+Two of them interact, and the guard reads them together: where the integration branch is a
+`protectedMergeTargets` name, no merge runs from a session at all, so `Stop` counts a pushed
+topic branch as **delivered**. Without that, a session that had done everything it was
+permitted to do — commit, push, open the PR, hand it to a person — would be refused
+permission to stop, twice, every time.
+
 ### `delivery` — when the repository has replaced the protocol's last three steps
 
 Push, PR, `gh pr merge`, `ExitWorktree`, remove is what the guard prescribes, and it is
