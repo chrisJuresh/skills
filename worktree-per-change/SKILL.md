@@ -26,12 +26,16 @@ here" is one stat call and never a judgement.
 
 What it buys, in the order the failures actually happen:
 
-- **Two writers never share a directory.** `git checkout` is a property of the
+- **Two *changes* never share a directory.** `git checkout` is a property of the
   directory, so a session switching branches rewrites files another is mid-edit on. The
   index is a single lock, so one `git add -A` sweeps up another's half-finished work.
   Two sessions editing one file means the later write silently discards the earlier —
   git never sees two versions, so there is no conflict marker. None of these produce an
   error.
+  **It does not follow that two *sessions* never do.** One worktree with two agents in it
+  passes every check the guard makes, and reproduces most of that list inside the tree —
+  see [one worktree, one session](#one-worktree-one-session), which is a separate,
+  opt-in hook.
 - **The main checkout stays trustworthy.** It is on the integration branch, clean, and
   pullable, so the operator's editor and dev server always show what actually landed
   rather than somebody's work in progress.
@@ -562,6 +566,10 @@ querying the parts that must be. `--no-permissions` skips it;
 [references/permissions.md](references/permissions.md) has the list, what is deliberately
 left out, and why the read-only half also belongs in `~/.claude/settings.json`.
 
+`--session-ownership` adds the second hook — one worktree, one session — which is off
+unless asked for and is the right answer for any repo where more than one agent runs at a
+time. See [one worktree, one session](#one-worktree-one-session).
+
 A repo install registers the hook as `python` against
 `${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py`, deliberately: the file is
 committed, so it must not carry the installing machine's interpreter path or this
@@ -836,10 +844,59 @@ hazard rather than an occasional one.
   saturating the same disk.
 - **The work item.** Two agents can happily take the same ticket. Claim it before you
   build — see [references/ticketing.md](references/ticketing.md).
+- **The tree itself, from a second session.** The protocol gives every *change* a tree
+  and says nothing about who is in it. Two agents in one worktree share its build output,
+  its dev server, its port and its `git status`, and none of that raises an error — see
+  below.
 - **Shared insert points in docs.** An append-ordered changelog or a hand-maintained
   index conflicts on every branch. Prefer one file per entry with a generated index, and
   keep doc edits to the narrowest diff, in one commit, last. **One file per entry does not
   finish the job** — see below, because the generated index is itself a shared insert point.
+
+## One worktree, one session
+
+Everything above isolates **changes**. Nothing in it isolates **sessions**, and two agents
+in one worktree pass every check the guard makes: the tree is a linked worktree, it is not
+on the integration branch, its PR has not merged.
+
+Measured, 2026-08-25, two sessions sharing one frontend worktree for half an hour:
+
+- both dev servers wrote the same build output directory, and both died mid-run;
+- one session's dev server took the port from the one already there;
+- one session's screenshot run captured the other's uncommitted edit, so the "after" image
+  it delivered was of a change it did not author;
+- the app's auth cookies were host-scoped rather than port-scoped, so switching role on one
+  server switched it on the other.
+
+**None of that raises an error.** It produces a screenshot that is wrong, and the ordinary
+reading of a wrong screenshot is that the code is wrong — so the cost is not the collision,
+it is the hour spent debugging the change it framed.
+
+`worktree_owner.py` is a second hook that closes it. Opt in per repo:
+
+```bash
+python .claude/scripts/install.py --repo . --session-ownership
+```
+
+The first write into a linked worktree claims it. A **different** session's write into a
+claimed tree is denied, with the command that cuts it one of its own. What it does not do
+is the load-bearing half:
+
+- **Reading another tree is untouched.** Comparing two branches on disk is ordinary work,
+  and a hook that refused it is a hook someone turns off — after which nothing is enforced
+  at all. Only the file tools and the commands that build, serve or write are refused.
+- **`git` is left to the guard.** Its rules are per-tree, not per-session, and one piece
+  of state gets one owner.
+- **A claim lapses; it does not lock.** Liveness is the owner's transcript mtime, which
+  every turn touches, so a session that is working is never more than a turn from fresh and
+  one that was killed frees its tree in 45 minutes (`CLAUDE_WORKTREE_OWNER_TTL`).
+  `--release <tree>` is the deliberate override, and the denial prints it.
+- **It is a separate script, not an edit to the guard.** The two answer different questions
+  — "is this tree a worktree, on the right branch, not already merged" against "is it
+  *yours*" — and a repo pinning the guard by digest can keep doing that.
+
+Full behaviour, the two-tier command lexing, and what a teardown script should call:
+[references/session-ownership.md](references/session-ownership.md).
 
 ## Generated files: stop resolving what nobody wrote
 
@@ -1020,5 +1077,8 @@ So the levers are on the briefing side:
   protocol and why only one of them is the guard; the allowlist `install.py` writes, entry
   by entry; the prefix-matching traps; and why wrapping a command to hide it from a
   permission layer is the one wrapper never to write.
+- [references/session-ownership.md](references/session-ownership.md) — the opt-in second
+  hook: what it claims, what it refuses, what it deliberately allows, and how a teardown
+  script releases a tree.
 - [references/replacing-a-concurrent-writer-guard.md](references/replacing-a-concurrent-writer-guard.md)
   — migrating a repo that already ships a hook of its own.

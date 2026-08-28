@@ -77,6 +77,20 @@ def registrations(repo: Path) -> list[str]:
     return sorted(found)
 
 
+def owner_registrations(repo: Path, name: str = "settings.json") -> list[str]:
+    path = repo / ".claude" / name
+    if not path.is_file():
+        return []
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    found = []
+    for event, matchers in (settings.get("hooks") or {}).items():
+        for matcher in matchers:
+            for hook in matcher.get("hooks") or []:
+                if "worktree-owner.py" in " ".join(str(p) for p in hook.get("args") or []):
+                    found.append(event)
+    return sorted(found)
+
+
 def fresh(root: Path, name: str) -> Path:
     repo = root / name
     repo.mkdir(parents=True)
@@ -440,6 +454,72 @@ def main() -> int:
         install(narrowed, "--uninstall")
         check("a hand-narrowed land.py rule survives the uninstall",
               permissions_of(narrowed), ["Bash(python .claude/scripts/land.py --dry-run:*)"])
+
+        # --- session ownership ----------------------------------------------------
+        # The second hook. Opt-in, separate from the guard on disk and in the settings
+        # file, and sticky across a resync — the last of those is the one that matters,
+        # because a resync that quietly retires a rule people rely on looks exactly like a
+        # successful resync.
+        owned = fresh(root, "owned")
+        install(owned)
+        check("it is off unless asked for", owner_registrations(owned), [])
+        check("...and recorded as off", config_of(owned).get("sessionOwnership"), False)
+        check("no ownership hook is copied",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+
+        out = install(owned, "--session-ownership")
+        check("--session-ownership succeeds", out.returncode, 0)
+        check("it registers on PreToolUse and SessionStart only",
+              owner_registrations(owned), ["PreToolUse", "SessionStart"])
+        # Not Stop: a session ending is not a write, and the hook has nothing to decide
+        # there. Asserted rather than assumed, because the cost of getting it wrong is one
+        # interpreter start per stop, forever, for nothing.
+        check("and not on Stop", "Stop" in owner_registrations(owned), False)
+        check("the guard's own three are untouched", registrations(owned),
+              ["PreToolUse", "SessionStart", "Stop"])
+        check("the script is copied in",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").is_file(), True)
+        check("it is recorded, so a resync keeps it",
+              config_of(owned).get("sessionOwnership"), True)
+        check("with a provenance that can date the copy",
+              content_hash((HERE / "worktree_owner.py").read_bytes()),
+              (config_of(owned).get("owner") or {}).get("sha256"))
+
+        install(owned)
+        check("a resync without the flag keeps the rule",
+              owner_registrations(owned), ["PreToolUse", "SessionStart"])
+
+        out = install(owned, "--no-session-ownership")
+        check("--no-session-ownership clears the registration",
+              owner_registrations(owned), [])
+        check("...and removes the script, so no later resync mistakes it for a decision",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+        check("...and records the answer", config_of(owned).get("sessionOwnership"), False)
+        check("...and drops the provenance with it", "owner" in config_of(owned), False)
+        check("the guard survives all of that", registrations(owned),
+              ["PreToolUse", "SessionStart", "Stop"])
+
+        # An uninstall run without the flag the install had: the hook announces itself on
+        # every tool call, so one left behind pointing at a deleted script is noisier than
+        # the guard entry it sits beside.
+        install(owned, "--session-ownership")
+        install(owned, "--uninstall")
+        check("an uninstall without the flag still clears the ownership hook",
+              owner_registrations(owned), [])
+        check("...and its script", (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+
+        # Never at user scope. Claims are keyed off a repository's common git dir, so a
+        # user-scope registration would run it against every repo on the machine.
+        user = root / "user-scope"
+        (user / ".claude").mkdir(parents=True)
+        out = subprocess.run(
+            [sys.executable, str(INSTALL), "--branch", "development", "--no-skill",
+             "--session-ownership", "--dry-run"],
+            capture_output=True, text=True, env={**__import__("os").environ,
+                                                 "CLAUDE_CONFIG_DIR": str(user / ".claude")},
+        )
+        check("a user-scope install ignores --session-ownership",
+              "worktree_owner.py" in out.stdout, False)
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:
