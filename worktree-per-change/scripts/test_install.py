@@ -77,6 +77,20 @@ def registrations(repo: Path) -> list[str]:
     return sorted(found)
 
 
+def owner_registrations(repo: Path, name: str = "settings.json") -> list[str]:
+    path = repo / ".claude" / name
+    if not path.is_file():
+        return []
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    found = []
+    for event, matchers in (settings.get("hooks") or {}).items():
+        for matcher in matchers:
+            for hook in matcher.get("hooks") or []:
+                if "worktree-owner.py" in " ".join(str(p) for p in hook.get("args") or []):
+                    found.append(event)
+    return sorted(found)
+
+
 def fresh(root: Path, name: str) -> Path:
     repo = root / name
     repo.mkdir(parents=True)
@@ -268,6 +282,79 @@ def main() -> int:
         check("but still registers the hooks", registrations(bare),
               ["PreToolUse", "SessionStart", "Stop"])
 
+        # --- the two files git will not carry for the protocol ---------------------
+        # Both are silent when absent. An unignored `.claude/worktrees/` gets a live
+        # checkout committed into the repository as a gitlink no clone can resolve; a
+        # worktree with no `settings.local.json` falls back to the default permission
+        # mode and starts refusing the protocol's own writes for no visible reason. The
+        # installer is what puts worktrees under `.claude/worktrees/` in the first place,
+        # so it is the installer that owes the repository both entries.
+        carried = fresh(root, "carried")
+        # Written as bytes so the fixture really has LF endings: `write_text` would
+        # translate them on Windows, and the assertion below would be about the
+        # fixture rather than about what the installer appended.
+        (carried / ".gitignore").write_bytes(b"node_modules/" + bytes([10]))
+        install(carried)
+        ignored = (carried / ".gitignore").read_text(encoding="utf-8")
+        check("the worktree directory is ignored", ".claude/worktrees/" in ignored, True)
+        check("and this machine's permission mode with it",
+              ".claude/settings.local.json" in ignored, True)
+        check("what was already in the file is left where it was",
+              ignored.startswith("node_modules/\n"), True)
+        check(
+            "the permission mode is copied into every new worktree instead",
+            ".claude/settings.local.json"
+            in (carried / ".worktreeinclude").read_text(encoding="utf-8"),
+            True,
+        )
+        # Appended as bytes, because `write_text` would translate every existing LF on
+        # Windows and turn a two-line addition into a whole-file diff.
+        check("and the file's existing line endings survive the append",
+              (carried / ".gitignore").read_bytes().count(bytes([13])), 0)
+
+        unchanged = (carried / ".gitignore").read_bytes()
+        install(carried)
+        check("a second install does not append them again",
+              (carried / ".gitignore").read_bytes(), unchanged)
+
+        install(carried, "--uninstall")
+        check(
+            # Un-ignoring `.claude/worktrees/` is how a stale checkout gets committed, and
+            # that outlives the guard. The uninstaller says it left them rather than acting.
+            "uninstalling leaves both files as it found them",
+            ".claude/worktrees/" in (carried / ".gitignore").read_text(encoding="utf-8"),
+            True,
+        )
+
+        # The question is whether the REPOSITORY carries the rule, so the machine's own
+        # ignores cannot answer it. Measured on the machine this was written on, whose
+        # global ignore already names `**/.claude/settings.local.json`: `check-ignore` said
+        # it was covered, the installer wrote nothing, and the repo went out to everybody
+        # else without the entry — right where it was installed, false where it travels.
+        elsewhere = fresh(root, "elsewhere")
+        machine_ignore = root / "machine-ignore"
+        machine_ignore.write_text(".claude/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(elsewhere), "config",
+                        "core.excludesFile", str(machine_ignore)], check=True)
+        install(elsewhere)
+        check(
+            "a machine-local ignore does not stand in for the repository's own",
+            ".claude/worktrees/" in (elsewhere / ".gitignore").read_text(encoding="utf-8"),
+            True,
+        )
+
+        # A repo that already ignores them keeps its own spelling: this is the repo's file
+        # and a second literal line saying the same thing is noise.
+        broad = fresh(root, "broad")
+        (broad / ".gitignore").write_text(
+            ".claude/worktrees/\n.claude/settings.local.json\n", encoding="utf-8")
+        install(broad)
+        check(
+            "an entry the repo already ignores is not repeated",
+            (broad / ".gitignore").read_text(encoding="utf-8").count(".claude/worktrees/"),
+            1,
+        )
+
         # --- a predecessor guard is replaced, not left beside ----------------------
         legacy = fresh(root, "legacy")
         (legacy / ".claude").mkdir()
@@ -284,6 +371,155 @@ def main() -> int:
         )
         check("while ours is registered", registrations(legacy),
               ["PreToolUse", "SessionStart", "Stop"])
+
+        # --- installing where nothing may be committed ----------------------------
+        # A committed guard changes what a COLLEAGUE's session may do in their own working
+        # directory. Where that is not wanted, the install still has to be a real install:
+        # hooks that fire, an allowlist that matches, and a record that can be dated.
+        local = fresh(root, "uncommitted")
+        outside = root / "tooling" / ".claude"
+        outside.mkdir(parents=True)
+        out = install(local, "--settings-file", "settings.local.json",
+                      "--guard-root", str(outside), "--worktrees-root", "../trees")
+        check("a local install succeeds", out.returncode, 0)
+        check("nothing is written to the committed settings file",
+              (local / ".claude" / "settings.json").exists(), False)
+        local_settings = json.loads(
+            (local / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        check("all three events are registered in the local file",
+              sorted(local_settings.get("hooks") or {}),
+              ["PreToolUse", "SessionStart", "Stop"])
+        check("the guard is not copied into the repository",
+              (local / ".claude" / "hooks" / "worktree-guard.py").exists(), False)
+        check("it is written to the guard root instead",
+              (outside / "hooks" / "worktree-guard.py").is_file(), True)
+        # `${CLAUDE_PROJECT_DIR}` resolves to the tree the session is in, which is exactly
+        # where this file is not. An install that kept it would register a hook that never
+        # runs — and a hook that never runs is indistinguishable from one with nothing to
+        # deny.
+        registered = json.dumps(local_settings)
+        check("the hook is referenced absolutely, not through the project dir",
+              "CLAUDE_PROJECT_DIR" in registered, False)
+        # Compared against the parsed args, not the serialised text: `json.dumps` escapes
+        # every backslash, so a substring test for a Windows path passes only on POSIX.
+        check("and it names the file that exists",
+              any(Path(arg) == outside / "hooks" / "worktree-guard.py"
+                  for event in (local_settings.get("hooks") or {}).values()
+                  for matcher in event
+                  for hook in matcher.get("hooks", [])
+                  for arg in hook.get("args", [])),
+              True)
+        # The allowlist is a prefix match on the command string, so `python` in the entry
+        # and `python3` in the call is an entry that matches nothing — and says nothing.
+        entries = (local_settings.get("permissions") or {}).get("allow") or []
+        landers = [e for e in entries if "land.py" in e]
+        check("land.py gets exactly one entry", len(landers), 1)
+        check("spelled with an interpreter that exists here", sys.executable in landers[0], True)
+        check("and with the absolute path it will be called by",
+              str(outside / "scripts" / "land.py") in landers[0], True)
+        check("the worktrees root is recorded", config_of(local).get("worktreesRoot"), "../trees")
+        check("the branch is still recorded in the repo, where both readers look",
+              config_of(local).get("integrationBranch"), "development")
+        # The one failure mode of this install shape, said out loud rather than found out:
+        # a worktree holds tracked files only, so an untracked settings file is in none of
+        # them.
+        check("and the install says the worktrees will not have it",
+              "does NOT exist in a fresh worktree" in out.stdout, True)
+
+        out = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(local), "--status"],
+            capture_output=True, text=True,
+        )
+        check("--status finds a local install rather than reporting none",
+              "settings.local.json  ->  installed" in out.stdout, True)
+
+        # An uninstall is frequently run without the flags the install had. Leaving a
+        # grant behind is worse than leaving a hook behind: the hook announces itself, and
+        # an allowlist entry for a script that is gone is a grant nobody remembers making.
+        install(local, "--settings-file", "settings.local.json", "--uninstall")
+        left = json.loads(
+            (local / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        check("an uninstall without the original flags still clears the allowlist",
+              (left.get("permissions") or {}).get("allow"), None)
+        check("and clears the hooks", left.get("hooks"), None)
+
+        # ... but a rule the operator NARROWED by hand is a decision, and an uninstaller
+        # that swept it up would silently reverse it.
+        narrowed = fresh(root, "narrowed")
+        install(narrowed)
+        settings_file = narrowed / ".claude" / "settings.json"
+        blob = json.loads(settings_file.read_text(encoding="utf-8"))
+        blob["permissions"]["allow"].append("Bash(python .claude/scripts/land.py --dry-run:*)")
+        settings_file.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+        install(narrowed, "--uninstall")
+        check("a hand-narrowed land.py rule survives the uninstall",
+              permissions_of(narrowed), ["Bash(python .claude/scripts/land.py --dry-run:*)"])
+
+        # --- session ownership ----------------------------------------------------
+        # The second hook. Opt-in, separate from the guard on disk and in the settings
+        # file, and sticky across a resync — the last of those is the one that matters,
+        # because a resync that quietly retires a rule people rely on looks exactly like a
+        # successful resync.
+        owned = fresh(root, "owned")
+        install(owned)
+        check("it is off unless asked for", owner_registrations(owned), [])
+        check("...and recorded as off", config_of(owned).get("sessionOwnership"), False)
+        check("no ownership hook is copied",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+
+        out = install(owned, "--session-ownership")
+        check("--session-ownership succeeds", out.returncode, 0)
+        check("it registers on PreToolUse and SessionStart only",
+              owner_registrations(owned), ["PreToolUse", "SessionStart"])
+        # Not Stop: a session ending is not a write, and the hook has nothing to decide
+        # there. Asserted rather than assumed, because the cost of getting it wrong is one
+        # interpreter start per stop, forever, for nothing.
+        check("and not on Stop", "Stop" in owner_registrations(owned), False)
+        check("the guard's own three are untouched", registrations(owned),
+              ["PreToolUse", "SessionStart", "Stop"])
+        check("the script is copied in",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").is_file(), True)
+        check("it is recorded, so a resync keeps it",
+              config_of(owned).get("sessionOwnership"), True)
+        check("with a provenance that can date the copy",
+              content_hash((HERE / "worktree_owner.py").read_bytes()),
+              (config_of(owned).get("owner") or {}).get("sha256"))
+
+        install(owned)
+        check("a resync without the flag keeps the rule",
+              owner_registrations(owned), ["PreToolUse", "SessionStart"])
+
+        out = install(owned, "--no-session-ownership")
+        check("--no-session-ownership clears the registration",
+              owner_registrations(owned), [])
+        check("...and removes the script, so no later resync mistakes it for a decision",
+              (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+        check("...and records the answer", config_of(owned).get("sessionOwnership"), False)
+        check("...and drops the provenance with it", "owner" in config_of(owned), False)
+        check("the guard survives all of that", registrations(owned),
+              ["PreToolUse", "SessionStart", "Stop"])
+
+        # An uninstall run without the flag the install had: the hook announces itself on
+        # every tool call, so one left behind pointing at a deleted script is noisier than
+        # the guard entry it sits beside.
+        install(owned, "--session-ownership")
+        install(owned, "--uninstall")
+        check("an uninstall without the flag still clears the ownership hook",
+              owner_registrations(owned), [])
+        check("...and its script", (owned / ".claude" / "hooks" / "worktree-owner.py").exists(), False)
+
+        # Never at user scope. Claims are keyed off a repository's common git dir, so a
+        # user-scope registration would run it against every repo on the machine.
+        user = root / "user-scope"
+        (user / ".claude").mkdir(parents=True)
+        out = subprocess.run(
+            [sys.executable, str(INSTALL), "--branch", "development", "--no-skill",
+             "--session-ownership", "--dry-run"],
+            capture_output=True, text=True, env={**__import__("os").environ,
+                                                 "CLAUDE_CONFIG_DIR": str(user / ".claude")},
+        )
+        check("a user-scope install ignores --session-ownership",
+              "worktree_owner.py" in out.stdout, False)
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:

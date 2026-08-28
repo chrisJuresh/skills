@@ -4,11 +4,13 @@ description: >-
   One change, one worktree, one branch, one merged PR — the protocol for repositories
   where nothing is ever written in the main checkout, and the guard hook that enforces
   it. Use this skill before the first Edit or Write in any repository that has the guard
-  installed, when a write, `git switch`, `git add` or `git stash` is denied, when
-  EnterWorktree cuts from the wrong base, when a change is finished and has to be pushed,
-  merged and then taken down, when a session is refused permission to stop, when a second
-  change starts in a session that already merged one, and when the user wants this rule
-  installed in a repository or on a machine.
+  installed, when a write, `git switch`, `git add` or `git stash` is denied or a worktree is
+  refused because another session holds it, when EnterWorktree cuts from the wrong base,
+  when a change is finished and has to be pushed, merged and then taken down, when a
+  session is refused permission to stop, when a second change starts in a session that
+  already merged one, when a session finds it has already been writing in the main checkout
+  or has moved a shared tree's `HEAD`, and when the user wants this rule installed in a
+  repository or on a machine.
 ---
 
 # One change, one worktree, one branch, one merged PR
@@ -25,12 +27,16 @@ here" is one stat call and never a judgement.
 
 What it buys, in the order the failures actually happen:
 
-- **Two writers never share a directory.** `git checkout` is a property of the
+- **Two *changes* never share a directory.** `git checkout` is a property of the
   directory, so a session switching branches rewrites files another is mid-edit on. The
   index is a single lock, so one `git add -A` sweeps up another's half-finished work.
   Two sessions editing one file means the later write silently discards the earlier —
   git never sees two versions, so there is no conflict marker. None of these produce an
   error.
+  **It does not follow that two *sessions* never do.** One worktree with two agents in it
+  passes every check the guard makes, and reproduces most of that list inside the tree —
+  see [one worktree, one session](#one-worktree-one-session), which is a separate,
+  opt-in hook.
 - **The main checkout stays trustworthy.** It is on the integration branch, clean, and
   pullable, so the operator's editor and dev server always show what actually landed
   rather than somebody's work in progress.
@@ -38,6 +44,14 @@ What it buys, in the order the failures actually happen:
   read while it is still cheap to change, and a history where each entry is one thing.
 
 ## The loop
+
+This is the default, and a repository may have replaced its last three steps. Check
+`.claude/worktree-per-change.json` for a `delivery` block before following the loop: a repo
+that lands without pull requests, or enters worktrees by path rather than with
+`EnterWorktree`, declares it there and the guard's own messages follow that instead. The
+**invariant** never moves — one change, one worktree, one branch, and a branch that exists
+only on this disk is not a delivered change — only the commands do. See
+[references/guard-internals.md](references/guard-internals.md#configuration).
 
 ```bash
 # 1. before the first edit — a worktree cut from the FETCHED integration branch
@@ -85,6 +99,27 @@ python .claude/scripts/land.py        # push, PR if there is none, merge, verify
 
 `land.py` is the same four commands with the verification that each of them needs, and it
 exists so that the delivery step can be *allowed* — see below.
+
+**Where several changes are in flight against one integration branch, bring it down before
+you push.** This protocol creates that situation rather than encountering it: every change
+that lands moves the base under every change still open. The next PR is then refused for a
+conflict *by the forge*, after the push — so `gh pr merge` fails on a PR that is now
+unmergeable, nothing local is set up to fix it, and the exit code describes the API call
+rather than the conflict. Doing it locally first costs a fetch, and the failure lands
+somewhere useful:
+
+```bash
+git fetch origin <integration>
+git merge --no-edit origin/<integration>    # clean: invisible. conflicted: fix it here
+```
+
+`land.py` does this when the repository records
+`"mergeIntegrationBeforeLanding": true`, or for one run with `--merge-integration`. It is
+**off by default**, because in a repo where changes land one at a time it is a fetch and a
+merge commit that buy nothing. It refuses rather than resolving: choosing between two
+versions of somebody's code is the work, and a script that guessed would land the guess.
+The guard permits the resolution — an unfinished merge outranks the spent marker for
+exactly this reason — and nothing has been pushed when the refusal arrives.
 
 **It also refuses a branch that has already merged, before pushing anything**, and running
 it by hand means doing that check by hand. A landed change leaves no remote branch and no
@@ -239,8 +274,8 @@ The same trap catches `git branch --merged <integration>`: it lists nothing afte
 merge, so it is not a sweep, and a branch missing from it has not necessarily survived.
 
 A second change in the same session gets a **new** worktree and a **new** branch, cut
-from the integration branch you just merged into. The guard marks a worktree spent once
-`gh pr merge` has run in it and denies further edits there — a merged branch that grows
+from the integration branch you just merged into. The guard marks a worktree spent once a
+merge — `gh pr merge`, or `land.py` — has run **in** it, and denies further edits there — a merged branch that grows
 a new commit reaches nobody, because the PR that would have carried it is already
 closed.
 
@@ -314,6 +349,16 @@ output, local config and anything else `.gitignore` covers are simply absent:
 - **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
   start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
   and the failure looks like the tool being broken rather than the file being missing.
+- **This machine's permission mode**, which is the case above turned on the protocol
+  itself. `.claude/settings.local.json` is ignored — it is nobody else's business what this
+  machine allows — so a fresh worktree does not have it and falls back to the default mode,
+  and the writes the guard *sent you to a worktree to make* start being refused. Measured
+  2026-08-15: `git add` allowed in one worktree and denied in the next one cut minutes
+  later, with nothing visible from inside either to say why. It reads exactly like the
+  permission layer's unstable judgement (below) and is not — it is a missing file, and the
+  only instance of that shape with a cause you can fix, so check it first. `install.py`
+  now writes the `.worktreeinclude` entry for it; a repo installed before that gets it by
+  re-running the installer, and `--status` says whether it is missing.
 - **The toolchain selection.** A worktree inherits the shell's default interpreter, not the
   repository's pin — an `.nvmrc` is a file, not a shell hook, and a version manager that
   needs one is no help to a session. What makes this awkward rather than routine is that
@@ -332,17 +377,30 @@ Two ways to fix it, and the second is better for anything a *human* also needs:
 - **`.worktreeinclude`** lists untracked paths Claude Code copies into each new worktree.
   Right for machine-local secrets and caches that must not be committed. A path is copied
   only when it is **both** listed there and gitignored, so it can never duplicate a tracked
-  file. If a setup script of yours reads the same list — and having one list read by both
-  paths is the whole point of it — have that reader take literal paths only and **skip a
-  glob out loud**: `.gitignore` syntax has patterns and negation, and half-honouring one
-  hands back a worktree that is missing a secret and says nothing.
+  file. `install.py` writes the file with `.claude/settings.local.json` already in it, and
+  appends rather than replaces, so a repo that keeps its own entries there keeps them. If a
+  setup script of yours reads the same list — and having one list read by both paths is the
+  whole point of it — have that reader take literal paths only and **skip a glob out
+  loud**: `.gitignore` syntax has patterns and negation, and half-honouring one hands back
+  a worktree that is missing a secret and says nothing.
 - **Un-ignore the file.** If every worktree needs it and it holds nothing private, the
   honest answer is to commit it — a worktree only gets a file if git puts it there. This
   applies to the guard itself: `.claude/settings.json`, `.claude/hooks/worktree-guard.py`
   and `.claude/worktree-per-change.json` must be tracked, or the rule stops applying
   inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
   needs its ignore narrowed to name them, keeping `settings.local.json` and
-  `.claude/worktrees/` out.
+  `.claude/worktrees/` out — the second stays ignored for a reason of its own, and the
+  first repository to adopt this guard arrived with the gitlink already in its history
+  ([below](#the-worktrees-live-inside-the-repo-so-its-own-tooling-can-see-them)).
+  `install.py` writes both ignore entries now, and asks *git* rather than the file, so a
+  repo that already covers them under a broader pattern does not collect a second line
+  saying the same thing. What it will not do is read your **machine's** global ignore as an
+  answer: the question is whether the repository carries the rule, and a
+  `core.excludesFile` is true only where it lives — measured, an honest check against it
+  reported nothing missing and shipped the repo to everybody else without the entry.
+- **Or accept that it is untracked, and write it into every worktree yourself.** Some
+  repositories cannot take the commit at all — see [installing where nothing may be
+  committed](#installing-where-nothing-may-be-committed) below.
 
 **Whatever you copy those files *from* is at the revision the operator left the main
 checkout on, which under this protocol is not the integration tip.** The base you cut from
@@ -377,13 +435,33 @@ from the next resync on, which is this same failure one level up:
 
 ```json
 { "integrationBranch": "queue",
+  "worktreesRoot": ".claude/worktrees",
   "guard": { "source": "…/worktree_guard.py", "syncedFrom": "<sha>", "sha256": "<hash>" } }
 ```
+
+`worktreesRoot` is where this repo's worktrees go, and it is quoted in the remedy text and
+used for nothing else — whether a directory *is* a worktree is a stat on `.git`, never path
+arithmetic, so a wrong value here cannot mis-classify a tree. It is still worth setting,
+because it can be wrong in the way that costs a turn: a repo that does not gitignore
+`.claude/` cannot put worktrees there without every tree arriving as untracked files in
+`git status`, and a remedy naming a path the repo has ruled out is a remedy nobody can
+take. Default `.claude/worktrees`; `install.py --worktrees-root` records another.
 
 It merges rather than replaces, so re-running it to resync keeps the branch and anything
 else the repo keeps in that file. `syncedFrom` is absent when the skill directory is not a
 git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
 sha is not.
+
+**That merge is also what makes the rest of this file the repository's to write.** Four more
+keys have accumulated there, one incident each, and every one of them is optional and off
+when absent: `delivery` (a repo that lands without pull requests, or without entering
+worktrees), `sessionOwnership` (the second hook), `mergeIntegrationBeforeLanding` (bring the
+base down before pushing) and `protectedMergeTargets` (branches this repo never merges into
+from a session). The full list, with what reads each, is in
+[references/guard-internals.md](references/guard-internals.md#configuration) — read it
+before adding a key by hand, because a repository that has declared nothing gets exactly the
+behaviour it had before any of them existed, and that is the property they are all built to
+preserve.
 
 **`sha256` is over the file's LF-normalised bytes, and a gate checking it must normalise
 too.** The record crosses platforms and the bytes on disk do not: a repo pinning
@@ -414,9 +492,39 @@ not tidiness: a linter, a formatter, a test runner or a type checker pointed at 
 will walk every worktree on disk, so the gate slows down with the number of trees standing
 and starts reporting *other branches'* failures as yours.
 
-Each tool has to be told separately, and one of them may already be right for a reason
-worth establishing rather than assuming. Measured on the first repository to adopt this:
-ESLint needed `.claude/**` adding to `ignores` and Prettier needed `.claude/` in
+**The first tool that sees them is git, so `.gitignore` gets the entry before anything
+else does.** This is the one that is easy to skip, because the noise it makes is small:
+git stops at each nested `.git` rather than descending, so the main checkout's
+`git status --short` grows exactly one line, `?? .claude/worktrees/`, however many trees
+stand. It is a permanent line, though, and while it is there "is the main checkout clean"
+is not a question the status answers. What it costs is the next `git add -A` run in the
+main checkout — by a person in an editor, or by any session in a repo where the guard is
+not installed yet, in `warn`, or failing open. Measured on a two-worktree probe:
+
+```
+$ git add -A                     # exit 0, and the only complaint is a hint
+warning: adding embedded git repository: .claude/worktrees/topic
+$ git ls-tree HEAD .claude/worktrees/
+160000 commit 7895d72…  .claude/worktrees/other
+160000 commit 7895d72…  .claude/worktrees/topic
+```
+
+Those are gitlinks to commits no clone can resolve, and they are quiet in both directions:
+the commit succeeds, and every worktree cut from it afterwards materialises empty
+directories named after other people's branches and then reports itself **clean**. So:
+
+```gitignore
+.claude/worktrees/
+```
+
+A repo that ignores `.claude/` wholesale already has this and needs the *narrowing*
+described above instead; a repo that ignores nothing under `.claude/` has neither, and
+nothing else in this protocol will tell it so. Measured: the repository this skill itself
+lives in was one of them.
+
+Each of the rest has to be told separately, and one of them may already be right for a
+reason worth establishing rather than assuming. Measured on the first repository to adopt
+this: ESLint needed `.claude/**` adding to `ignores` and Prettier needed `.claude/` in
 `.prettierignore`, while the test runner was already safe only because its `include` globs
 name three directories instead of the root. The type checker needed nothing — TypeScript's
 wildcard `include` skips dot-directories — but that was settled with a three-line probe
@@ -444,9 +552,13 @@ python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --dry-run
 Show the user that output, then run it without `--dry-run`. It copies the guard to
 `.claude/hooks/` and `land.py` to `.claude/scripts/`, registers three hooks and the
 allowlist in the committed `.claude/settings.json`, writes
-`.claude/worktree-per-change.json` with the integration branch, and links this skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all four, and
-check `.gitignore` is not swallowing them.
+`.claude/worktree-per-change.json` with the integration branch, adds `.claude/worktrees/`
+and `.claude/settings.local.json` to `.gitignore` and `.claude/settings.local.json` to
+`.worktreeinclude`, and links this skill into `~/.claude/skills/` so
+`/worktree-per-change` resolves everywhere. Commit all six, and check `.gitignore` is not
+swallowing the four that have to stay tracked. `--uninstall` leaves the `.gitignore` and
+`.worktreeinclude` entries alone and says so — un-ignoring `.claude/worktrees/` is how a
+stale checkout ends up committed, and that outlives the guard.
 
 **It asks which branch changes merge into, and does not guess.** This is the setting that
 is silently wrong: a guard pointed at the wrong integration branch denies nothing and
@@ -466,6 +578,10 @@ querying the parts that must be. `--no-permissions` skips it;
 [references/permissions.md](references/permissions.md) has the list, what is deliberately
 left out, and why the read-only half also belongs in `~/.claude/settings.json`.
 
+`--session-ownership` adds the second hook — one worktree, one session — which is off
+unless asked for and is the right answer for any repo where more than one agent runs at a
+time. See [one worktree, one session](#one-worktree-one-session).
+
 A repo install registers the hook as `python` against
 `${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py`, deliberately: the file is
 committed, so it must not carry the installing machine's interpreter path or this
@@ -473,14 +589,59 @@ checkout's absolute location, and `${CLAUDE_PROJECT_DIR}` resolves to whichever 
 the session is actually in. `--python` overrides the interpreter where `python` is not on
 `PATH`.
 
+### Installing where nothing may be committed
+
+A committed install is right when the repository's team is adopting the rule. It is wrong
+when it is *one person's* setup in a checkout other people work in, and the reason is not
+etiquette: this guard **denies writes**, so committing it changes what a colleague's
+session is allowed to do, in their own working directory, without them having agreed to
+it. That is a conversation to have, not a side effect of an install. Documentation is not
+like this — a paragraph added to a `CONTEXT.md` changes nobody's session — which is why
+"don't commit agent config here" and "don't touch the docs" are different rules.
+
+```bash
+python install.py --repo . --branch develop \
+    --settings-file settings.local.json \
+    --guard-root ~/tooling/.claude \
+    --worktrees-root ../trees
+```
+
+`--settings-file` registers the hooks in the gitignored file instead of the committed one.
+`--guard-root` keeps the guard and `land.py` outside the repository and references them by
+absolute path — one copy for every repo installed this way, and `${CLAUDE_PROJECT_DIR}`
+would be exactly wrong for it, since that resolves to the tree the file deliberately is not
+in. `.claude/worktree-per-change.json` still goes in the repo, untracked, because the guard
+and `land.py` read it from the **main checkout** — and a `.git/info/exclude` entry covers it
+in every worktree at once, lives in the common git directory, and is never pushed.
+
+**The cost is one thing, and it is the thing that makes this install look like it worked
+when it did not: a worktree is a checkout of TRACKED files, so an untracked settings file
+is absent from every worktree the guard sends a session into.** The rule would then apply
+in the main checkout — where nothing is supposed to happen anyway — and nowhere else. So
+whatever creates worktrees here has to write one into each of them, and that is not
+optional. `install.py` prints that warning instead of leaving it to be discovered, and
+`--status` reads `settings.local.json` too and marks a local install with the same note —
+a status that reported "not installed" about a guard that is running is how somebody
+installs it twice.
+
+It also removes the drift gate's usual justification, and the removal is real rather than
+convenient. The copy-plus-hash machinery exists because a *committed* copy is a fork the
+moment upstream moves; a single untracked copy that every repo references is one file to
+resync and no forks to find. `install.py` still records `syncedFrom` and `sha256` in each
+repo's config, so the copy can still be dated — what goes away is the CI check, which had
+nothing to check.
+
 - Omit `--repo` to install at user scope for every repository on the machine. It applies
   one integration branch to repos that may not share it, so prefer per-repo.
 - `--permissions-only` writes the allowlist and nothing else — no hooks, no guard, no
   config. Run it once at user scope on any machine doing this work: a repo-scoped rule
   cannot cover a session that has to read a *different* repository, and installing this
   guard into the next repo is exactly that shape of task.
-- `--status` reports what is installed, which branch this repo integrates through,
-  whether the cwd may write, and every worktree with what it is still holding.
+- `--status` reports what is installed — including a local install and the ownership hook
+  — which branch this repo integrates through, whether the cwd may write, every worktree
+  with what it is still holding and which session is holding it, and whether the
+  `.gitignore` and `.worktreeinclude` entries are there, which is how a repo installed
+  before the installer wrote them finds out, since nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.
@@ -524,6 +685,26 @@ because a protected branch refuses it:
 gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/<integration>   # expect 422
 ```
 
+**And where the answer is a branch nobody may merge unreviewed, say that in the config
+rather than in a convention.** The first property above is the one repositories get wrong,
+and they get it wrong in the direction that costs most: pointing `integrationBranch` at a
+trunk where review is a *habit* rather than a required check. The forge then merges the
+agent's PR on request, unreviewed, and nothing anywhere reports a problem. Name that branch
+in `protectedMergeTargets` and both halves of the protocol stop at the open pull request —
+`land.py` pushes and opens and returns 0, and a `gh pr merge` typed by hand is denied, so
+opting in cannot be undone by taking the shortcut:
+
+```json
+{ "integrationBranch": "main", "protectedMergeTargets": ["main"] }
+```
+
+It is empty by default, because for most repositories the integration branch *is* the batch
+branch and squash-merging into it is the whole protocol. Where it is set, delivery ends at
+the PR: `Stop` counts a pushed branch as delivered, and the reply names the PR and says it
+is waiting for a person. It is additive only — no key removes a name and no environment
+variable turns it off — so a repository that has opted in cannot be talked back out of it by
+a session, which is the point of putting it here rather than in a habit.
+
 ## When the guard denies you
 
 Each denial has exactly one next move. Take it and carry on — do not go looking for a
@@ -536,6 +717,8 @@ way around, and do not re-run the same command hoping it lands.
 | An edit in a worktree that is on the integration branch | `git switch -c <short-topic-name>` first. |
 | An edit in a worktree whose PR has merged | That change is finished. Take a new worktree for the next one. |
 | `git stash`, anywhere | Commit instead: `git add <paths> && git commit -m "wip"`. |
+| A merge into a branch this repo named in `protectedMergeTargets` | Push and open the PR, then leave it for a person and say so in your reply. |
+| A write into a worktree another session holds (opt-in second hook) | Cut one of your own — the denial prints the command. Reading that tree in place stays allowed. |
 
 **First check it is this guard denying you.** A denial that names no next move, or that
 says permission rather than protocol, is the machine's permission layer and not the rule —
@@ -546,6 +729,83 @@ covers a command that layer *judges*, and the judgement is not stable — the sa
 can be stopped in one repository and allowed in another, or stopped and then allowed in the
 same one. So do not reason about when it will stop you; write the rule. See
 [references/permissions.md](references/permissions.md).
+
+### Several gates refuse worktree work, and they read alike
+
+Naming the wrong one is worse than writing nothing down, because it sends the next session
+to fix a repository that cannot fix it. Measured in the first repository to adopt this:
+**three log entries and five refusals**, all filed against this guard, none of them its
+doing — and an upstream fix for any of them would have moved nothing.
+
+| gate | how you recognise it | where the fix is |
+|---|---|---|
+| this guard, `PreToolUse` | its own vocabulary: the main checkout, the integration branch, a spent worktree, `git stash`, a protected merge target | upstream, in the skill — never in a repo's committed copy |
+| this guard, `Stop` | it counts what the worktree is holding, then prescribes delivery and teardown | upstream too — but note it is **not** a `PreToolUse` hook, so grepping the guard's rule set for its words finds nothing and proves nothing |
+| `worktree-owner.py`, where the repo installed it | it names *another session* and offers `--release` | upstream, and it is a **separate file** from the guard — grepping `worktree-guard.py` for its words proves nothing either |
+| the machine's permission layer | it says permission rather than protocol, and names no next move | an allowlist entry, once — see [references/permissions.md](references/permissions.md) |
+| Claude Code's own worktree isolation | `"This session is isolated in the worktree …"`, arriving as a tool **error**, not a hook denial | nowhere. No repository can change it — see below |
+
+**Grep the refusal against the repo's committed hooks before writing "fix it upstream".**
+Both of them, and only the ones this repository actually has: if the words are in neither
+file, neither of these hooks said them.
+
+### What `EnterWorktree` costs
+
+Entering is what the loop above asks for, and it buys a real thing: Claude Code enforces
+the boundary itself from that moment, and the session reports the worktree as its `cwd`
+rather than going on advertising the main checkout to every other session.
+
+It is also a **second** gate on top of this guard, and it refuses more than the boundary.
+It rejects every compound command it cannot statically verify — a heredoc, a pipe, a `for`
+loop over two `curl` calls, an `echo "$VAR"` — including ones that touch no git and no path
+outside the worktree and could not leave it by construction. And it refuses every `cd` to
+the main checkout, including the legitimate one: removing a *sibling* worktree, which
+nothing inside that worktree can do for itself.
+
+```
+This session is isolated in the worktree <path>, but this command is too complex to
+verify that it stays inside the worktree; break it into plain, separate commands.
+```
+
+Measured: five refusals across four sessions in one repository, one call and one rewrite
+each. If you are isolated and hit it — one command per call, a pipe counts as complexity,
+the Write tool replaces a heredoc, and `git worktree remove ../<sibling>` is the relative
+spelling that does the same job as the `cd` it refuses.
+
+**A repository may decide the trade is not worth it**, and one has: where the guard is
+installed, it already judges the *path a write targets*, so a session that never entered
+still cannot write in the main checkout. Such a repository declares
+`"delivery": {"enterWorktree": false}` (see
+[references/guard-internals.md](references/guard-internals.md#configuration)), and every
+message the guard prints then stops naming `EnterWorktree`. In one, work in the tree by
+path — better still, start the session inside it, since entering mid-session pays the cold
+start twice.
+
+**Absent that declaration, enter.** This is a repository's decision to record, not a
+session's to make on the day, and none of the above is licence to `cd` instead of entering
+in a repository that has not made it. The refusals are a cost to know about when you meet
+one, and they are the reason the declaration exists at all.
+
+**In a repository that has made it, read the next paragraph, because "by path" does not
+work for git.**
+
+### Working in a worktree by path: `cd` once, alone, spelled out
+
+Write and Edit are judged on the path they target, so they work on a worktree from a
+session sitting anywhere. **`git` is judged on the directory the command runs in**, and
+this guard works that out by reading the command's *tokens* — so a `cd` or a `-C` whose
+argument is a shell **variable** is unreadable, the hook falls back to the tool's cwd, and
+the call is denied as though it were in the main checkout:
+
+```
+Denied: `git add` does not run in the main checkout.
+```
+
+Both `cd "$W" && git add <paths>` and `git -C "$W" add <paths>` are denied, and neither is
+a wrong denial — `git -C "$W" switch` is the guard's own worked example of a directory
+argument it cannot read. The variable is the trap, not the `cd`. What works is one call
+that is **only** `cd /full/literal/path`, with no `&&` and no variable; the tool's cwd
+persists, so every later `git` in that session resolves inside the tree.
 
 `git stash` is denied in worktrees too, and that is not an oversight: `refs/stash` is a
 single stack for the whole repository, so a push in one worktree renumbers every other
@@ -566,6 +826,44 @@ same goes for `CLAUDE_WORKTREE_GATE=warn`, which reports without denying and is 
 operator watches what a repo would block before committing to it. So if a denial is
 provably wrong, the move that works is to say so plainly in your reply — what you were
 doing, what it blocked, why the guard is wrong — and stop.
+
+## When the rule was already broken
+
+The guard has holes by design, and each one is defended somewhere above: it **fails open**
+on every question it cannot answer, it sees only Claude's own tool calls, `warn` reports
+without denying, and new hooks apply only to sessions started after the install. So
+arriving in the state this protocol exists to prevent — a write in the main checkout, two
+sessions in one tree — does not mean anything went wrong with the guard, and it is worth
+knowing the move before you need it. Both of them are the opposite of the instinct.
+
+**Never put back a `HEAD` you moved by accident.** A session that finds it has moved the
+shared tree — checked out a branch there, left it somewhere new — **says which command it
+ran and stops.** It does not restore anything, and it does not go looking through the
+reflog for the value to restore. "Back" is not knowable from inside one session: the value
+you are trying to return to is another session's, you cannot see what that session had, and
+a wrong guess silently swaps the files under a live worker — which is the failure this whole
+protocol is built to prevent, arriving disguised as the repair for it. Two sessions each
+guessing leaves the tree somewhere neither of them intended, with the second guess hiding
+the first. The session that owns the branch is the only one that can put it back, and it can
+only do that if it is told. Reporting it is therefore the fix and not the preamble to one.
+
+**If you find mid-change that you have been sharing a tree, move rather than finish.**
+The instinct is to get to a stopping point first, and it is wrong in the direction that
+costs most: the shared tree gets worse with every file written, and untangling it happens
+later, when nobody can still say which hunk was whose. So stop where you are, **commit**
+what is genuinely yours — never stash it, `refs/stash` is one stack for the whole
+repository and the entry a later `pop` takes may not be the one you pushed — then cut a
+worktree off the correct base, `git cherry-pick` the commit across, and carry on there.
+A commit is the cheap move here precisely because it is addressable: it belongs to a
+branch, it survives the next session's `git switch`, and it can be named in a reply.
+
+That second one is the recovery for a hazard the protocol does not otherwise close, and a
+repository where more than one agent runs at a time can close it instead of recovering from
+it — see [one worktree, one session](#one-worktree-one-session). The recovery still matters
+there: the hook is opt-in, it fails open, and a claim lapses.
+
+Say both in the reply. An operator who is told which command moved the tree can put it
+back in one step; one who is told nothing pays for it in the next session's diff.
 
 ## What a worktree still does not isolate
 
@@ -588,10 +886,59 @@ hazard rather than an occasional one.
   saturating the same disk.
 - **The work item.** Two agents can happily take the same ticket. Claim it before you
   build — see [references/ticketing.md](references/ticketing.md).
+- **The tree itself, from a second session.** The protocol gives every *change* a tree
+  and says nothing about who is in it. Two agents in one worktree share its build output,
+  its dev server, its port and its `git status`, and none of that raises an error — see
+  below.
 - **Shared insert points in docs.** An append-ordered changelog or a hand-maintained
   index conflicts on every branch. Prefer one file per entry with a generated index, and
   keep doc edits to the narrowest diff, in one commit, last. **One file per entry does not
   finish the job** — see below, because the generated index is itself a shared insert point.
+
+## One worktree, one session
+
+Everything above isolates **changes**. Nothing in it isolates **sessions**, and two agents
+in one worktree pass every check the guard makes: the tree is a linked worktree, it is not
+on the integration branch, its PR has not merged.
+
+Measured, 2026-08-25, two sessions sharing one frontend worktree for half an hour:
+
+- both dev servers wrote the same build output directory, and both died mid-run;
+- one session's dev server took the port from the one already there;
+- one session's screenshot run captured the other's uncommitted edit, so the "after" image
+  it delivered was of a change it did not author;
+- the app's auth cookies were host-scoped rather than port-scoped, so switching role on one
+  server switched it on the other.
+
+**None of that raises an error.** It produces a screenshot that is wrong, and the ordinary
+reading of a wrong screenshot is that the code is wrong — so the cost is not the collision,
+it is the hour spent debugging the change it framed.
+
+`worktree_owner.py` is a second hook that closes it. Opt in per repo:
+
+```bash
+python .claude/scripts/install.py --repo . --session-ownership
+```
+
+The first write into a linked worktree claims it. A **different** session's write into a
+claimed tree is denied, with the command that cuts it one of its own. What it does not do
+is the load-bearing half:
+
+- **Reading another tree is untouched.** Comparing two branches on disk is ordinary work,
+  and a hook that refused it is a hook someone turns off — after which nothing is enforced
+  at all. Only the file tools and the commands that build, serve or write are refused.
+- **`git` is left to the guard.** Its rules are per-tree, not per-session, and one piece
+  of state gets one owner.
+- **A claim lapses; it does not lock.** Liveness is the owner's transcript mtime, which
+  every turn touches, so a session that is working is never more than a turn from fresh and
+  one that was killed frees its tree in 45 minutes (`CLAUDE_WORKTREE_OWNER_TTL`).
+  `--release <tree>` is the deliberate override, and the denial prints it.
+- **It is a separate script, not an edit to the guard.** The two answer different questions
+  — "is this tree a worktree, on the right branch, not already merged" against "is it
+  *yours*" — and a repo pinning the guard by digest can keep doing that.
+
+Full behaviour, the two-tier command lexing, and what a teardown script should call:
+[references/session-ownership.md](references/session-ownership.md).
 
 ## Generated files: stop resolving what nobody wrote
 
@@ -664,12 +1011,58 @@ worktree is its business even after its branch merges — leave it and say it is
 Claude Code's own periodic sweep already removes subagent and background-session
 worktrees that hold no work.
 
+**`git worktree remove` deregisters first and deletes the files second, and it keeps the
+deregistration when the delete fails.** So the command reports an error, `git worktree
+list` goes clean, the whole checkout is still sitting there, and running the same command
+again refuses with `is not a working tree` — the directory is now the only thing that knows
+it exists, and nothing you would think to run mentions it. Measured 2026-08-28 in the first
+repository to adopt this guard: three leftover directories under `.claude/worktrees/`, one
+of them a full checkout with `node_modules` in it, against a `git worktree list` naming
+only the main checkout. **So check the directory as well as the listing**, and delete it
+yourself — `SessionStart` reports these under a heading of their own, because the remedy
+for a live worktree is the command that fails on a dead one.
+
+Deleting it can fail too, with `Device or resource busy`, while something still holds a
+file inside. It is worth naming what: on the machine this was measured on, four hung
+`gk.exe ai hook` processes — one per commit the session had made, spawned by an editor's
+git-hooks plugin and still alive after the session ended. A busy delete does not become
+unbusy by being retried, so find the holder rather than looping. This is also the cause of
+the leftovers above, one level up: it is what makes the delete half of
+`git worktree remove` fail while the deregistration has already happened.
+
 **What the sweep reports is a merge that was *attempted*.** The marker goes down before
 `gh pr merge` runs, because no hook can tell a merge from one the forge refused, so confirm
 with `gh pr view <n> --json state` before removing anything and read uncommitted changes as
 a merge that did not land. A tree holding an unfinished rebase or merge is left out of the
 report entirely and keeps its right to be edited — conflict resolution is the work, and it
 is the most expensive thing a wrong cleanup could destroy.
+
+### When `git worktree remove` is refused by a lock
+
+`EBUSY: resource busy or locked, rmdir` on the worktree directory, or git's own refusal to
+remove it. **The change has already landed by then** — the merge is first and the teardown
+second, on purpose — so this is never a reason to redo anything, and never a reason to
+stash. Three causes, in the order worth checking:
+
+1. **Your own shell's cwd is inside the tree.** This is the default outcome rather than an
+   edge case, because the teardown is run from the worktree. `cd` to the main checkout in a
+   call of its own, then remove it.
+2. **A server or watcher you started in it.** A `cmd &` inside one tool call does not
+   survive the call; a backgrounded *tool* invocation does — stop that one first. A dev
+   server that picked a different port than the one it was asked for is the version of this
+   that wastes an afternoon: check what is actually listening, and confirm the process's
+   command line points into *this* tree before killing it, because the obvious port is
+   often another worktree's.
+3. **A blocking `PreToolUse` hook from some other plugin, hung with the tree as its cwd.**
+   The tell is that the directory is **empty** and still locked: the recursive delete got
+   all the way through and only the top-level directory is held. A `--blocking` hook still
+   alive minutes after the command that spawned it is hung, not working, and killing it
+   loses nothing.
+
+What it is usually *not* is `node_modules` still holding a file, though that does happen
+and does clear: measured, a removal that failed succeeded about a minute later with nothing
+done in between. So a teardown script should retry for a few seconds before reporting. If
+waiting does not clear it, it is one of the three above.
 
 One consequence of cleaning up routinely: worktree **paths get reused**, because the next
 change to the same area wants the same obvious name. The guard's spent marker is keyed by
@@ -719,12 +1112,16 @@ So the levers are on the briefing side:
 ## Reference
 
 - [references/guard-internals.md](references/guard-internals.md) — what the guard checks,
-  its modes, what it deliberately does not cover, and how to debug it.
+  its modes, every key `.claude/worktree-per-change.json` takes, what it deliberately does
+  not cover, and how to debug it.
 - [references/ticketing.md](references/ticketing.md) — working a ticket queue with
   several agents, including Matt Pocock's `to-tickets` → `implement` → `code-review` chain.
 - [references/permissions.md](references/permissions.md) — the two layers that stop this
   protocol and why only one of them is the guard; the allowlist `install.py` writes, entry
   by entry; the prefix-matching traps; and why wrapping a command to hide it from a
   permission layer is the one wrapper never to write.
+- [references/session-ownership.md](references/session-ownership.md) — the opt-in second
+  hook: what it claims, what it refuses, what it deliberately allows, and how a teardown
+  script releases a tree.
 - [references/replacing-a-concurrent-writer-guard.md](references/replacing-a-concurrent-writer-guard.md)
   — migrating a repo that already ships a hook of its own.

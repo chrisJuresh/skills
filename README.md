@@ -57,9 +57,21 @@ New hooks apply to sessions started afterwards, not the one you are in.
 | `--python EXE` | Interpreter to run the guard with, where `python` is not on `PATH` |
 | `--keep-legacy` | Leave a predecessor concurrent-writer guard registered instead of replacing it |
 | `--no-skill` | Skip the skill link — only if the skill is already installed another way |
+| `--settings-file NAME` | Register in a different settings file, e.g. `settings.local.json` |
+| `--guard-root DIR` | Keep the guard and `land.py` in `DIR` and reference them absolutely |
+| `--worktrees-root PATH` | Where this repo's worktrees go, quoted in the guard's remedy text |
+| `--session-ownership` | Also install `worktree-owner.py`: one worktree, one session. **Off by default** |
 
 Omit `--repo` to install at user scope for every repository on the machine; it applies one
 integration branch to repos that may not share it, so prefer per-repo.
+
+Some repositories cannot take the commit at all — a shared checkout where this would change
+what a *colleague's* session is allowed to do in their own working directory. There,
+`--settings-file settings.local.json --guard-root <dir>` gives a real install with nothing
+added to the repo. The catch is worth knowing before you choose it: a worktree is a checkout
+of tracked files, so an untracked settings file is absent from every worktree, and whatever
+creates worktrees has to write one into each of them. The installer says so, and `--status`
+marks it.
 
 Requires Python 3 and git. No third-party packages.
 
@@ -73,8 +85,17 @@ Requires Python 3 and git. No third-party packages.
   every time" a rule rather than a habit
 - `git stash`, **everywhere** — `refs/stash` is one stack shared by every worktree, so it is
   the one hazard a worktree looks like it isolates and does not
+- a merge into a branch the repo named in `protectedMergeTargets` — empty by default, and
+  for the repository whose trunk takes reviewed PRs. `land.py` stops at the open PR there
+  too, so opting in cannot be undone by typing `gh pr merge` instead
 
 A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most.
+
+With `--session-ownership`, a second hook adds one more denial: **a write into a worktree
+another live session is holding.** The guard isolates changes and has nothing to say about
+sessions — two agents in one tree pass every check above, share its build output, its port
+and its `git status`, and none of it raises an error. Reads are untouched, `git` is left to
+the guard, and a claim lapses once its session has been quiet for 45 minutes.
 
 Everything else proceeds: every read, `push`, `fetch`, `log`, `diff`, `status`, `branch`,
 `git worktree`, `stash list`, every `gh` call, and every edit in a live worktree on its own

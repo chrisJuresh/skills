@@ -7,3 +7,8 @@ __pycache__/
 
 .DS_Store
 Thumbs.db
+
+# A worktree of this repo, created under worktree-per-change. Its tracked files
+# would otherwise show up as an untracked entry here, and a `git add -A` stages
+# it as an embedded-repo gitlink that no clone can resolve.
+.claude/worktrees/

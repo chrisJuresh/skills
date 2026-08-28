@@ -191,6 +191,67 @@ def worktree_at(repo: Path, name: str, branch: str, merged: bool = True) -> Path
     return tree
 
 
+def build_published(root: Path) -> tuple[Path, Path, Path, Path]:
+    """A repo with a real `origin`, whose default branch has diverged from its
+    integration branch — plus the three worktrees that tell the `Stop` gate's cases apart.
+
+    The divergence is the whole fixture. `origin/development..HEAD` counts it in every
+    worktree cut from `main`, which is what the harness cuts, so a gate reading only that
+    fired at every `Stop` in a session that had delivered everything it did — and the five
+    steps it then prescribed would have squash-merged the divergence onto `development`.
+
+    A real bare remote rather than a hand-written `refs/remotes/…`: the whole question is
+    what git considers published, and a faked ref would let a broken `--not --remotes`
+    keep passing.
+    """
+    remote = root / "origin.git"
+    git(root, "init", "--bare", "-q", str(remote))
+
+    published = root / "published"
+    published.mkdir()
+    git(published, "init", "-b", "main")
+    git(published, "config", "user.email", "t@example.com")
+    git(published, "config", "user.name", "t")
+    (published / "README.md").write_text("hello\n", encoding="utf-8")
+    git(published, "add", "README.md")
+    git(published, "commit", "-m", "init")
+    git(published, "branch", "development")
+    # The commit `main` has and `development` has not — published, and nobody's to deliver.
+    (published / "main-only.txt").write_text("main moved on\n", encoding="utf-8")
+    git(published, "add", "main-only.txt")
+    git(published, "commit", "-m", "main moves on")
+
+    claude = published / ".claude"
+    claude.mkdir()
+    (claude / "worktree-per-change.json").write_text(
+        json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+    )
+    git(published, "remote", "add", "origin", str(remote))
+    git(published, "push", "-q", "origin", "main", "development")
+
+    # What the harness cuts when nobody passes it a base: a tree on the DEFAULT branch.
+    harness = published / ".claude" / "worktrees" / "harness"
+    git(published, "worktree", "add", str(harness), "-b", "claude/objective-lalande", "main")
+
+    # Real undelivered work: a commit on no remote at all.
+    unpushed = published / ".claude" / "worktrees" / "unpushed"
+    git(published, "worktree", "add", str(unpushed), "-b", "a-real-topic", "development")
+    (unpushed / "work.txt").write_text("the work\n", encoding="utf-8")
+    git(unpushed, "add", "work.txt")
+    git(unpushed, "commit", "-m", "the work")
+
+    # Pushed, and still not on the integration branch — the other real case, and the one
+    # a bare `HEAD --not --remotes` would go quiet on.
+    onremote = published / ".claude" / "worktrees" / "onremote"
+    git(published, "worktree", "add", str(onremote), "-b", "a-pushed-topic", "development")
+    (onremote / "pushed.txt").write_text("pushed\n", encoding="utf-8")
+    git(onremote, "add", "pushed.txt")
+    git(onremote, "commit", "-m", "pushed work")
+    git(onremote, "push", "-q", "-u", "origin", "HEAD")
+
+    return published, harness, unpushed, onremote
+
+
 def leave_unfinished_rebase(onbase: Path, tree: Path) -> None:
     """Leave a real, unfinished rebase in `tree` — the state a refused merge is fixed from.
 
@@ -544,6 +605,120 @@ def main() -> int:
             "",
         )
 
+        # --- where the remedy sends you ----------------------------------------
+        # The path in the remedy is the one thing the guard says that a session then
+        # ACTS on, and it is the one thing the guard cannot verify: whether a directory
+        # is a worktree is a stat on `.git`, so a wrong path here denies nothing and
+        # breaks nothing — it just sends the next session to make untracked files in a
+        # repo that does not ignore them. Hence a config key, and hence these two.
+        check(
+            "the remedy names the default worktrees root when the repo says nothing",
+            ".claude/worktrees/<name>" in reason(run(write(repo, str(repo / "README.md")))),
+            True,
+        )
+        config = repo / ".claude" / "worktree-per-change.json"
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "worktreesRoot": "../trees/repo"}),
+            encoding="utf-8",
+        )
+        relocated = reason(run(write(repo, str(repo / "README.md"))))
+        check(
+            "a repo that puts its worktrees elsewhere gets its own path in the remedy",
+            "../trees/repo/<name>" in relocated,
+            True,
+        )
+        check(
+            "and the path it has ruled out is not also offered",
+            ".claude/worktrees/<name>" in relocated,
+            False,
+        )
+        # Restored, because every check after this one reads the default remedy.
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+
+        # --- a protected merge target ------------------------------------------
+        # The other half of the same rule land.py enforces. Without this, opting a repo
+        # in would only redirect the well-behaved path and leave `gh pr merge` typed by
+        # hand as an open shortcut straight onto the trunk.
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "protectedMergeTargets": ["development"]}),
+            encoding="utf-8",
+        )
+        check(
+            "`gh pr merge` into a protected branch is denied",
+            decision(run(shell(topic, "gh pr merge --squash"))),
+            "deny",
+        )
+        denial = reason(run(shell(topic, "gh pr merge --squash")))
+        check("the denial names the branch", "development" in denial, True)
+        check("and points at push-and-open instead", "gh pr create --base" in denial, True)
+        check(
+            "it is refused in the main checkout too, not only in a worktree",
+            decision(run(shell(repo, "gh pr merge 12 --squash"))),
+            "deny",
+        )
+        # A denied merge never ran, so the worktree must NOT be spent by it — spending it
+        # here would strand a live change in a tree the guard then refuses to edit, and
+        # the change would need a new worktree to finish something that never started.
+        # Asked of a FRESH tree: `topic` was already spent by the allowed merge above,
+        # and a spent tree would answer "deny" for a reason that has nothing to do with
+        # this — which is exactly how this check would pass while the ordering was wrong.
+        unspent = repo / ".claude" / "worktrees" / "unspent"
+        git(repo, "worktree", "add", str(unspent), "-b", "unspent-topic", "development")
+        check(
+            "the fresh tree starts writable",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        check(
+            "the merge is denied there too",
+            decision(run(shell(unspent, "gh pr merge --squash"))),
+            "deny",
+        )
+        check(
+            "a denied merge does not spend the worktree",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        # `land.py` reaches the same merge, so the same refusal has to reach it. It was
+        # invisible to the phrase-matching this check used to do, which would have left
+        # the route SKILL.md recommends as the way past a rule the repo opted into.
+        check(
+            "the declared delivery script is refused too",
+            decision(run(shell(unspent, "python .claude/scripts/land.py"))),
+            "deny",
+        )
+        check(
+            "and refusing it does not spend the tree either",
+            decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        # The protected check reads the same parse as the mark, so prose costs nothing
+        # here for the same reason it costs nothing there.
+        check(
+            "quoting the phrase is not attempting a merge",
+            decision(run(shell(unspent, "grep -rn 'gh pr merge' docs/"))),
+            "allow",
+        )
+        # Unrelated gh calls are untouched; this is not a block on `gh`.
+        check(
+            "`gh pr create` is unaffected",
+            decision(run(shell(topic, "gh pr create --base development --fill"))),
+            "allow",
+        )
+        # Restored, because every check after this one expects the unprotected default.
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+        check(
+            "with nothing configured `gh pr merge` is allowed again",
+            decision(run(shell(topic, "gh pr merge --squash"))),
+            "allow",
+        )
+
         # --- modes and fail-open ------------------------------------------------
         check(
             "`off` disables it",
@@ -692,6 +867,48 @@ def main() -> int:
             "deny",
         )
 
+        # --- a teardown that deregistered and then could not delete -------------
+        # `git worktree remove` drops the registration first and deletes the files second,
+        # so a delete that fails — a held file, a `node_modules` nothing will let go —
+        # leaves a directory git no longer knows about. Measured 2026-08-28 in the first
+        # repository to adopt this guard: three of them under one `.claude/worktrees/`, one
+        # a full checkout with dependencies installed, while `git worktree list` named only
+        # the main checkout. The sweep had been asking every new session since to run the
+        # command that had already run and now refuses with `is not a working tree`.
+        gone = worktree_at(repo, "gone", "dev/gone")
+        (gone / "node_modules").mkdir()
+        (gone / ".git").unlink()
+        git(repo, "worktree", "prune")
+        left = run({"session_id": "c8", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        body = json.dumps(left or {})
+        heading = body.find("no longer worktrees")
+        check(
+            "the sweep still names a directory git has let go of",
+            names(left, gone),
+            True,
+        )
+        check(
+            # Under the other heading the remedy is `git worktree remove`, which is the one
+            # command that cannot work here — so which list it lands in is the whole point.
+            "and files it where the remedy is deleting the directory, not removing a worktree",
+            heading != -1 and body.find(json.dumps(str(gone))[1:-1]) > heading,
+            True,
+        )
+        check(
+            "the marker does not survive a tree that is only a directory",
+            spent_marker_for(repo, gone).exists(),
+            False,
+        )
+        # The path is not reusable until somebody deletes the directory, which is the
+        # remedy the new heading asks for; once they have, the name has to be free again.
+        shutil.rmtree(gone)
+        reused = worktree_at(repo, "gone", "dev/gone-again", merged=False)
+        check(
+            "so the next worktree to take that name is not born spent",
+            decision(run(write(reused, str(reused / "README.md")))),
+            "allow",
+        )
+
         # --- a merge the forge refused ------------------------------------------
         # The marker goes down BEFORE `gh pr merge` runs, because no after-hook can tell a
         # merge from a merge that failed. That was called the harmless direction while only
@@ -755,6 +972,173 @@ def main() -> int:
             "the sweep still names a landed tree with nothing in progress",
             names(swept_mid, still),
             True,
+        )
+
+        # --- what counts as running the merge ------------------------------------
+        # The mark used to be a regex over the whole command string, so a command that
+        # merely *contained* the phrase spent the worktree. Measured 2026-08-22: a session
+        # writing this protocol's own docs was denied its next edit, with no PR anywhere.
+        quoting = worktree_at(repo, "quoting", "dev/quoting", merged=False)
+        run(shell(quoting, 'grep -rn "gh pr merge" docs/'))
+        check(
+            "grepping for the merge phrase does not spend the worktree",
+            decision(run(write(quoting, str(quoting / "a.txt")))),
+            "allow",
+        )
+        run(shell(quoting, "echo gh pr merge"))
+        check(
+            "the phrase as another command's argument does not spend it",
+            decision(run(write(quoting, str(quoting / "a.txt")))),
+            "allow",
+        )
+        run(shell(quoting, "cat > docs/contract.md <<EOF\n| guard | gh pr merge ran |\nEOF"))
+        check(
+            "a heredoc writing a document that quotes the phrase does not spend it",
+            decision(run(write(quoting, str(quoting / "a.txt")))),
+            "allow",
+        )
+        # `--repo o/r` puts a flag's VALUE in front of the subcommand, so a reading that
+        # only skipped tokens starting with `-` would miss the merge entirely.
+        run(shell(quoting, "gh --repo o/r pr merge --squash"))
+        check(
+            "`gh pr merge` behind a flag with a value still spends it",
+            decision(run(write(quoting, str(quoting / "a.txt")))),
+            "deny",
+        )
+
+        # `land.py` is the delivery route SKILL.md recommends, and the regex never saw it:
+        # the command string holds no `gh pr merge`, so the supported path left no mark.
+        landing = worktree_at(repo, "landing", "dev/landing", merged=False)
+        run(shell(landing, "python .claude/scripts/land.py"))
+        check(
+            "land.py spends the worktree it delivered from",
+            decision(run(write(landing, str(landing / "a.txt")))),
+            "deny",
+        )
+
+        # The mark belongs on the tree the merge RAN IN. Measured 2026-08-23: a session
+        # merged another worktree with a leading `cd` and marked its own tree instead —
+        # refusing its own Stop, and leaving the tree that merged editable.
+        merging = worktree_at(repo, "merging", "dev/merging", merged=False)
+        elsewhere = worktree_at(repo, "elsewhere", "dev/elsewhere", merged=False)
+        run(shell(merging, f'cd "{elsewhere}" && gh pr merge --squash'))
+        check(
+            "a merge run in another worktree marks that worktree",
+            decision(run(write(elsewhere, str(elsewhere / "a.txt")))),
+            "deny",
+        )
+        check(
+            "and does not mark the tree the session was sitting in",
+            decision(run(write(merging, str(merging / "a.txt")))),
+            "allow",
+        )
+
+        # --- the Stop gate counts what is undelivered, not what is unmerged -------
+        published, harness, unpushed, onremote = build_published(root)
+        check(
+            "Stop does not block on the default branch's divergence",
+            decision(run({"session_id": "p1", "hook_event_name": "Stop", "cwd": str(harness)})),
+            "allow",
+        )
+        held = run({"session_id": "p2", "hook_event_name": "Stop", "cwd": str(unpushed)})
+        check("Stop still blocks on a commit that is on no remote", decision(held), "block")
+        check(
+            "and says that is what it counted",
+            "on no remote" in (held or {}).get("reason", ""),
+            True,
+        )
+        waiting = run({"session_id": "p3", "hook_event_name": "Stop", "cwd": str(onremote)})
+        check(
+            "Stop blocks on a branch pushed but never landed",
+            decision(waiting),
+            "block",
+        )
+        check(
+            "and names the pushed branch rather than calling it disk-only",
+            "origin/a-pushed-topic" in (waiting or {}).get("reason", ""),
+            True,
+        )
+
+        # --- a repository may name its own delivery -------------------------------
+        config = published / ".claude" / "worktree-per-change.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "integrationBranch": "development",
+                    "delivery": {
+                        "command": "pnpm feature land",
+                        "teardown": "pnpm feature clean <name>",
+                        "enterWorktree": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        declared = (
+            run({"session_id": "p4", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        ).get("reason", "")
+        check("the block names the repository's own delivery command",
+              "pnpm feature land" in declared, True)
+        check("and does not prescribe a pull request it does not open",
+              "gh pr create" in declared, False)
+        check("its teardown is the declared one, with the worktree's name filled in",
+              "pnpm feature clean unpushed" in declared, True)
+        check("and it does not prescribe a step the repository cannot reach",
+              "ExitWorktree" in declared, False)
+        briefing = run({"session_id": "p5", "hook_event_name": "SessionStart", "cwd": str(published)})
+        context = ((briefing or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        check("SessionStart states the declared protocol",
+              "pnpm feature land" in context, True)
+        check("and tells a by-path repository how a `cd` has to be spelled",
+              "in a command of its own" in context, True)
+
+        # The default is what every repository that has declared nothing still gets.
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+        default = (
+            run({"session_id": "p6", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        ).get("reason", "")
+        check("an undeclared repository still gets the PR protocol",
+              "gh pr create --base development" in default, True)
+        check("and still gets the ExitWorktree step",
+              "ExitWorktree" in default, True)
+
+        # --- a protected target changes what "delivered" means -------------------
+        # Where the repository has declared that no session merges into the integration
+        # branch, a pushed topic branch IS the finished state: the session committed,
+        # pushed, opened the PR and handed it to a person. Counting it as undelivered
+        # refuses `Stop` twice in a session that followed the protocol exactly — the same
+        # shape of wrong gate as counting `origin/<branch>..HEAD` was.
+        config.write_text(
+            json.dumps({"integrationBranch": "development",
+                        "protectedMergeTargets": ["development"]}),
+            encoding="utf-8",
+        )
+        check(
+            "Stop lets a pushed, unmerged branch end where the target is protected",
+            decision(run({"session_id": "p7", "hook_event_name": "Stop", "cwd": str(onremote)})),
+            "allow",
+        )
+        # Unpushed work is undelivered under any repository's rules, so that half stands.
+        guarded = run({"session_id": "p8", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        check(
+            "but an unpushed commit still holds the session open",
+            guarded.get("decision"),
+            "block",
+        )
+        check(
+            "and the steps stop at the open PR rather than prescribing a denied merge",
+            "gh pr merge" in guarded.get("reason", ""),
+            False,
+        )
+        check(
+            "saying so, so the session knows the PR is the end of its job",
+            "Leave the pull request open" in guarded.get("reason", ""),
+            True,
+        )
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
         )
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
