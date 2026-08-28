@@ -109,6 +109,127 @@ DELIVERY = [
 ]
 
 
+# The two files this protocol needs that git will not carry for it, and that no hook can
+# supply. Both are about what a worktree does *not* get, which is why installing the guard
+# without them leaves a repository that fails in ways nothing on disk explains.
+#
+# `.gitignore`: the installer is what names `.claude/worktrees/` as where worktrees go, so
+# the installer is what creates this hazard. A worktree is a checkout of the repository
+# inside itself, and a `git add -A` that catches one commits it as a gitlink no clone can
+# resolve. Measured in the first repository to adopt this guard: it arrived with exactly
+# that already in its history, committed by an earlier session, and the ignore had to be
+# added by hand before the next `git add -A` did it again.
+#
+# `.worktreeinclude`: `settings.local.json` holds this machine's permission mode and is
+# ignored, so no worktree gets it and every worktree falls back to the default. What that
+# looks like from inside is the protocol's own writes being refused for no visible reason
+# -- measured 2026-08-15 in the same repository, `git add` allowed in one worktree and
+# denied in the next one cut minutes later, which reads as the tool being broken rather
+# than as a file being missing. It is the one ignored-but-required file every repo running
+# this guard has, because the guard is what makes those writes necessary.
+IGNORE_ENTRIES = (".claude/worktrees/", ".claude/settings.local.json")
+# Why each one, for the `--status` report. They are ignored for entirely different
+# reasons and a single message for both would be wrong about one of them.
+IGNORE_WHY = {
+    ".claude/worktrees/":
+        "a `git add -A` over a live worktree commits it as a gitlink no clone can resolve",
+    ".claude/settings.local.json":
+        "this machine's permission mode is not everybody's, and committing it hands it to them",
+}
+IGNORE_NOTE = """
+# Every change gets its own worktree under here, so each one is a checkout of this
+# repository inside itself -- a `git add -A` that catches one commits it as a gitlink
+# no clone can resolve. settings.local.json is this machine's permission mode, which
+# is nobody else's. The guard itself stays TRACKED: .claude/settings.json,
+# .claude/hooks/ and .claude/worktree-per-change.json, because a worktree only gets a
+# file if git puts it there.
+"""
+
+INCLUDE_PATH = ".worktreeinclude"
+INCLUDE_ENTRIES = (".claude/settings.local.json",)
+INCLUDE_NOTE = """
+# Untracked files copied into every new worktree.
+#
+# A worktree is a fresh checkout of tracked files and nothing else, so anything
+# .gitignore covers is simply absent from it, and the failure looks like the tool being
+# broken rather than the file being missing. settings.local.json is this machine's
+# permission mode: without it a new worktree falls back to the default and the
+# protocol's own writes start being refused.
+"""
+
+
+# A path git will not find, so `core.excludesFile` contributes nothing to the answer
+# below. Any string that cannot be a real file does; this one says why it is there.
+NO_GLOBAL_EXCLUDES = "core.excludesFile=/dev/null/worktree-per-change-no-such-file"
+
+
+def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
+    """Which of `entries` this repository itself does not already ignore.
+
+    Asked of git rather than of the file, so a repo that already covers them under a
+    broader pattern does not collect a redundant line.
+
+    **The machine's own ignores are excluded from the answer on purpose.** The question
+    is whether the *repository* carries the rule, and a global `core.excludesFile` is not
+    the repository: measured on the machine this was written on, whose global ignore
+    already names `**/.claude/settings.local.json`, the honest check reported nothing
+    missing and the installed repo went out to everyone else without the entry. That is
+    the same shape as a hash of the working copy being true only where it was computed --
+    right on the machine that installed, false everywhere the file actually travels.
+
+    `.git/info/exclude` is still counted, and is the one remaining way to get a false
+    negative here. It is left in because it is at least a decision somebody made about
+    this checkout, and git offers no flag to switch it off.
+
+    The entry is probed exactly as it is written, trailing slash included: a `foo/`
+    pattern matches directories only, and git decides what a path *is* by looking at the
+    disk, so probing `foo` for a directory that does not exist yet answers no.
+    """
+    try:
+        present = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        present = []
+    missing = []
+    for entry in entries:
+        if entry in present or entry.rstrip("/") in present:
+            continue
+        # `check-ignore` exits non-zero when the path is not ignored, which `git()`
+        # returns as None. A git that cannot answer at all lands in the same branch, and
+        # a line that turns out to have been redundant is the cheap way to be wrong.
+        if git(repo, "-c", NO_GLOBAL_EXCLUDES, "check-ignore", "-q", entry) is not None:
+            continue
+        missing.append(entry)
+    return missing
+
+
+def missing_includes(repo: Path, entries=INCLUDE_ENTRIES) -> list[str]:
+    """Which of `entries` are not already listed in `.worktreeinclude`."""
+    try:
+        present = (repo / INCLUDE_PATH).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        present = []
+    listed = {line.strip() for line in present if line.strip() and not line.startswith("#")}
+    return [entry for entry in entries if entry not in listed]
+
+
+def append_block(path: Path, note: str, entries: list[str]) -> None:
+    """Append `note` and `entries` to `path`, leaving every byte already there alone.
+
+    Appended as bytes on purpose. `write_text` translates newlines, so reading a file
+    with LF endings and writing it back on Windows rewrites every existing line to CRLF
+    -- a one-line addition arriving as a whole-file diff, in the file most likely to be
+    under review at the time.
+    """
+    try:
+        existing = path.read_bytes()
+    except OSError:
+        existing = b""
+    tail = b"" if not existing or existing.endswith(b"\n") else b"\n"
+    body = (note.lstrip("\n") + "\n".join(entries) + "\n").encode("utf-8")
+    with path.open("ab") as handle:
+        handle.write(tail + (b"\n" if existing else b"") + body)
+
+
 def rule(command: str) -> str:
     """The settings.json spelling of an allowlist entry.
 
@@ -484,6 +605,21 @@ def report_status(user_root: Path, repo: Path | None) -> int:
     print(f"integrates through: {branch}")
     print(f"cwd is: {'a worktree — writes allowed' if linked else 'the MAIN CHECKOUT — writes denied'}")
 
+    # Both of these are silent when wrong, and neither is repaired by anything the guard
+    # does at runtime — a repo installed before the installer wrote them has to be told.
+    # Only asked of a repo that has this guard: elsewhere an unignored `.claude/worktrees/`
+    # is not a finding, it is a directory nothing is going to put a worktree in.
+    installed = (main_root / ".claude" / CONFIG_FILENAME).is_file()
+    unignored = missing_ignores(main_root) if installed else []
+    unincluded = missing_includes(main_root) if installed else []
+    for entry in unignored:
+        print(f"  ! {entry} is not ignored — {IGNORE_WHY.get(entry, 'it should be')}")
+    for entry in unincluded:
+        print(f"  ! {entry} is not in .worktreeinclude — new worktrees fall back to the "
+              "default permission mode, and the protocol's own writes start being refused")
+    if unignored or unincluded:
+        print("    re-running the installer adds them; it appends and does not rewrite")
+
     listing = git(main_root, "worktree", "list", "--porcelain") or ""
     spent_dir = common / STATE_DIRNAME / "spent"
     trees = [line.split(" ", 1)[1] for line in listing.splitlines() if line.startswith("worktree ")]
@@ -598,6 +734,14 @@ def main() -> int:
             except OSError:
                 print(f"leave {linked} in place — remove it by hand if you want it gone")
         print(f"removed the guard from {target}")
+        kept = [name for name in (".gitignore", INCLUDE_PATH)
+                if repo and (repo / name).is_file()]
+        if kept:
+            # Left alone deliberately. Un-ignoring `.claude/worktrees/` is how a stale
+            # checkout ends up committed as a gitlink, and that outlives the guard.
+            print(", ".join(kept)
+                  + (" are" if len(kept) > 1 else " is")
+                  + " left as found — edit by hand if you want the worktree entries gone.")
         return 0
 
     script = guard_path(root)
@@ -634,6 +778,12 @@ def main() -> int:
             # the real run will write rather than a placeholder for it.
             print(f"would write {config}  ->  integrationBranch = {branch}, "
                   f"guard = {json.dumps(provenance(GUARD_SOURCE))}")
+        if repo:
+            for entry in missing_ignores(repo):
+                print(f"would ignore {entry} in {repo / '.gitignore'}")
+            for entry in missing_includes(repo):
+                print(f"would copy {entry} into every new worktree "
+                      f"via {repo / INCLUDE_PATH}")
         for line in removed:
             print(f"would remove predecessor guard  {line}")
         if not args.no_skill:
@@ -663,6 +813,16 @@ def main() -> int:
         synced = blob["guard"].get("syncedFrom")
         print(f"config  -> {config} (integrationBranch = {branch}"
               f"{', syncedFrom ' + synced[:12] if synced else ''})")
+    # Both are appended, never rewritten, and only for what is missing: these are the
+    # repo's own files and are likely to have been curated by hand.
+    ignores = missing_ignores(repo) if repo else []
+    includes = missing_includes(repo) if repo else []
+    if repo and ignores:
+        append_block(repo / ".gitignore", IGNORE_NOTE, ignores)
+        print(f"ignore  -> {repo / '.gitignore'} ({', '.join(ignores)})")
+    if repo and includes:
+        append_block(repo / INCLUDE_PATH, INCLUDE_NOTE, includes)
+        print(f"include -> {repo / INCLUDE_PATH} ({', '.join(includes)})")
     for line in removed:
         print(f"removed predecessor guard  {line}")
     # Same rule as the uninstall path, and it was missing here: no `.bak` beside a
@@ -683,6 +843,10 @@ def main() -> int:
     print("Restart or /reload any running sessions for the hooks to take effect.")
     if repo:
         files = [target, script, config] + ([lander] if lander is not None else [])
+        if ignores:
+            files.append(repo / ".gitignore")
+        if includes:
+            files.append(repo / INCLUDE_PATH)
         print("Commit " + ", ".join(str(p.relative_to(repo)) for p in files)
               + " for everyone working here to get it.")
     return 0

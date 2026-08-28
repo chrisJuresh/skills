@@ -209,6 +209,20 @@ reaches it. It lists landed worktrees still on disk — invisible otherwise, sin
 worktree looks exactly like an in-progress one in `git worktree list` — and, in the same
 pass, deletes markers whose tree is gone.
 
+**A directory whose worktree was deregistered is not "still on disk", and it gets a heading
+of its own.** `git worktree remove` deregisters first and deletes second, and keeps the
+deregistration when the delete fails, so the leftover is a directory git has already let go
+of. Reporting it beside the live ones asks for `git worktree remove`, which is the command
+that has already run and now refuses with `is not a working tree` — a remedy that cannot
+work, offered every session, which is how a report stops being read. The test is the same
+single stat everything else here turns on: `.git` is a *file* in a linked worktree, and a
+directory git has released does not have one at all. Those markers are dropped like any
+other whose tree is gone, because the tree is gone; what is left is a directory, and the
+message for it says to delete it. Measured 2026-08-28, in the first repository to adopt
+this guard: three of them under one `.claude/worktrees/`, one a full checkout with
+`node_modules` in it, while `git worktree list` named only the main checkout — and one had
+been in every new session's context since the day it was left.
+
 It blocks at most **twice** per session and then lets the session end. A hook that can block
 forever hangs a session, and an agent that has ignored the same instruction twice will not
 take it on the third telling. Every git call that fails resolves to "nothing to hold" —

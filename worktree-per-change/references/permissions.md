@@ -128,6 +128,19 @@ delete`, `gh secret`, `gh auth token`, `git push` in any form but the protocol's
 `git reset`, `git clean`, `git rebase`, `git merge`, `git checkout`, `git switch` other
 than `-c`.
 
+`gh pr merge` is the one an operator will be asked for anyway, because it is the step the
+manual recipe ends on and `land.py` is the only thing that avoids needing it. Measured
+2026-08-21: it was stopped twice on one PR — as `gh pr merge <n> --squash
+--delete-branch=false` and as the plain `gh pr merge <n> --squash` — in a session where
+`git push` and `gh pr create` both went through, which is what the end of this protocol
+looks like from the inside when nobody has granted the last step. If the answer is going
+to be a rule, `Bash(python .claude/scripts/land.py:*)` is the same unblocking at a
+fraction of the grant: `Bash(gh pr merge:*)` merges any PR in any repository the machine
+is authenticated to, on any base, and it is written at user scope where it outlives the
+repo that needed it. An operator who chooses the wide one has made a decision, not a
+mistake — say which one you are asking for and why, rather than asking for "permission to
+merge".
+
 ## Where the rules go
 
 Repo scope (`.claude/settings.json`, committed, beside the hooks) is the usual home: the
@@ -145,6 +158,23 @@ and permitted afterwards.
 Do not build a theory of *when* it stops things. The lesson is narrower and more useful:
 **anything you rely on, write a rule for.** A protocol whose routine steps are decided
 case by case is one that works until the day it does not, in the middle of a change.
+
+**One case of that shape is not the classifier at all, and it is worth ruling out first.**
+`.claude/settings.local.json` holds this machine's permission mode and is ignored, so a
+fresh worktree does not have one and falls back to the default — and the protocol's own
+writes start being refused there while the same command is fine in the worktree next to it.
+Measured 2026-08-15: `git add` allowed in one worktree and denied in the next one cut
+minutes later, which is exactly what unstable judgement looks like from inside and is not.
+`.worktreeinclude` is the fix, `install.py` writes the entry, and `install.py --status`
+says whether a given repo has it. See [the SKILL](../SKILL.md).
+
+**A rule takes effect immediately; a hook does not.** Measured 2026-08-21, adding an entry
+to `~/.claude/settings.json` mid-session: the next call of the command that had just been
+stopped went through, with no restart and no `/reload`. That matters for what you tell the
+operator. A session stopped by this layer is not over — name the exact rule, in the
+spelling `settings.json` wants, say which file to put it in, and the work continues in the
+same session once they have. Hook registrations are the other way round and only apply to
+sessions started afterwards, so do not offer the two in one breath.
 
 That is also why the **read-only** entries belong in `~/.claude/settings.json` and not only
 in each repo. A repo-scoped rule cannot cover a session that has to read another repository

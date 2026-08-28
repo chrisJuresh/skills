@@ -692,6 +692,48 @@ def main() -> int:
             "deny",
         )
 
+        # --- a teardown that deregistered and then could not delete -------------
+        # `git worktree remove` drops the registration first and deletes the files second,
+        # so a delete that fails — a held file, a `node_modules` nothing will let go —
+        # leaves a directory git no longer knows about. Measured 2026-08-28 in the first
+        # repository to adopt this guard: three of them under one `.claude/worktrees/`, one
+        # a full checkout with dependencies installed, while `git worktree list` named only
+        # the main checkout. The sweep had been asking every new session since to run the
+        # command that had already run and now refuses with `is not a working tree`.
+        gone = worktree_at(repo, "gone", "dev/gone")
+        (gone / "node_modules").mkdir()
+        (gone / ".git").unlink()
+        git(repo, "worktree", "prune")
+        left = run({"session_id": "c8", "hook_event_name": "SessionStart", "cwd": str(repo)})
+        body = json.dumps(left or {})
+        heading = body.find("no longer worktrees")
+        check(
+            "the sweep still names a directory git has let go of",
+            names(left, gone),
+            True,
+        )
+        check(
+            # Under the other heading the remedy is `git worktree remove`, which is the one
+            # command that cannot work here — so which list it lands in is the whole point.
+            "and files it where the remedy is deleting the directory, not removing a worktree",
+            heading != -1 and body.find(json.dumps(str(gone))[1:-1]) > heading,
+            True,
+        )
+        check(
+            "the marker does not survive a tree that is only a directory",
+            spent_marker_for(repo, gone).exists(),
+            False,
+        )
+        # The path is not reusable until somebody deletes the directory, which is the
+        # remedy the new heading asks for; once they have, the name has to be free again.
+        shutil.rmtree(gone)
+        reused = worktree_at(repo, "gone", "dev/gone-again", merged=False)
+        check(
+            "so the next worktree to take that name is not born spent",
+            decision(run(write(reused, str(reused / "README.md")))),
+            "allow",
+        )
+
         # --- a merge the forge refused ------------------------------------------
         # The marker goes down BEFORE `gh pr merge` runs, because no after-hook can tell a
         # merge from a merge that failed. That was called the harmless direction while only

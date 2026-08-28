@@ -250,6 +250,16 @@ output, local config and anything else `.gitignore` covers are simply absent:
 - **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
   start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
   and the failure looks like the tool being broken rather than the file being missing.
+- **This machine's permission mode**, which is the case above turned on the protocol
+  itself. `.claude/settings.local.json` is ignored — it is nobody else's business what this
+  machine allows — so a fresh worktree does not have it and falls back to the default mode,
+  and the writes the guard *sent you to a worktree to make* start being refused. Measured
+  2026-08-15: `git add` allowed in one worktree and denied in the next one cut minutes
+  later, with nothing visible from inside either to say why. It reads exactly like the
+  permission layer's unstable judgement (below) and is not — it is a missing file, and the
+  only instance of that shape with a cause you can fix, so check it first. `install.py`
+  now writes the `.worktreeinclude` entry for it; a repo installed before that gets it by
+  re-running the installer, and `--status` says whether it is missing.
 - **The toolchain selection.** A worktree inherits the shell's default interpreter, not the
   repository's pin — an `.nvmrc` is a file, not a shell hook, and a version manager that
   needs one is no help to a session. What makes this awkward rather than routine is that
@@ -266,14 +276,24 @@ output, local config and anything else `.gitignore` covers are simply absent:
 Two ways to fix it, and the second is better for anything a *human* also needs:
 
 - **`.worktreeinclude`** lists untracked paths Claude Code copies into each new worktree.
-  Right for machine-local secrets and caches that must not be committed.
+  Right for machine-local secrets and caches that must not be committed. `install.py`
+  writes it with `.claude/settings.local.json` already in it, and appends rather than
+  replaces, so a repo that keeps its own entries there keeps them.
 - **Un-ignore the file.** If every worktree needs it and it holds nothing private, the
   honest answer is to commit it — a worktree only gets a file if git puts it there. This
   applies to the guard itself: `.claude/settings.json`, `.claude/hooks/worktree-guard.py`
   and `.claude/worktree-per-change.json` must be tracked, or the rule stops applying
   inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
   needs its ignore narrowed to name them, keeping `settings.local.json` and
-  `.claude/worktrees/` out.
+  `.claude/worktrees/` out. **`.claude/worktrees/` stays ignored for a reason of its own:**
+  every worktree there is a checkout of the repository inside itself, and a `git add -A`
+  that catches one commits it as a gitlink no clone can resolve — a directory that is
+  simply empty for everybody who checks the repository out afterwards. The first repository
+  to adopt this guard arrived with exactly that already in its history. `install.py` writes
+  both entries now, and asks git rather than the file, so a repo that already covers them
+  does not collect a second line saying the same thing. What it will not do is read your
+  *machine's* global ignore as an answer: the question is whether the repository carries
+  the rule, and a global `core.excludesFile` is true only where it lives.
 
 A repo that commits the hook should also test it, in its own test suite and idiom — the
 committed copy is what actually runs, and a hook that silently stopped denying looks
@@ -337,9 +357,13 @@ python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --dry-run
 Show the user that output, then run it without `--dry-run`. It copies the guard to
 `.claude/hooks/` and `land.py` to `.claude/scripts/`, registers three hooks and the
 allowlist in the committed `.claude/settings.json`, writes
-`.claude/worktree-per-change.json` with the integration branch, and links this skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all four, and
-check `.gitignore` is not swallowing them.
+`.claude/worktree-per-change.json` with the integration branch, adds `.claude/worktrees/`
+and `.claude/settings.local.json` to `.gitignore` and `.claude/settings.local.json` to
+`.worktreeinclude`, and links this skill into `~/.claude/skills/` so
+`/worktree-per-change` resolves everywhere. Commit all six, and check `.gitignore` is not
+swallowing the four that have to stay tracked. `--uninstall` leaves the `.gitignore` and
+`.worktreeinclude` entries alone and says so — un-ignoring `.claude/worktrees/` is how a
+stale checkout ends up committed, and that outlives the guard.
 
 **It asks which branch changes merge into, and does not guess.** This is the setting that
 is silently wrong: a guard pointed at the wrong integration branch denies nothing and
@@ -373,7 +397,9 @@ the session is actually in. `--python` overrides the interpreter where `python` 
   cannot cover a session that has to read a *different* repository, and installing this
   guard into the next repo is exactly that shape of task.
 - `--status` reports what is installed, which branch this repo integrates through,
-  whether the cwd may write, and every worktree with what it is still holding.
+  whether the cwd may write, every worktree with what it is still holding, and whether the
+  `.gitignore` and `.worktreeinclude` entries are there — which is how a repo installed
+  before the installer wrote them finds out, since nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.
@@ -524,6 +550,25 @@ Remove the ones reported as `clean and landed` that are yours. Another session's
 worktree is its business even after its branch merges — leave it and say it is there.
 Claude Code's own periodic sweep already removes subagent and background-session
 worktrees that hold no work.
+
+**`git worktree remove` deregisters first and deletes the files second, and it keeps the
+deregistration when the delete fails.** So the command reports an error, `git worktree
+list` goes clean, the whole checkout is still sitting there, and running the same command
+again refuses with `is not a working tree` — the directory is now the only thing that knows
+it exists, and nothing you would think to run mentions it. Measured 2026-08-28 in the first
+repository to adopt this guard: three leftover directories under `.claude/worktrees/`, one
+of them a full checkout with `node_modules` in it, against a `git worktree list` naming
+only the main checkout. **So check the directory as well as the listing**, and delete it
+yourself — `SessionStart` reports these under a heading of their own, because the remedy
+for a live worktree is the command that fails on a dead one.
+
+Deleting it can fail too, with `Device or resource busy`, while something still holds a
+file inside. It is worth naming what: on the machine this was measured on, four hung
+`gk.exe ai hook` processes — one per commit the session had made, spawned by an editor's
+git-hooks plugin and still alive after the session ended. A busy delete does not become
+unbusy by being retried, so find the holder rather than looping. This is also the cause of
+the leftovers above, one level up: it is what makes the delete half of
+`git worktree remove` fail while the deregistration has already happened.
 
 **What the sweep reports is a merge that was *attempted*.** The marker goes down before
 `gh pr merge` runs, because no hook can tell a merge from one the forge refused, so confirm
