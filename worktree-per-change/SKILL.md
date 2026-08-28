@@ -560,10 +560,21 @@ swallowing the four that have to stay tracked. `--uninstall` leaves the `.gitign
 `.worktreeinclude` entries alone and says so — un-ignoring `.claude/worktrees/` is how a
 stale checkout ends up committed, and that outlives the guard.
 
-**It asks which branch changes merge into, and does not guess.** This is the setting that
-is silently wrong: a guard pointed at the wrong integration branch denies nothing and
-breaks nothing, it just aims every future PR at a branch nobody merges, and nothing looks
-broken until somebody goes looking for the work. Repos differ on this in ways no
+**A repository that has already answered is not asked again.** The commonest run of this
+installer is not a first install but a **resync**, and everything a repo decided for itself
+survives one: the config is merged rather than replaced, `integrationBranch` is read back
+from the record, `sessionOwnership` keeps whichever answer the repo gave, `worktreesRoot` is
+written only when asked for, and the keys nobody's installer writes — `delivery`,
+`protectedMergeTargets`, `mergeIntegrationBeforeLanding` — are never touched. `--branch` is
+how a repository that has genuinely changed its integration branch says so; nothing else
+moves it. `--status` prints the declarations in effect, which is the other half: a mechanism
+existing is not the same as *this* repository having used it, and that gap is silent
+everywhere else.
+
+**On a first install it asks which branch changes merge into, and does not guess.** This is
+the setting that is silently wrong: a guard pointed at the wrong integration branch denies
+nothing and breaks nothing, it just aims every future PR at a branch nobody merges, and
+nothing looks broken until somebody goes looking for the work. Repos differ on this in ways no
 inspection settles — some integrate through their default branch, others hold changes on
 `development` or a `queue` branch and promote from there — so **ask the user, do not read
 it off `origin/HEAD`.** Measured 2026-08-15: a repo with both `main` and `development` had
@@ -638,10 +649,11 @@ nothing to check.
   cannot cover a session that has to read a *different* repository, and installing this
   guard into the next repo is exactly that shape of task.
 - `--status` reports what is installed — including a local install and the ownership hook
-  — which branch this repo integrates through, whether the cwd may write, every worktree
-  with what it is still holding and which session is holding it, and whether the
-  `.gitignore` and `.worktreeinclude` entries are there, which is how a repo installed
-  before the installer wrote them finds out, since nothing at runtime repairs either.
+  — which branch this repo integrates through, **which of the optional declarations it has
+  made**, whether the cwd may write, every worktree with what it is still holding and which
+  session is holding it, and whether the `.gitignore` and `.worktreeinclude` entries are
+  there, which is how a repo installed before the installer wrote them finds out, since
+  nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.

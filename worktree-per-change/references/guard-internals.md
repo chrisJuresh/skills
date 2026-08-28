@@ -308,7 +308,12 @@ at a time and are otherwise scattered across the two scripts that read them:
 | `protectedMergeTargets` | guard, `land.py` | branches that are pushed to and opened against but **never merged** by a session. Additive only: no key removes a name and no environment variable turns it off, so a repository that has opted in cannot be talked back out of it |
 
 `install.py` **merges** this file rather than replacing it, so every one of these survives a
-resync that the installer knows nothing about.
+resync that the installer knows nothing about — and `integrationBranch`, which it does know
+about, is read back from the record rather than re-asked. That matters more than it sounds:
+a resync is the run that happens repeatedly, and the branch list it would otherwise offer
+names the repository's **default** branch as the obvious answer, which for a repository
+integrating through anything else is exactly the wrong one. `install.py --status` prints
+whichever of these a repository has declared, and says so plainly when it has declared none.
 
 Two of them interact, and the guard reads them together: where the integration branch is a
 `protectedMergeTargets` name, no merge runs from a session at all, so `Stop` counts a pushed
