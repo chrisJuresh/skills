@@ -4,12 +4,13 @@ description: >-
   One change, one worktree, one branch, one merged PR — the protocol for repositories
   where nothing is ever written in the main checkout, and the guard hook that enforces
   it. Use this skill before the first Edit or Write in any repository that has the guard
-  installed, when a write, `git switch`, `git add` or `git stash` is denied, when
-  EnterWorktree cuts from the wrong base, when a change is finished and has to be pushed,
-  merged and then taken down, when a session is refused permission to stop, when a second
-  change starts in a session that already merged one, when a session finds it has already
-  been writing in the main checkout or has moved a shared tree's `HEAD`, and when the user
-  wants this rule installed in a repository or on a machine.
+  installed, when a write, `git switch`, `git add` or `git stash` is denied or a worktree is
+  refused because another session holds it, when EnterWorktree cuts from the wrong base,
+  when a change is finished and has to be pushed, merged and then taken down, when a
+  session is refused permission to stop, when a second change starts in a session that
+  already merged one, when a session finds it has already been writing in the main checkout
+  or has moved a shared tree's `HEAD`, and when the user wants this rule installed in a
+  repository or on a machine.
 ---
 
 # One change, one worktree, one branch, one merged PR
@@ -855,6 +856,11 @@ repository and the entry a later `pop` takes may not be the one you pushed — t
 worktree off the correct base, `git cherry-pick` the commit across, and carry on there.
 A commit is the cheap move here precisely because it is addressable: it belongs to a
 branch, it survives the next session's `git switch`, and it can be named in a reply.
+
+That second one is the recovery for a hazard the protocol does not otherwise close, and a
+repository where more than one agent runs at a time can close it instead of recovering from
+it — see [one worktree, one session](#one-worktree-one-session). The recovery still matters
+there: the hook is opt-in, it fails open, and a claim lapses.
 
 Say both in the reply. An operator who is told which command moved the tree can put it
 back in one step; one who is told nothing pays for it in the next session's diff.
