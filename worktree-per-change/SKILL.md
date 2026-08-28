@@ -142,7 +142,7 @@ you is `gh`'s `--delete-branch` — see below.
 gh pr view <n> --json state --jq .state          # expect MERGED
 #   ExitWorktree with action: "keep"             — puts the SESSION back in the main
 #   checkout; the removal is git's job (see below)
-git worktree remove <path>                       # from the main checkout
+git worktree remove --force <path>               # from the main checkout — see below
 git branch -D <short-topic-name>
 ```
 
@@ -208,6 +208,20 @@ late to mean anything. A genuinely unreachable remote is the one case worth fail
 worth failing loudly, because then the branch's fate is unknowable rather than merely
 unrefreshed.
 
+**`--force`, and do the check it costs you yourself.** Some git versions refuse to remove a
+worktree holding untracked or ignored files, and under this protocol every worktree holds
+them by construction: the dependency install, the build output, and whatever
+`.worktreeinclude` copied in. So the flag is not optional here — but what it switches off
+is git's own last look for work you have not landed. Take that check back explicitly, one
+line earlier, where it can still say something useful:
+
+```bash
+git -C <path> status --porcelain --untracked-files=no   # anything here is unlanded work
+```
+
+Ignored files are the reason for the flag; a *tracked* file with changes in it is a change
+that never landed, and that is a tree to go back into rather than one to clear.
+
 Freeing the worktree before deleting the local branch is right anyway: deleting a branch
 out from under a live worktree leaves the worktree on a detached HEAD and git unsure
 which of the two to believe.
@@ -235,6 +249,53 @@ file **without a BOM** — PowerShell's `Set-Content -Encoding utf8` emits one, 
 the top of the body, and it stops a leading markdown heading from rendering. Use
 `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false))`.
 
+## Squash the topic branch; merge the branch that lives on
+
+`--squash` is right for every PR this protocol opens, because the head branch dies on the
+merge: one commit per change on the integration branch, and nothing ever merges *from* that
+branch again. The rule stops there — and where it stops is a seam this protocol **creates**,
+because an integration branch is a branch somebody afterwards promotes.
+
+**A PR between two branches that both live on afterwards has to be a merge commit.** A
+squash writes a single-parent commit, so the base takes the *content* and none of the
+*ancestry* and the merge base of the two branches never advances. The next PR across that
+seam diffs from the stale base and re-proposes the entire branch. Measured 2026-08-19, on a
+promotion opened two hours after the previous one was squashed: **654 changed files,
++102,594 −3,876, and nine `add/add` conflicts** — every one a phantom, against a tree that
+was byte-identical to the head branch's own tip at the moment the squash landed. There was
+nothing to reconcile and nothing a human could usefully decide.
+
+What makes it expensive is that it is quiet at the moment it happens. The squash merges
+green and looks finished; the bill arrives on the *next* PR, looking like a legitimate
+654-file conflict resolution.
+
+**Repair it by restoring the parent link, never by resolving the conflicts.**
+Hand-resolving yields a tree that was already correct and *still* records no ancestry, so
+the PR after that one explodes the same way. On a branch cut from the side that is behind:
+
+```bash
+git diff <base> <the-squashed-commit's-source-tip>   # must be EMPTY before you start
+git merge -s ours origin/<the-squashed-head>         # records the parent, changes no bytes
+git diff origin/<the-squashed-head> HEAD             # must be EMPTY afterwards
+```
+
+`-s ours` discards the other side wholesale, so it is honest exactly when that side holds
+nothing unique — which is the only thing those two `git diff`s are there to establish.
+Then merge the repair itself **as a merge commit**: squashing it collapses the second
+parent that is its entire reason to exist.
+
+**Enforce it with a rule, not with discipline.** It is one green button among three, pressed
+at the end of a piece of work that is already finished, and discipline was measured failing
+inside a single afternoon — the repair PR for the first squashed seam was itself
+squash-merged, flattening away the parent it had been opened to add. On GitHub a repository
+ruleset over the long-lived bases carrying `allowed_merge_methods: ["merge"]` stops offering
+the other two buttons there, while the integration branch stays outside its conditions and
+goes on squashing. The rule is blunter than the principle — the damage depends on whether
+the *head* survives the merge, and a ruleset can only condition on the *base* — so it also
+forces a merge commit on a dependency bump or a hotfix aimed straight at a protected base,
+where a squash would in fact have been harmless. That costs one extra merge commit on a
+one-commit branch. The looser rule costs the 654 files.
+
 ## What a fresh worktree does not have
 
 This is the cost that changed. Under a rule where worktrees were occasional, setting one
@@ -246,7 +307,10 @@ output, local config and anything else `.gitignore` covers are simply absent:
 
 - **Dependencies.** `node_modules/`, a virtualenv, a `pnpm install`. Some repos dodge
   most of this by committing build output — check before assuming a full install is
-  needed; often only a change that touches source requires one.
+  needed; often only a change that touches source requires one. **Do not pipe the install
+  through `tail` to keep it out of a context window.** A pipeline reports the *last*
+  command's status, so a failed install exits 0 and hands back a checkout whose every
+  later gate result means nothing. `set -o pipefail`, or read `${PIPESTATUS[0]}`.
 - **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
   start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
   and the failure looks like the tool being broken rather than the file being missing.
@@ -266,7 +330,12 @@ output, local config and anything else `.gitignore` covers are simply absent:
 Two ways to fix it, and the second is better for anything a *human* also needs:
 
 - **`.worktreeinclude`** lists untracked paths Claude Code copies into each new worktree.
-  Right for machine-local secrets and caches that must not be committed.
+  Right for machine-local secrets and caches that must not be committed. A path is copied
+  only when it is **both** listed there and gitignored, so it can never duplicate a tracked
+  file. If a setup script of yours reads the same list — and having one list read by both
+  paths is the whole point of it — have that reader take literal paths only and **skip a
+  glob out loud**: `.gitignore` syntax has patterns and negation, and half-honouring one
+  hands back a worktree that is missing a secret and says nothing.
 - **Un-ignore the file.** If every worktree needs it and it holds nothing private, the
   honest answer is to commit it — a worktree only gets a file if git puts it there. This
   applies to the guard itself: `.claude/settings.json`, `.claude/hooks/worktree-guard.py`
@@ -274,6 +343,17 @@ Two ways to fix it, and the second is better for anything a *human* also needs:
   inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
   needs its ignore narrowed to name them, keeping `settings.local.json` and
   `.claude/worktrees/` out.
+
+**Whatever you copy those files *from* is at the revision the operator left the main
+checkout on, which under this protocol is not the integration tip.** The base you cut from
+is fetched, so it is current; the main checkout's *working tree* is not, and a setup
+script, a `.worktreeinclude` or a config read out of it lags the integration branch by
+however much has not been promoted. Measured on the second change ever made under this
+rule: the worktree came out one merge behind and missing the very file that a merged change
+had just added to the list, and the failure read as the tooling being broken. Pull the main
+checkout first, and have a setup script read its *list* from the checkout the script itself
+lives in — the files still come from the main one, but the list comes from the same commit
+as the code reading it.
 
 A repo that commits the hook should also test it, in its own test suite and idiom — the
 committed copy is what actually runs, and a hook that silently stopped denying looks
@@ -324,6 +404,33 @@ something unverified reading as fine. `integration-console`'s
 [`scripts/check-guard.mjs`](https://github.com/third-bridge/hermes-frontend) is a worked
 example. Don't fetch this repo from CI — that puts a third-party's availability on a required
 check — and don't auto-resync, because the suite has to run against the new file first.
+
+## The worktrees live inside the repo, so its own tooling can see them
+
+`.claude/worktrees/<name>` is where `EnterWorktree` puts a tree and what every denial the
+guard prints tells a session to type, so a repository under this rule grows N complete
+copies of itself *inside* itself. Excluding that directory from the repo's own tooling is
+not tidiness: a linter, a formatter, a test runner or a type checker pointed at the root
+will walk every worktree on disk, so the gate slows down with the number of trees standing
+and starts reporting *other branches'* failures as yours.
+
+Each tool has to be told separately, and one of them may already be right for a reason
+worth establishing rather than assuming. Measured on the first repository to adopt this:
+ESLint needed `.claude/**` adding to `ignores` and Prettier needed `.claude/` in
+`.prettierignore`, while the test runner was already safe only because its `include` globs
+name three directories instead of the root. The type checker needed nothing — TypeScript's
+wildcard `include` skips dot-directories — but that was settled with a three-line probe
+rather than read off the docs: drop a deliberately broken file at
+`.claude/worktrees/probe/src/broken.ts`, run the check, watch it stay green. Run the same
+probe for the next tool you point at the tree, and add nothing on faith: a no-op `exclude`
+reads as load-bearing to everyone after you.
+
+**This is also what decides where the guard's own suite goes.** Once `.claude/**` sits
+outside the linter and outside the test glob, a suite placed next to
+`.claude/hooks/worktree-guard.py` never runs again — and a hook whose tests silently
+stopped running looks exactly like a hook that had nothing to deny, which is the failure
+the suite exists to catch. Put it where the repo's runner already looks and let it reach
+across to its subject.
 
 ## Installing it
 
@@ -384,6 +491,38 @@ assume the current session is covered.
 The integration branch has to exist on the remote before the first PR. If the repo
 integrates through a branch it does not have yet, create it from the default branch and
 push it once — and say you did, because it changes what everyone else's PRs target.
+
+### What that branch has to be, and what it must not be
+
+Two properties that sound contradictory, which is why no repository arrives with both, and
+why it is worth settling while the answer to `--branch` is still being decided.
+
+**It must not carry a required status check or a required review.** The whole shape of this
+protocol is a session opening its own PR and merging it on the strength of a gate it ran on
+its own disk. Aim that at a protected branch and every session ends in a waiting loop on CI
+for a verdict it already holds. So the integration branch is ungated for *merging* and sits
+one step removed from the branch that deploys, a human promotes it when a batch is ready,
+and the required check lives on that promotion. Say the consequence out loud to whoever
+adopts this, because it is the thing they will assume the other way round: **a merged agent
+PR has not deployed anything.**
+
+**And it must still be protected against deletion and force-pushes, admins included.**
+Nothing here writes to that branch except merges, so the risk was never a bad commit — it is
+the branch ceasing to exist, and the protocol has no step that survives that. Measured
+2026-08-19: a promotion PR whose *head* was the integration branch merged with
+`--delete-branch`, and the flag did exactly what it says. Nothing failed loudly.
+`git fetch origin <integration>` started answering *"couldn't find remote ref"*, every
+session's first step had no base, and a session holding a stale tracking ref went on
+branching off a tip the remote no longer had. Classic branch protection with
+`allow_deletions: false`, `allow_force_pushes: false` and `enforce_admins: true` — the
+delete came *from* an admin path, so a rule admins bypass would not have stopped it — while
+leaving required checks and required reviews `null`, gates destruction without gating
+merging, which is exactly the split this one branch needs. The delete call is the test,
+because a protected branch refuses it:
+
+```bash
+gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/<integration>   # expect 422
+```
 
 ## When the guard denies you
 
