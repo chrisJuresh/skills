@@ -379,9 +379,24 @@ def choose_branch(repo: Path | None, given: str | None) -> str:
     So it is a question, with the repository's own evidence offered as the answer. When
     there is nobody to ask — a scripted install, CI, a pipe — it refuses instead of
     guessing, because the guess is the failure.
+
+    **A repository that has already answered is not asked again.** The recorded answer
+    outranks everything below, because the commonest run of this installer is not a first
+    install but a **resync**, and re-asking there is how a recorded decision gets
+    overwritten: the list offered below is the remote's branches with the *default* branch
+    named as such, and for every repository this protocol is built for the default branch
+    is exactly the wrong answer. Both known consumers integrate through something else —
+    `development` where the default is `main`, `queue` where the default is `master` — so
+    an operator resyncing was shown the wrong branch as the obvious one and asked to retype
+    the right one from memory. `--branch` still overrides, which is how a repository that
+    genuinely changes its integration branch says so.
     """
     if given:
         return given
+    if repo is not None:
+        recorded = load(repo / ".claude" / CONFIG_FILENAME).get("integrationBranch")
+        if isinstance(recorded, str) and recorded.strip():
+            return recorded.strip()
     candidates: list[str] = []
     if repo is not None:
         head = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
@@ -666,6 +681,54 @@ def git(tree: Path, *args: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+# What a repository has decided for itself, for the `--status` report. Every one of these
+# is optional and off when absent, which is the property that lets one skill serve
+# repositories that disagree — and it is also what makes them invisible. A resync prints
+# this so an operator can see which of their repo's decisions are recorded and which are
+# not: the mechanism existing is not the same as this repository having used it, and the
+# gap between those two is silent everywhere else.
+# `always` is False for a key this installer writes itself with a default in it. Presence
+# is a decision for a hand-written key and means nothing for an installer-written one, and
+# conflating the two is how "this repo declared nothing" stops being sayable:
+# `sessionOwnership` is recorded either way so a resync keeps the answer, so a repo that
+# has never heard of it still has the key.
+DECLARATIONS = (
+    ("delivery", "delivery: this repo's own commands, in place of push/PR/merge", True),
+    ("protectedMergeTargets", "protected merge targets: no session merges into these", True),
+    ("mergeIntegrationBeforeLanding", "land.py merges the integration branch down first", True),
+    ("worktreesRoot", "worktrees go here, and the remedy text says so", True),
+    ("sessionOwnership", "one worktree, one session", False),
+)
+
+
+def declarations(blob: dict) -> list[str]:
+    """One line per decision this repository has recorded, or one saying it recorded none."""
+    lines = []
+    for name, what, hand_written in DECLARATIONS:
+        # For a hand-written key, `false` and `[]` are answers the repo gave rather than
+        # absences, so presence is the test and not truthiness — reading
+        # `mergeIntegrationBeforeLanding: false` as "nothing here" is how a report would
+        # invite a decision that has already been made.
+        if name not in blob:
+            continue
+        value = blob[name]
+        if not hand_written and not value:
+            continue
+        if isinstance(value, dict):
+            detail = ", ".join(f"{k}={json.dumps(v)}" for k, v in value.items())
+        elif isinstance(value, list):
+            detail = ", ".join(str(v) for v in value) or "(none)"
+        else:
+            detail = json.dumps(value)
+        lines.append(f"{what} — {detail}")
+    if not lines:
+        lines.append(
+            "no other declarations — this repo takes the default protocol throughout. "
+            "See references/guard-internals.md#configuration for what it may declare."
+        )
+    return lines
+
+
 def report_status(user_root: Path, repo: Path | None) -> int:
     # Both spellings, because `--settings-file settings.local.json` is a real install and a
     # status that reads only settings.json reports it as absent. "Not installed" about a
@@ -722,11 +785,14 @@ def report_status(user_root: Path, repo: Path | None) -> int:
         common = Path(os.path.normpath(str(git_dir / target if not target.is_absolute() else target)))
     main_root = common.parent if common.name == ".git" else tree
 
+    declared = load(main_root / ".claude" / CONFIG_FILENAME)
     branch = os.environ.get("CLAUDE_INTEGRATION_BRANCH") or (
-        load(main_root / ".claude" / CONFIG_FILENAME).get("integrationBranch") or DEFAULT_BRANCH
+        declared.get("integrationBranch") or DEFAULT_BRANCH
     )
     print(f"\nrepository: {main_root}")
     print(f"integrates through: {branch}")
+    for line in declarations(declared):
+        print(f"  {line}")
     print(f"{where} is: "
           + ("a worktree — writes allowed" if linked else "the MAIN CHECKOUT — writes denied"))
 

@@ -220,6 +220,60 @@ def main() -> int:
         )
         check("an answer down a pipe is taken", piped.returncode, 0)
         check("and is what gets recorded", config_of(asked).get("integrationBranch"), "queue")
+        # ...and having answered once, the repository is not asked again. The commonest run
+        # of this installer is a RESYNC, and re-asking there is how a recorded decision gets
+        # overwritten: the list offered names the *default* branch as the obvious one, and
+        # for every repository this protocol is built for that is the wrong answer. Both
+        # known consumers integrate through something other than their default branch.
+        resync = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(asked), "--no-skill"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        check("a resync with no --branch does not have to ask", resync.returncode, 0)
+        check("and keeps the branch the repo recorded",
+              config_of(asked).get("integrationBranch"), "queue")
+        check("a repo that changes its mind still says so with --branch",
+              config_of(asked) is not None
+              and install(asked, "--branch", "trunk").returncode == 0
+              and config_of(asked).get("integrationBranch"),
+              "trunk")
+
+        # --- a resync keeps every decision the repository made by hand -------------
+        # The keys below are hand edits by design: the repo that needs them has already
+        # written its protocol down somewhere. That only holds if a resync leaves them
+        # alone — an installer that dropped them would make its own defaults the answer
+        # to a question the repository had already settled.
+        opinionated = fresh(root, "opinionated")
+        install(opinionated)
+        blob = config_of(opinionated)
+        blob["delivery"] = {"command": "pnpm feature land", "enterWorktree": False}
+        blob["protectedMergeTargets"] = ["main"]
+        blob["mergeIntegrationBeforeLanding"] = True
+        (opinionated / ".claude" / "worktree-per-change.json").write_text(
+            json.dumps(blob, indent=2), encoding="utf-8")
+        install(opinionated)
+        kept = config_of(opinionated)
+        check("a resync keeps a hand-written delivery block",
+              (kept.get("delivery") or {}).get("command"), "pnpm feature land")
+        check("and the branches the repo will not merge into",
+              kept.get("protectedMergeTargets"), ["main"])
+        check("and its answer about merging the base down first",
+              kept.get("mergeIntegrationBeforeLanding"), True)
+        # And it says so, because a mechanism that exists is not the same as this
+        # repository having used it, and the gap is silent everywhere else.
+        told = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(opinionated), "--status"],
+            capture_output=True, text=True, cwd=str(opinionated),
+        ).stdout
+        check("--status names the repo's own delivery command",
+              "pnpm feature land" in told, True)
+        check("and its protected merge targets", "protected merge targets" in told, True)
+        plain = subprocess.run(
+            [sys.executable, str(INSTALL), "--repo", str(asked), "--status"],
+            capture_output=True, text=True, cwd=str(asked),
+        ).stdout
+        check("a repo that declared nothing is told that, not left to wonder",
+              "no other declarations" in plain, True)
 
         # --- the allowlist ---------------------------------------------------------
         # Two different denials stop this protocol, and only one of them is the guard. A
