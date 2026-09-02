@@ -1,0 +1,47 @@
+{
+  "deadline": "10:00",
+  "pollSeconds": 60,
+  "jobTimeoutMinutes": 180,
+  "retries": 1,
+  "agentLabel": "ready-for-agent",
+  "humanLabel": "ready-for-human",
+  "claimLabel": "agent-running",
+
+  "repos": {
+    "example-with-pull-requests": {
+      "cwd": "C:/Users/you/Documents/example",
+      "slug": "you/example",
+      "integration": "development",
+      "concurrency": 2,
+
+      "epics": [88],
+      "claimed": [91],
+
+      "landHint": "Land with `python .claude/scripts/land.py --merge-integration` — other agents are landing into development at the same time, so the base must come down before you push."
+    },
+
+    "example-without-pull-requests": {
+      "cwd": "C:/Users/you/Desktop/site",
+      "slug": "you/site",
+      "integration": "development",
+      "concurrency": 3,
+      "epics": [187],
+      "claimed": [],
+      "landHint": "Cut the worktree with `pnpm feature start <name>` and land with `pnpm feature land` (ADR 0005: no pull request). `land` fetches and rebases onto development itself; if it refuses on a conflict, resolve it in the worktree and run `pnpm feature land` again."
+    },
+
+    "example-holding-one-gpu": {
+      "cwd": "C:/Users/you/Desktop/study",
+      "slug": "you/study",
+      "integration": "main",
+      "concurrency": 1,
+      "epics": [1, 41, 64],
+      "claimed": [66, 69],
+
+      "gate": ["node", "gates/compute-idle.mjs", "study|train_|export_sweep", "F:/study", "240"],
+      "gateWhy": "one GPU and one CPU, and every arm here wants all of both — a second training run started while the first is alive does not queue, it OOMs",
+
+      "landHint": "Land with `python .claude/scripts/land.py --merge-integration`. The integration branch here is `main`, not development."
+    }
+  }
+}
