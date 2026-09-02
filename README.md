@@ -140,3 +140,86 @@ python worktree-per-change/scripts/test_guard.py
 ```bash
 python worktree-per-change/scripts/test_install.py
 ```
+
+## `board-runner`
+
+Work a GitHub board unattended — one ticket, one brand-new session, one worktree, one
+landed change — with a live tree to watch it by.
+
+The idea it rests on is that **the queue is a query**. A list of tickets to work through
+is wrong the moment it is written: something lands and three blocked tickets become
+runnable, or a person picks one up by hand and it must not be started twice. So there is no
+list. Every cycle the runner asks the board which tickets are open, carry the agent label,
+and have no open blocker — using GitHub's own `blocked_by` edges — and works whatever comes
+back. Cascades then need no orchestration, because closing a ticket *is* the release of
+everything behind it.
+
+The unit is one ticket per brand-new `claude -p` session, because that is what `/implement`
+is for: several tickets in one chat share a context window, a cwd and a plan, and several
+tickets in several processes share nothing. Work stops at a wall-clock deadline — nothing
+new *starts* past it, and whatever is running is left to finish, because killing a session
+mid-land is how a branch gets pushed with no merge behind it.
+
+Three things the board cannot tell you live in the config instead: **epics**, which through
+the API look exactly like small independent tickets; **tickets already claimed** by a chat
+the runner did not start; and **gates**, for when a dependency has landed but the training
+run it started still owns the GPU.
+
+Assumes `worktree-per-change`, and reads that skill's config for each repository's
+integration branch and delivery command so the two agree by construction.
+
+### Install
+
+```bash
+python board-runner/scripts/install.py --dir ~/afk --add-repo ../photos --dry-run
+```
+
+Read the diff it prints, then run it without `--dry-run`. The runner stands outside the
+repositories it works — nothing is installed into them — so it lives in one directory with
+the scripts, a `config.json`, and the logs and state of every run.
+
+It will not guess the epics. `--suggest-epics <repo>` prints the candidates with the
+evidence for each and changes nothing; naming a leaf as an epic means it never runs, and
+missing a real one means an agent tries to implement six tickets in one session.
+
+| Flag | Effect |
+|---|---|
+| `--dir PATH` | Where the runner lives. Default `~/afk` |
+| `--add-repo PATH` | Detect a repository and append it to `config.json` |
+| `--suggest-epics PATH` | Print likely epics for a repository, and change nothing |
+| `--deadline HH:MM` | The wall-clock stop. Default `10:00` |
+| `--status` | What is configured, which epics are set, what has run |
+| `--uninstall` | Remove the scripts, keep `config.json` and the logs |
+
+### Running and watching
+
+```bash
+node ~/afk/scheduler.mjs --dry-run
+```
+
+```bash
+node ~/afk/tree.mjs
+```
+
+`scheduler.mjs --dry-run` prints the board and launches nothing. `tree.mjs` serves a live
+tree at `http://localhost:7717` (`--watch` for the terminal) where each ticket hangs under
+the blocker still gating it, so it reads downward as *when this lands, these are released*
+— with each running chat's elapsed time, current tool, context-window occupancy and last
+line. It reads chats the runner never started too, from their session transcripts, so a
+hand-started session is never invisible.
+
+```
+board-runner/
+  SKILL.md
+  references/
+    gates.md          when a landed dependency still owns the GPU
+    recovery.md       credits, crashes, and resuming one ticket
+  scripts/
+    install.py        install / --add-repo / --suggest-epics / --status / --uninstall
+    scheduler.mjs     the pool: query the board, launch, claim, retry, stop at the deadline
+    tree.mjs          the live board, as a server or a terminal watch
+    tree.html         the page it serves
+    gates/
+      compute-idle.mjs   refuses while a training or export run holds the machine
+    config.example.json
+```
