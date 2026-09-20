@@ -467,8 +467,17 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
                 )
         create = ["gh", "pr", "create", "--base", branch]
         create += ["--title", args.title] if args.title else []
-        create += ["--body-file", args.body_file] if args.body_file else []
-        if not args.title and not args.body_file:
+        if args.body_file:
+            create += ["--body-file", args.body_file]
+        else:
+            # `--fill` whenever there is no body file, including alongside `--title`.
+            # gh documents the precedence — "if the --title and/or --body are also
+            # provided alongside --fill, the values specified by --title and/or --body
+            # will [win]" — so the explicit title survives and the commits supply the
+            # body. This used to add `--fill` only when there was no title either, which
+            # meant `land.py --title T` sent gh neither a body nor a way to derive one,
+            # and gh refuses that non-interactively: the run died at the forge, after the
+            # push, with an error about a missing body rather than about the flag.
             create += ["--fill"]
         created = run(create, tree, args.dry_run)
         if not args.dry_run:

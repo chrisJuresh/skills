@@ -127,6 +127,18 @@ def main() -> int:
         for step in ("git push -u origin HEAD", "gh pr create --base queue",
                      "gh pr merge", "--squash", "git push origin --delete topic"):
             check(f"the dry run shows `{step}`", step in out.stdout, True)
+
+        # A title with no body file still gets `--fill`, which is where the body comes
+        # from; gh lets the explicit title win. Without it the command carries neither a
+        # body nor a way to derive one, and gh refuses that non-interactively — after the
+        # push, so the failure arrives at the forge and reads as gh's problem.
+        titled = land(dirty, "--dry-run", "--title", "A title")
+        check("a title alone still fills the body", "--fill" in titled.stdout, True)
+        check("and keeps the explicit title", "--title A title" in titled.stdout, True)
+        # A body file replaces `--fill` rather than joining it.
+        filed = land(dirty, "--dry-run", "--body-file", "body.md")
+        check("a body file is used instead of --fill", "--fill" in filed.stdout, False)
+        check("and is passed to gh", "--body-file body.md" in filed.stdout, True)
         check("the dry run says it did nothing", "nothing was pushed" in out.stdout, True)
 
         # `--delete-branch` is deliberately absent, and this is the check that keeps it
