@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -110,6 +111,71 @@ def is_protected(branch: str, protected: frozenset[str]) -> bool:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     return name in protected
+
+
+# A pull request closes its ticket from its BODY, and only from its body.
+#
+# **Off by default**, because a repository that does not track work as issues has nothing
+# for this to check, and one whose tickets live in a tracker with no closing keywords
+# cannot satisfy it at all. Turned on per repository:
+#
+#     "requireIssueReference": true
+#
+# What it is for: the omission is invisible at the moment it is made. The PR merges green,
+# the reply is truthful, and the ticket stays open — so the next session reads the tracker,
+# sees undelivered work, and builds what already landed. Measured 2026-09-20 in a repo
+# using this protocol: #19 delivered issue #4 with `(#4)` in its TITLE, which GitHub does
+# not act on, and no keyword in its body. #20, one commit later, opened with `Closes #9.`
+# and closed its issue on merge. The difference was one line, and the cost was a session
+# spent rebuilding delivered work.
+#
+# This script's own default makes it easy to drop: with no `--body-file`, the PR body is
+# `--fill`, which is the branch's commit messages — so the line lives in the commit, where
+# nobody looking at a `gh pr create` command would think to check for it.
+CLOSING_KEYWORD = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:[\w.-]+/[\w.-]+)?#\d+",
+    re.IGNORECASE,
+)
+# The escape hatch, on a line of its own, with a reason after the colon. A line in the PR
+# outlives a flag on a command nobody will see again.
+NO_ISSUE = re.compile(r"^\s*no[ -]issue\s*:\s*\S+", re.IGNORECASE | re.MULTILINE)
+
+
+def requires_issue_reference(main_root: Path) -> bool:
+    """Whether this repository has opted in. Read from the MAIN checkout, like the rest."""
+    return bool(config(main_root).get("requireIssueReference"))
+
+
+def closes_an_issue(body: str) -> bool:
+    return bool(CLOSING_KEYWORD.search(body) or NO_ISSUE.search(body))
+
+
+def pull_request_body(tree: Path, branch: str, body_file: str | None) -> str | None:
+    """The body the pull request will get, by whichever route this script takes.
+
+    `None` means the body could not be read, and the caller lets it through: refusing to
+    land a delivered change over a file this script merely failed to open is the worse
+    error, and it is the error that gets a check removed.
+    """
+    if body_file:
+        # Resolved against the worktree, which is the cwd `gh` itself will read it from.
+        path = Path(body_file)
+        try:
+            return (path if path.is_absolute() else tree / path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+    # No body file means `--fill`, whose body is the branch's commit messages — every
+    # commit the branch adds, not just the tip. `origin/<branch>` is the honest range and
+    # the local branch is the fallback for a repo whose remote has not been fetched;
+    # `-1` is the last resort, and it is last because a branch of several commits whose
+    # keyword sits in an earlier one would otherwise be refused for lacking it.
+    for revisions in (f"origin/{branch}..HEAD", f"{branch}..HEAD", "-1"):
+        body = git(tree, "log", revisions, "--pretty=%B")
+        if body:
+            return body
+    return None
 
 
 class Refused(Exception):
@@ -370,6 +436,35 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     number = None if args.dry_run else head_pr(tree, topic, "open")
     print("\npull request")
     if number is None:
+        if requires_issue_reference(main_root):
+            # Checked here rather than before the push, because this is the only step it
+            # is about: a PR that is already open has its body, and re-running this script
+            # against it must not start refusing. A push with no PR behind it is benign —
+            # the next run finds no open PR and creates one.
+            body = pull_request_body(tree, branch, args.body_file)
+            if body is not None and not closes_an_issue(body):
+                raise Refused(
+                    "this repository requires a pull request to close its issue, and this "
+                    "body would close nothing.\n\n"
+                    "Put the keyword and the number on the body's first line, where the "
+                    "forge reads it — the TITLE is not read:\n"
+                    "    Closes #<n>.\n\n"
+                    + (
+                        f"The body comes from {args.body_file}.\n"
+                        if args.body_file
+                        else "With no --body-file the body is --fill, so the line goes in the "
+                        "commit message:\n"
+                        "    git commit --amend\n"
+                    )
+                    + "\nIf this change genuinely closes no issue, say so with a reason and "
+                    "this passes:\n"
+                    "    No issue: <why>\n\n"
+                    + (
+                        "This is a dry run; nothing ran."
+                        if args.dry_run
+                        else "The branch is pushed; nothing was opened or merged."
+                    )
+                )
         create = ["gh", "pr", "create", "--base", branch]
         create += ["--title", args.title] if args.title else []
         create += ["--body-file", args.body_file] if args.body_file else []

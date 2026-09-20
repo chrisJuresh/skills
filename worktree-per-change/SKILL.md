@@ -157,6 +157,14 @@ quieter. It takes no PR number and no branch, so it can only ever merge the PR w
 the branch in the worktree it was run from, into the branch that repo recorded. One entry
 for it grants the protocol; `Bash(gh pr merge:*)` would grant every PR on the machine.
 
+**Where the change came from a ticket, the PR body closes it — `Closes #<n>.` on the first
+line.** The forge reads the body and nothing else: an issue number in the *title* closes
+nothing, which is how a ticket stays open over a change that shipped, and how the session
+after next sets out to rebuild it. `--fill` above means the body is your commit messages, so
+in that route the line goes in the commit. `requireIssueReference` makes `land.py` refuse a
+body that would close nothing; `No issue: <why>` is how a change that genuinely closes none
+says so. See [references/ticketing.md](references/ticketing.md).
+
 Pushing and merging are part of finishing, not a separate errand to be asked about. A
 branch that exists only on this disk is not a delivered change: the operator is left
 with a directory nobody will look in, and the next worktree is cut from an integration
@@ -452,12 +460,13 @@ else the repo keeps in that file. `syncedFrom` is absent when the skill director
 git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
 sha is not.
 
-**That merge is also what makes the rest of this file the repository's to write.** Four more
+**That merge is also what makes the rest of this file the repository's to write.** Five more
 keys have accumulated there, one incident each, and every one of them is optional and off
 when absent: `delivery` (a repo that lands without pull requests, or without entering
 worktrees), `sessionOwnership` (the second hook), `mergeIntegrationBeforeLanding` (bring the
-base down before pushing) and `protectedMergeTargets` (branches this repo never merges into
-from a session). The full list, with what reads each, is in
+base down before pushing), `protectedMergeTargets` (branches this repo never merges into
+from a session) and `requireIssueReference` (the PR body must close its ticket, or say why
+not). The full list, with what reads each, is in
 [references/guard-internals.md](references/guard-internals.md#configuration) — read it
 before adding a key by hand, because a repository that has declared nothing gets exactly the
 behaviour it had before any of them existed, and that is the property they are all built to

@@ -306,6 +306,7 @@ at a time and are otherwise scattered across the two scripts that read them:
 | `sessionOwnership` | `install.py` | whether `worktree-owner.py` is registered too. A resync keeps the repository's answer without the flag |
 | `mergeIntegrationBeforeLanding` | `land.py` | bring `origin/<integration>` down into the topic branch before pushing, so a conflict lands in a tree set up to resolve it instead of in an API response |
 | `protectedMergeTargets` | guard, `land.py` | branches that are pushed to and opened against but **never merged** by a session. Additive only: no key removes a name and no environment variable turns it off, so a repository that has opted in cannot be talked back out of it |
+| `requireIssueReference` | `land.py` | refuse to open a pull request whose **body** would close no issue. Off by default, because a repo that does not track work as issues has nothing to check. `No issue: <why>` is the escape hatch, and an unreadable body is let through — see below |
 
 `install.py` **merges** this file rather than replacing it, so every one of these survives a
 resync that the installer knows nothing about — and `integrationBranch`, which it does know
@@ -320,6 +321,48 @@ Two of them interact, and the guard reads them together: where the integration b
 topic branch as **delivered**. Without that, a session that had done everything it was
 permitted to do — commit, push, open the PR, hand it to a person — would be refused
 permission to stop, twice, every time.
+
+### `requireIssueReference` — the pull request closes its ticket, or says why not
+
+A pull request closes its ticket from its **body**, and a forge reads nothing else — not
+the title, not the branch name, not the commit subject. Omitting the line costs nothing at
+the moment it happens: the PR merges green, the reply is truthful, and the ticket simply
+stays open. The bill arrives later, on whoever reads the tracker next.
+
+Measured 2026-09-20, in a repository using this protocol. `#19` delivered issue `#4` with
+`(#4)` in its title and no keyword in its body, so nothing closed `#4`. `#20`, one commit
+later, opened with `Closes #9.` and closed its issue on merge — same author, same day, one
+line's difference. A day after that, a session read the tracker, found `#4` open and
+labelled ready, and set out to build what was already on `main`; it got as far as cutting a
+worktree before noticing the local checkout was three commits stale.
+
+This protocol makes the omission *easier*, which is why the key lives here rather than in
+the ticketing page. `land.py` with no `--body-file` passes `--fill`, so the body is the
+branch's commit messages — the keyword has to be in a commit, and nobody inspecting a
+`gh pr create` command would think to look there.
+
+```json
+{ "integrationBranch": "main", "requireIssueReference": true }
+```
+
+`land.py` then reads the body it is about to send, by whichever route it would send it, and
+refuses before `gh pr create` when that body would close nothing. Three properties matter:
+
+- **`No issue: <why>` passes.** A guard resync, a dependency bump and a spike genuinely
+  close nothing, and a rule with no honest way out is a rule that gets turned off. The
+  reason is required — the bare words do not pass — and it lands in the PR, where a reader
+  will actually see it, rather than in a flag on a command nobody reads twice.
+- **An unreadable body is let through.** A missing `--body-file`, a branch `git log` will
+  not print: refusing to land a delivered change over state the script merely failed to
+  read is the worse error, and it is the error that gets a check deleted.
+- **It refuses after the push and before the PR.** That is the only step it is about, and
+  a pushed branch with no PR behind it is benign — the next run finds no open PR and opens
+  one. Checking earlier would mean refusing a re-run against a PR that is already open and
+  whose body is already settled.
+
+Off by default. A repository that does not track work as issues, or whose tracker has no
+closing keywords, has nothing for this to check and behaves exactly as it did before the
+key existed.
 
 ### `delivery` — when the repository has replaced the protocol's last three steps
 

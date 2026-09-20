@@ -63,12 +63,19 @@ def repo_with_commit(root: Path, name: str, branch: str) -> Path:
     return repo
 
 
-def record_branch(repo: Path, branch: str, protected: list[str] | None = None) -> None:
+def record_branch(
+    repo: Path,
+    branch: str,
+    protected: list[str] | None = None,
+    require_issue: bool | None = None,
+) -> None:
     config = repo / ".claude" / "worktree-per-change.json"
     config.parent.mkdir(parents=True, exist_ok=True)
     blob: dict = {"integrationBranch": branch}
     if protected is not None:
         blob["protectedMergeTargets"] = protected
+    if require_issue is not None:
+        blob["requireIssueReference"] = require_issue
     config.write_text(json.dumps(blob), encoding="utf-8")
 
 
@@ -260,6 +267,55 @@ def main() -> int:
         out = land(ptree, "--dry-run")
         check("an unconfigured repo merges into main as before", "gh pr merge" in out.stdout, True)
         check("and says nothing about protection", "NOT MERGING" in out.stdout, False)
+
+        # --- a pull request that would close no issue -------------------------------
+        # Off unless the repository asks, and when it does, the body is read by the same
+        # route the PR will get it: `--fill` means the branch's commit messages. The
+        # incident behind it is a PR that named its issue in the TITLE, which no forge
+        # acts on, leaving the issue open and the next session rebuilding landed work.
+        tickets = repo_with_commit(root, "tickets", "main")
+        record_branch(tickets, "main", require_issue=True)
+        git(tickets, "worktree", "add", "-q", "-b", "silent", str(root / "wt-silent"), "main")
+        silent = root / "wt-silent"
+        (silent / "a.txt").write_text("work\n", encoding="utf-8")
+        git(silent, "add", "a.txt")
+        git(silent, "commit", "-qm", "Resolve step (#4)")
+        out = land(silent, "--dry-run")
+        check("a body that closes nothing is refused", out.returncode, 2)
+        check("and the keyword is spelled out", "Closes #<n>." in out.stderr, True)
+        check("and the title is named as not enough", "TITLE is not read" in out.stderr, True)
+        check("and the escape hatch is offered", "No issue:" in out.stderr, True)
+
+        # The keyword in the commit message is what `--fill` will carry into the body.
+        git(silent, "commit", "-q", "--amend", "-m", "Resolve step\n\nCloses #4.")
+        out = land(silent, "--dry-run")
+        check("a commit that closes an issue is accepted", out.returncode, 0)
+
+        # A change that genuinely closes nothing says so, with a reason.
+        git(tickets, "worktree", "add", "-q", "-b", "chore", str(root / "wt-chore"), "main")
+        chore = root / "wt-chore"
+        (chore / "b.txt").write_text("bump\n", encoding="utf-8")
+        git(chore, "add", "b.txt")
+        git(chore, "commit", "-qm", "Bump the pin\n\nNo issue: upstream resync.")
+        check("`No issue: <why>` passes", land(chore, "--dry-run").returncode, 0)
+
+        # ... but the reason is the point of it, so the bare words are not a way past.
+        git(chore, "commit", "-q", "--amend", "-m", "Bump the pin\n\nNo issue")
+        check("`No issue` with no reason does not", land(chore, "--dry-run").returncode, 2)
+
+        # An unreadable body file is let through rather than guessed at: refusing to land
+        # a delivered change over a file this script failed to open is the worse error.
+        out = land(chore, "--dry-run", "--title", "T", "--body-file", "nowhere.md")
+        check("an unreadable body file is let through", out.returncode, 0)
+
+        # And a repository that has not asked is untouched by any of it.
+        git(repo, "worktree", "add", "-q", "-b", "quiet", str(root / "wt-quiet"), "queue")
+        quiet = root / "wt-quiet"
+        (quiet / "c.txt").write_text("work\n", encoding="utf-8")
+        git(quiet, "add", "c.txt")
+        git(quiet, "commit", "-qm", "no keyword anywhere")
+        check("an unconfigured repo is not asked for an issue",
+              land(quiet, "--dry-run").returncode, 0)
 
         # --- a tree outside a repository -------------------------------------------
         loose = root / "not-a-repo"
