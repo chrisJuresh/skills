@@ -324,8 +324,9 @@ class Delivery:
         )
 
     def base_note(self, branch: str, worktrees: str) -> str:
+        stale = "\n\n" + STALE_LOCAL.format(branch=branch)
         if self.enter:
-            return BASE_NOTE.format(branch=branch, worktrees=worktrees)
+            return BASE_NOTE.format(branch=branch, worktrees=worktrees) + stale
         # Half of BASE_NOTE is about `worktree.baseRef` choosing the wrong base, which is
         # a property of EnterWorktree and reads as noise in a repository that never calls
         # it. The rule it exists to protect — cut from the FETCHED remote tip — is not.
@@ -335,7 +336,7 @@ class Delivery:
             "unfetched local ref. A stale base silently reintroduces work already landed "
             "as a conflict:\n"
             f"`git fetch origin {branch} && git worktree add {worktrees}/<name> "
-            f"-b <branch> origin/{branch}`"
+            f"-b <branch> origin/{branch}`" + stale
         )
 
     def finishing(self) -> str:
@@ -953,6 +954,20 @@ BASE_NOTE = (
     "branch name — it chooses between the repository's default branch and local HEAD, and "
     "here BOTH are wrong — so a bare EnterWorktree cuts from the wrong place and carries "
     "changes you did not make into your diff without complaining."
+)
+
+# The base rule is about one moment; this is the same fact for every other moment. They
+# print together because a session that cuts from `origin/` and then *reads* local
+# `{branch}` has the stale answer anyway — later, and with no conflict to warn it.
+STALE_LOCAL = (
+    "`origin/{branch}` is also what you READ this repository by, not only what you cut "
+    "from. Local `{branch}` is never pulled here — every change lands on the remote, so "
+    "the local ref is behind from the moment anyone merges, and the main checkout's files "
+    "are that stale ref too. Fetch, then ask the remote-tracking ref: `git fetch origin "
+    "{branch}`, then `git log origin/{branch}`, `git diff origin/{branch}...HEAD`, `git "
+    "show origin/{branch}:<path>`, `git merge-base origin/{branch} HEAD`. A bare "
+    "`{branch}`, a bare `git log`, or a file read from the main checkout answers from "
+    "whenever this disk last caught up, and nothing about the answer says it is old."
 )
 
 ESCAPE = (

@@ -72,6 +72,23 @@ Not local HEAD, not whatever branch the main checkout is sitting on, not a local
 whole point of merging every change is that the next one starts from it, and a stale local
 ref silently reintroduces work you already landed as a conflict.
 
+`origin/<integration>` is also what you **read** the repository by, not only what you cut
+from. Nothing pulls the local `<integration>` ref under this protocol — every change lands
+on the remote and the local one is behind from the moment anyone merges, as are the files
+sitting in the main checkout. So fetch, then ask the remote-tracking ref:
+
+```bash
+git fetch origin <integration>
+git log origin/<integration>                 # what has actually landed
+git diff origin/<integration>...HEAD         # what this branch adds to it
+git show origin/<integration>:<path>         # the current file, not this disk's copy
+git merge-base origin/<integration> HEAD     # where this branch left it
+```
+
+A bare `<integration>`, a bare `git log`, and a file read from the main checkout all answer
+from whenever this disk last caught up. That is the expensive kind of stale: unlike a bad
+base it never surfaces as a conflict, so the reading is simply wrong and looks fine.
+
 That is also why a bare `EnterWorktree` (no `git worktree add` first) is only correct when
 the repository's **default branch is also its integration branch** *and* you want it fresh
 from the remote. `worktree.baseRef` never accepts a branch name — it chooses between two
