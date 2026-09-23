@@ -1102,6 +1102,27 @@ and does clear: measured, a removal that failed succeeded about a minute later w
 done in between. So a teardown script should retry for a few seconds before reporting. If
 waiting does not clear it, it is one of the three above.
 
+**And it should choose how long to wait from which of them it is looking at**, because the
+first cause and the last one want opposite waits. A `node_modules` lock clears on its own
+and is worth the full retry. A working directory does not clear at all while the process
+holding it lives — and under cause 1 that process is the shell blocked waiting for the
+teardown to return, so it cannot let go until after the last attempt. A fixed retry
+therefore spends its whole budget on the one lock that is knowably unclearable, on *every*
+teardown, and then prints the reason it could not clear. Measured in the one repository
+with a scripted teardown: twelve attempts a second apart, twelve seconds, every land.
+
+The fix is not to skip the wait when a standing cwd is found — a `node_modules` lock can
+sit behind one, and cutting to nothing gives up on the lock that would have cleared. It is
+to make the count a **decision**, taken before the removal from what is already known:
+whether the teardown's own starting directory was inside the tree is a path comparison and
+costs no syscall, while asking the operating system who else is there costs about a second
+and could not change the answer anyway. Cause 1 present, wait briefly; absent, wait it out.
+
+Whichever it picks, **say which cause it acted on**. `after 3 attempts: EBUSY` on its own
+reads as a removal that was barely tried, and a person who cannot tell a short wait from an
+untried one will go and check by hand — which is the cost this whole section exists to
+remove.
+
 One consequence of cleaning up routinely: worktree **paths get reused**, because the next
 change to the same area wants the same obvious name. The guard's spent marker is keyed by
 the tree's leaf name, so it records the branch too and matches on both, and the
