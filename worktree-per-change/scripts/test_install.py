@@ -386,7 +386,10 @@ def main() -> int:
         # it was covered, the installer wrote nothing, and the repo went out to everybody
         # else without the entry — right where it was installed, false where it travels.
         elsewhere = fresh(root, "elsewhere")
-        machine_ignore = root / "machine-ignore"
+        # Named `.gitignore`, as a global one often is (`~/.gitignore`): the file's name is
+        # not what makes it the repository's, being tracked in it is.
+        machine_ignore = root / "home" / ".gitignore"
+        machine_ignore.parent.mkdir()
         machine_ignore.write_text(".claude/\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(elsewhere), "config",
                         "core.excludesFile", str(machine_ignore)], check=True)
@@ -396,6 +399,33 @@ def main() -> int:
             ".claude/worktrees/" in (elsewhere / ".gitignore").read_text(encoding="utf-8"),
             True,
         )
+
+        # `.git/info/exclude` is the same kind of answer: it lives in the git directory,
+        # is never committed, and is true only in this clone. Measured 2026-09-23 on a
+        # repo whose exclude named `.claude/worktrees/` and whose .gitignore did not: the
+        # installer appended its note and `settings.local.json`, and left out the one
+        # entry that keeps a live worktree from being committed as a gitlink.
+        excluded = fresh(root, "excluded")
+        (excluded / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(excluded), "add", ".gitignore"], check=True)
+        with (excluded / ".git" / "info" / "exclude").open("a", encoding="utf-8") as handle:
+            handle.write(".claude/worktrees/\n.claude/settings.local.json\n")
+        install(excluded)
+        ignored = (excluded / ".gitignore").read_text(encoding="utf-8").splitlines()
+        check("an info/exclude rule does not stand in for the repository's own",
+              ".claude/worktrees/" in ignored, True)
+        check("for either entry", ".claude/settings.local.json" in ignored, True)
+
+        # The other half: a TRACKED .gitignore that covers them under a broader pattern
+        # is the repository answering, and it collects no second line.
+        covered = fresh(root, "covered")
+        (covered / ".gitignore").write_text("/.claude/worktrees/\n**/settings.local.json\n",
+                                            encoding="utf-8")
+        subprocess.run(["git", "-C", str(covered), "add", ".gitignore"], check=True)
+        install(covered)
+        check("a broader pattern in a tracked .gitignore is an answer",
+              (covered / ".gitignore").read_text(encoding="utf-8").splitlines(),
+              ["/.claude/worktrees/", "**/settings.local.json"])
 
         # A repo that already ignores them keeps its own spelling: this is the repo's file
         # and a second literal line saying the same thing is noise.

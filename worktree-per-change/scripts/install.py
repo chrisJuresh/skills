@@ -205,9 +205,30 @@ INCLUDE_NOTE = """
 """
 
 
-# A path git will not find, so `core.excludesFile` contributes nothing to the answer
-# below. Any string that cannot be a real file does; this one says why it is there.
-NO_GLOBAL_EXCLUDES = "core.excludesFile=/dev/null/worktree-per-change-no-such-file"
+# `git check-ignore -v`: `<source>:<line>:<pattern>\t<path>`. Non-greedy, so a Windows
+# drive letter in an absolute source (`C:/…/.git/info/exclude`) stays in the source.
+IGNORE_SOURCE = re.compile(r"^(.*?):\d+:.*\t")
+
+
+def carried_by_repository(repo: Path, entry: str) -> bool:
+    """Whether the rule git applies to `entry` comes from a tracked `.gitignore`.
+
+    `-v` names the one pattern that decided, and git consults its sources in precedence
+    order -- the tree's `.gitignore` files, then `.git/info/exclude`, then
+    `core.excludesFile` -- so a source that is not a tracked `.gitignore` means no
+    tracked `.gitignore` covers the path at all. A negated pattern that wins exits
+    non-zero, the same as no match.
+    """
+    # `check-ignore` exits non-zero when the path is not ignored, which `git()` returns
+    # as None. A git that cannot answer at all lands in the same branch, and a line that
+    # turns out to have been redundant is the cheap way to be wrong.
+    verdict = git(repo, "check-ignore", "-v", entry)
+    found = IGNORE_SOURCE.match(verdict or "")
+    if not found or Path(found.group(1)).name != ".gitignore":
+        return False
+    # `ls-files` prints nothing for an untracked file and fails for one outside the tree,
+    # which is where a global excludes file called `~/.gitignore` lives.
+    return bool(git(repo, "ls-files", "--", found.group(1)))
 
 
 def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
@@ -216,17 +237,17 @@ def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
     Asked of git rather than of the file, so a repo that already covers them under a
     broader pattern does not collect a redundant line.
 
-    **The machine's own ignores are excluded from the answer on purpose.** The question
-    is whether the *repository* carries the rule, and a global `core.excludesFile` is not
-    the repository: measured on the machine this was written on, whose global ignore
-    already names `**/.claude/settings.local.json`, the honest check reported nothing
-    missing and the installed repo went out to everyone else without the entry. That is
+    **Only a tracked `.gitignore` counts as an answer.** The question is whether the
+    *repository* carries the rule, and the other two places git reads ignores from are
+    this machine rather than the repository: a global `core.excludesFile`, and
+    `.git/info/exclude`, which lives in the git directory and is never committed. Both
+    were measured answering for it. On a machine whose global ignore names
+    `**/.claude/settings.local.json`, the check reported nothing missing and the repo went
+    out to everyone else without the entry; on 2026-09-23, a repo whose info/exclude
+    named `.claude/worktrees/` got the explanatory note and `settings.local.json` and not
+    the one line that keeps a live worktree from being committed as a gitlink. That is
     the same shape as a hash of the working copy being true only where it was computed --
     right on the machine that installed, false everywhere the file actually travels.
-
-    `.git/info/exclude` is still counted, and is the one remaining way to get a false
-    negative here. It is left in because it is at least a decision somebody made about
-    this checkout, and git offers no flag to switch it off.
 
     The entry is probed exactly as it is written, trailing slash included: a `foo/`
     pattern matches directories only, and git decides what a path *is* by looking at the
@@ -240,10 +261,7 @@ def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
     for entry in entries:
         if entry in present or entry.rstrip("/") in present:
             continue
-        # `check-ignore` exits non-zero when the path is not ignored, which `git()`
-        # returns as None. A git that cannot answer at all lands in the same branch, and
-        # a line that turns out to have been redundant is the cheap way to be wrong.
-        if git(repo, "-c", NO_GLOBAL_EXCLUDES, "check-ignore", "-q", entry) is not None:
+        if carried_by_repository(repo, entry):
             continue
         missing.append(entry)
     return missing

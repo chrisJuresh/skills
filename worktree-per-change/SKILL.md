@@ -419,10 +419,12 @@ Two ways to fix it, and the second is better for anything a *human* also needs:
   ([below](#the-worktrees-live-inside-the-repo-so-its-own-tooling-can-see-them)).
   `install.py` writes both ignore entries now, and asks *git* rather than the file, so a
   repo that already covers them under a broader pattern does not collect a second line
-  saying the same thing. What it will not do is read your **machine's** global ignore as an
-  answer: the question is whether the repository carries the rule, and a
-  `core.excludesFile` is true only where it lives — measured, an honest check against it
-  reported nothing missing and shipped the repo to everybody else without the entry.
+  saying the same thing. What it will not do is read your **machine's** ignores as an
+  answer — a global `core.excludesFile`, or the clone's own `.git/info/exclude`, which
+  lives in the git directory and is never committed. The question is whether the
+  repository carries the rule, and only a tracked `.gitignore` answers it: measured against
+  each of the other two, an honest check reported the entry covered and shipped the repo
+  to everybody else without it.
 - **Or accept that it is untracked, and write it into every worktree yourself.** Some
   repositories cannot take the commit at all — see [installing where nothing may be
   committed](#installing-where-nothing-may-be-committed) below.
