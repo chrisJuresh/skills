@@ -98,6 +98,53 @@ def fresh(root: Path, name: str) -> Path:
     return repo
 
 
+def git_in(tree: Path, *args: str) -> str:
+    result = subprocess.run(["git", "-C", str(tree), *args], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def remoted(root: Path, name: str) -> Path:
+    """A repository with a bare `origin` holding one commit on `main`, as a real one has.
+
+    `fresh` repositories have no remote, so every install into one is written in place —
+    which is the right behaviour there and exactly why it cannot test the default.
+    """
+    remote = root / f"{name}.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    repo = fresh(root, name)
+    for args in (("checkout", "-q", "-b", "main"),
+                 ("config", "user.name", "install test"),
+                 ("config", "user.email", "install-test@example.invalid"),
+                 ("config", "commit.gpgsign", "false")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    (repo / "README").write_bytes(b"a repository" + bytes([10]))
+    # Captured, not checked for silence: `core.autocrlf` warns about the README on Windows.
+    subprocess.run(["git", "-C", str(repo), "add", "README"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "first"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                   check=True, capture_output=True)
+    return repo
+
+
+def checkout_bytes(repo: Path) -> dict:
+    """Every file in the checkout by path, leaving out `.git` and the worktrees under it."""
+    found = {}
+    for path in repo.rglob("*"):
+        relative = path.relative_to(repo).as_posix()
+        if relative.split("/")[0] == ".git" or relative.startswith(".claude/worktrees/"):
+            continue
+        if path.is_file():
+            found[relative] = path.read_bytes()
+    return found
+
+
+def install_branches(repo: Path) -> list[str]:
+    return git_in(repo, "for-each-ref", "--format=%(refname:short)",
+                  "refs/heads/install-worktree-per-change*").splitlines()
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -110,6 +157,10 @@ def main() -> int:
               ["PreToolUse", "SessionStart", "Stop"])
         check("the guard is copied in", (repo / ".claude" / "hooks" / "worktree-guard.py").is_file(), True)
         check("the branch is recorded", config_of(repo).get("integrationBranch"), "development")
+        # No `origin`, so nothing to cut a worktree from or land into: written where it was
+        # asked for, and saying so rather than leaving the operator to work out which.
+        check("a repo with no origin is installed in place, and told so",
+              "in place" in result.stdout and "no `origin` remote" in result.stdout, True)
 
         # --- the provenance of the copy -------------------------------------------
         # A committed guard is a fork the moment the skill moves, and a stale one still
@@ -604,6 +655,177 @@ def main() -> int:
         )
         check("a user-scope install ignores --session-ownership",
               "worktree_owner.py" in out.stdout, False)
+
+        # --- a committed install is a change, and is made as one ---------------------
+        # It used to be written into the main checkout with "commit these" printed after
+        # it. Measured 2026-10-16: the guard it had just registered denied that `git add`
+        # in the same session, and the files had to be cleared out by hand before the main
+        # checkout would pull again. So it is cut, written and committed where every change
+        # is, and the main checkout is not touched at all.
+        landed = remoted(root, "landed")
+        untouched = checkout_bytes(landed)
+        out = install(landed, "--branch", "main", "--session-ownership")
+        check("an install into a repo with an origin succeeds", out.returncode, 0)
+        made = install_branches(landed)
+        check("it makes exactly one branch of its own", len(made), 1)
+        topic = made[0] if made else "install-worktree-per-change-missing"
+        tree = landed / ".claude" / "worktrees" / topic
+        check("in a worktree of the same name under the worktrees root",
+              (tree / ".git").is_file(), True)
+        check("the main checkout is left byte for byte as it was",
+              checkout_bytes(landed) == untouched, True)
+        check("so it holds no guard yet", (landed / ".claude" / "hooks").exists(), False)
+        check("and is still on its own branch",
+              git_in(landed, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        # Until the install lands nothing in the main checkout ignores the worktrees, and
+        # its status would show `?? .claude/worktrees/` — the one line a `git add -A` turns
+        # into a gitlink, at the one moment no guard is there to stop it. This clone's
+        # exclude closes that window; the tracked .gitignore is still what carries it.
+        check("its status stays empty while the install is in flight",
+              git_in(landed, "status", "--porcelain"), "")
+        check("because this clone excludes the worktrees root",
+              "/.claude/worktrees/" in (landed / ".git" / "info" / "exclude")
+              .read_text(encoding="utf-8").splitlines(), True)
+        check("the branch commits exactly the files the install wrote",
+              sorted(git_in(landed, "diff", "--name-only", "origin/main", topic).splitlines()),
+              [".claude/hooks/worktree-guard.py", ".claude/hooks/worktree-owner.py",
+               ".claude/scripts/land.py", ".claude/settings.json",
+               ".claude/worktree-per-change.json", ".gitignore", ".worktreeinclude"])
+        check("in one commit on top of the fetched base",
+              git_in(landed, "rev-list", "--count", f"origin/main..{topic}"), "1")
+        check("leaving nothing uncommitted in the worktree", git_in(tree, "status", "--porcelain"), "")
+        check("and nothing pushed — landing is land.py's job",
+              git_in(landed, "ls-remote", "--heads", "origin", topic), "")
+        synced = (config_of(tree).get("guard") or {}).get("syncedFrom")
+        if synced:
+            check("the commit records where the copy came from",
+                  f"syncedFrom: {synced}" in git_in(landed, "log", "-1", "--format=%B", topic),
+                  True)
+        check("the one next step is land.py, from inside that worktree",
+              "land.py" in out.stdout and topic in out.stdout.split("Next:", 1)[-1], True)
+        # land.py reads the integration branch from the MAIN checkout, which has no record
+        # until this lands — so on its own it would fall back to its default and aim the
+        # pull request at a branch this repository does not integrate through.
+        check("naming the branch land.py cannot read yet",
+              "CLAUDE_INTEGRATION_BRANCH=main python .claude/scripts/land.py" in out.stdout, True)
+
+        # Refused, never reused or overwritten: a second install in flight writes the same
+        # files and conflicts with the first, and a half-landed one is its owner's question.
+        again = install(landed, "--branch", "main")
+        check("a second install while the first stands is refused", again.returncode, 2)
+        check("...naming what is standing", topic in again.stderr, True)
+        check("...and cutting nothing", install_branches(landed), [topic])
+        squatted = remoted(root, "squatted")
+        subprocess.run(["git", "-C", str(squatted), "branch", "install-worktree-per-change"],
+                       check=True)
+        check("an install branch that is already there is refused",
+              install(squatted, "--branch", "main").returncode, 2)
+        check("...with no worktree cut beside it",
+              (squatted / ".claude" / "worktrees").exists(), False)
+        # A directory as well: `git worktree remove` deregisters before it deletes, and
+        # keeps the deregistration when the delete fails.
+        leftover = remoted(root, "leftover")
+        (leftover / ".claude" / "worktrees" / "install-worktree-per-change-old").mkdir(parents=True)
+        out = install(leftover, "--branch", "main")
+        check("a leftover install directory is refused too", out.returncode, 2)
+        check("...and named", "install-worktree-per-change-old" in out.stderr, True)
+
+        # --- a resync reads the record the integration branch carries --------------
+        # Land it the way a merged PR would, and leave the main checkout un-pulled — which
+        # under this protocol is its ordinary state. A resync that read the record from
+        # there would find none, drop the ownership hook, and have something to commit.
+        subprocess.run(["git", "-C", str(landed), "push", "-q", "origin", f"{topic}:main"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(landed), "worktree", "remove", "--force", str(tree)],
+                       check=True)
+        subprocess.run(["git", "-C", str(landed), "branch", "-D", topic], check=True,
+                       capture_output=True)
+        out = install(landed, "--branch", "main")
+        check("a resync of what already landed has nothing to land", out.returncode, 0)
+        check("...says so", "nothing to land" in out.stdout, True)
+        check("...and leaves no branch", install_branches(landed), [])
+        check("...or worktree behind", any((landed / ".claude" / "worktrees").iterdir()), False)
+        out = install(landed, "--branch", "main", "--no-session-ownership")
+        check("a resync that changes something commits it", out.returncode, 0)
+        retired = install_branches(landed)
+        check("...including a file it removed, as a deletion",
+              "D\t.claude/hooks/worktree-owner.py"
+              in git_in(landed, "diff", "--name-status", "origin/main",
+                        retired[0] if retired else "main").splitlines(), True)
+        check("...still naming the branch, since the main checkout has pulled no record",
+              "CLAUDE_INTEGRATION_BRANCH=main" in out.stdout, True)
+        check("...and the un-pulled main checkout is still untouched",
+              checkout_bytes(landed) == untouched, True)
+
+        # --- in place: asked for, or where a worktree makes no sense -----------------
+        placed = remoted(root, "placed")
+        out = install(placed, "--branch", "main", "--in-place")
+        check("--in-place succeeds", out.returncode, 0)
+        check("...writes into the checkout itself",
+              (placed / ".claude" / "hooks" / "worktree-guard.py").is_file(), True)
+        check("...with no branch", install_branches(placed), [])
+        check("...or worktree", (placed / ".claude" / "worktrees").exists(), False)
+        check("...and says so", "in place: asked for with --in-place" in out.stdout, True)
+        # A resync of the same install rewrites the settings file with the same bytes. It
+        # used to swap the file's two blocks on the first resync, which is a diff of
+        # nothing that somebody then has to commit, review and land.
+        written = (placed / ".claude" / "settings.json").read_bytes()
+        install(placed, "--branch", "main", "--in-place")
+        check("a resync keeps the settings file's key order",
+              (placed / ".claude" / "settings.json").read_bytes() == written, True)
+
+        # Nothing committed, so nothing to land: a local install on a repo with an origin.
+        localised = remoted(root, "localised")
+        out = install(localised, "--branch", "main", "--settings-file", "settings.local.json",
+                      "--guard-root", str(root / "tooling-local" / ".claude"))
+        check("a local install is written in place even with an origin",
+              (localised / ".claude" / "settings.local.json").is_file(), True)
+        check("...with no branch of its own", install_branches(localised), [])
+        check("...and says why", "nothing this install writes is committed" in out.stdout, True)
+
+        allowlisted = remoted(root, "allowlisted")
+        out = install(allowlisted, "--permissions-only")
+        check("--permissions-only is written in place",
+              bool(permissions_of(allowlisted)) and not install_branches(allowlisted), True)
+        check("...and says so", "in place: --permissions-only" in out.stdout, True)
+
+        reported = remoted(root, "reported")
+        subprocess.run([sys.executable, str(INSTALL), "--repo", str(reported), "--status"],
+                       capture_output=True, text=True)
+        check("--status cuts nothing", install_branches(reported), [])
+
+        scoped = root / "user-scope-real" / ".claude"
+        scoped.mkdir(parents=True)
+        out = subprocess.run(
+            [sys.executable, str(INSTALL), "--branch", "development", "--no-skill"],
+            capture_output=True, text=True, cwd=str(root),
+            env={**__import__("os").environ, "CLAUDE_CONFIG_DIR": str(scoped)},
+        )
+        check("a user-scope install is in place, and says so",
+              "in place: a user-scope install" in out.stdout, True)
+
+        # --- the dry run shows the worktree and writes nothing ------------------------
+        rehearsed = remoted(root, "rehearsed")
+        untouched = checkout_bytes(rehearsed)
+        out = install(rehearsed, "--branch", "main", "--dry-run")
+        check("a worktree dry run exits clean", out.returncode, 0)
+        check("it names the worktree it would cut",
+              "would cut" in out.stdout and ".claude" in out.stdout
+              and "install-worktree-per-change-" in out.stdout, True)
+        check("...the branch, and the fetched base it would cut it from",
+              "from origin/main (fetched)" in out.stdout, True)
+        for name in ("worktree-guard.py", "land.py", "settings.json",
+                     "worktree-per-change.json", ".gitignore", ".worktreeinclude"):
+            check(f"it lists {name} among the files it would write there", name in out.stdout, True)
+        check("it says it would commit them", "would commit exactly those files" in out.stdout, True)
+        check("and that it would exclude the worktrees root",
+              "would exclude /.claude/worktrees/" in out.stdout, True)
+        check("it cuts no branch", install_branches(rehearsed), [])
+        check("...and no worktree", (rehearsed / ".claude").exists(), False)
+        check("...and leaves the checkout as it was", checkout_bytes(rehearsed) == untouched, True)
+        check("...including this clone's excludes",
+              "/.claude/worktrees/" in (rehearsed / ".git" / "info" / "exclude")
+              .read_text(encoding="utf-8"), False)
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:

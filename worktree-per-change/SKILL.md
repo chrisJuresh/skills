@@ -577,25 +577,67 @@ branches mean:
 python "${CLAUDE_SKILL_DIR}/scripts/install.py" --repo . --dry-run
 ```
 
-Show the user that output, then run it without `--dry-run`. It copies the guard to
-`.claude/hooks/` and `land.py` to `.claude/scripts/`, registers three hooks and the
-allowlist in the committed `.claude/settings.json`, writes
-`.claude/worktree-per-change.json` with the integration branch, adds `.claude/worktrees/`
-and `.claude/settings.local.json` to `.gitignore` and `.claude/settings.local.json` to
-`.worktreeinclude`, and links this skill into `~/.claude/skills/` so
-`/worktree-per-change` resolves everywhere. Commit all six, and check `.gitignore` is not
-swallowing the four that have to stay tracked. `--uninstall` leaves the `.gitignore` and
-`.worktreeinclude` entries alone and says so — un-ignoring `.claude/worktrees/` is how a
-stale checkout ends up committed, and that outlives the guard.
+Show the user that output, then run it without `--dry-run`. **The install is itself a
+change, so it is made like one.** It fetches the integration branch, cuts a worktree from
+`origin/<integration>` at `<worktreesRoot>/install-worktree-per-change-<time>` on a branch
+of the same name, and writes everything there: the guard to `.claude/hooks/` and `land.py`
+to `.claude/scripts/`, three hooks and the allowlist in the committed
+`.claude/settings.json`, the integration branch in `.claude/worktree-per-change.json`,
+`.claude/worktrees/` and `.claude/settings.local.json` in `.gitignore`, and
+`.claude/settings.local.json` in `.worktreeinclude` — plus
+`.claude/hooks/worktree-owner.py` with `--session-ownership`. It stages exactly the files
+it wrote, commits them with the `syncedFrom` it recorded, and prints one next step: enter
+that worktree and run `land.py` from inside it. Once that has merged, `git pull --ff-only`
+in the main checkout brings the guard in. It pushes and merges nothing itself. It also
+links this skill into `~/.claude/skills/` so `/worktree-per-change` resolves everywhere.
+
+**The main checkout is not touched, and that is the point.** The installer used to write
+there and print "commit these". Measured 2026-10-16: the guard it had just registered
+denied that `git add` in the same session, and the files then held the checkout off
+`git pull --ff-only` until a person restored and cleaned it by hand — the guard denies
+`git restore` there too. Doing it properly has three consequences worth knowing:
+
+- **On a first install `land.py` cannot read the branch yet.** It reads the record from the
+  main checkout, which has none until this lands, so the printed step passes the branch
+  once: `CLAUDE_INTEGRATION_BRANCH=<integration> python .claude/scripts/land.py`.
+- **Until it lands, nothing in the main checkout ignores `.claude/worktrees/`,** so its
+  `git status` shows `?? .claude/worktrees/` — in the one window where no guard stands
+  between that checkout and a `git add -A` that commits the install's own worktree as a
+  gitlink. So the installer adds `/.claude/worktrees/` to `.git/info/exclude` unless
+  something already hides it. That file is this clone's and never pushed, and the line is
+  redundant rather than wrong once the pull is done. It is not the repository carrying the
+  ignore ([above](#what-a-fresh-worktree-does-not-have)) — the tracked `.gitignore` still
+  gets its entry.
+- **The branch name carries the time,** because `land.py` refuses a branch whose name
+  already has a merged pull request, and a fixed name would be refused on every resync
+  after the first. An earlier install still standing — its branch, its worktree, or a
+  directory left behind — is refused rather than reused: land it or take it down first. A
+  resync that changes nothing removes the worktree it cut and says there was nothing to
+  land.
+
+Check `.gitignore` is not swallowing the four that have to stay tracked. `--uninstall`
+still writes in place; it leaves the `.gitignore` and `.worktreeinclude` entries alone and
+says so — un-ignoring `.claude/worktrees/` is how a stale checkout ends up committed, and
+that outlives the guard.
+
+**`--in-place` keeps the old behaviour:** the files go into the checkout, and committing
+them is yours to do — from a terminal of your own, since the guard sees only Claude's tool
+calls and may already be denying this session's `git add` there. It is also what happens,
+said out loud, wherever a worktree makes no sense: a user-scope install,
+`--settings-file settings.local.json` or `--guard-root` (nothing is committed),
+`--permissions-only`, and a repository with no `origin` remote.
 
 **A repository that has already answered is not asked again.** The commonest run of this
 installer is not a first install but a **resync**, and everything a repo decided for itself
 survives one: the config is merged rather than replaced, `integrationBranch` is read back
 from the record, `sessionOwnership` keeps whichever answer the repo gave, `worktreesRoot` is
 written only when asked for, and the keys nobody's installer writes — `delivery`,
-`protectedMergeTargets`, `mergeIntegrationBeforeLanding` — are never touched. `--branch` is
-how a repository that has genuinely changed its integration branch says so; nothing else
-moves it. `--status` prints the declarations in effect, which is the other half: a mechanism
+`protectedMergeTargets`, `mergeIntegrationBeforeLanding` — are never touched. Through a worktree,
+the record a resync merges into is the one `origin/<integration>` carries, read from the
+worktree cut from it; only the branch's *name* comes from the main checkout, because nothing else can
+say it before it is known, and where the two disagree the installer refuses and asks for
+`--branch`. `--branch` is how a repository that has genuinely changed its integration
+branch says so; nothing else moves it. `--status` prints the declarations in effect, which is the other half: a mechanism
 existing is not the same as *this* repository having used it, and that gap is silent
 everywhere else.
 
@@ -686,8 +728,15 @@ nothing to check.
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.
 
-New hooks apply to sessions started afterwards, so say so rather than letting the user
-assume the current session is covered.
+**Plan as if new hooks cover the sessions already running — the installing one
+included.** This used to say the opposite, and that was wrong in the direction that
+strands a session. Measured 2026-10-16 in the Claude desktop app: an install wrote a
+project's `.claude/settings.json` mid-session, and that same session's very next Bash call,
+a `git add` in the main checkout, was denied by the `PreToolUse` hook it had just
+registered. It may vary by Claude Code version or settings scope, so do not plan a step
+that only works if the current session is *not* covered. An install through a worktree
+puts the hooks on its own branch, so the main checkout gets them with the pull — and a
+session that enters that worktree may get them on its next call.
 
 The integration branch has to exist on the remote before the first PR. If the repo
 integrates through a branch it does not have yet, create it from the default branch and
@@ -871,8 +920,9 @@ doing, what it blocked, why the guard is wrong — and stop.
 
 The guard has holes by design, and each one is defended somewhere above: it **fails open**
 on every question it cannot answer, it sees only Claude's own tool calls, `warn` reports
-without denying, and new hooks apply only to sessions started after the install. So
-arriving in the state this protocol exists to prevent — a write in the main checkout, two
+without denying, and an install reaches the main checkout only once it has landed and been
+pulled — after which whether a session already running picks the hooks up is not
+something to rely on in either direction. So arriving in the state this protocol exists to prevent — a write in the main checkout, two
 sessions in one tree — does not mean anything went wrong with the guard, and it is worth
 knowing the move before you need it. Both of them are the opposite of the instinct.
 
