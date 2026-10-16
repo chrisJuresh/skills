@@ -26,7 +26,7 @@ GUARD_SOURCE = HERE / "worktree_guard.py"
 # and its reader agree on what "the same file" means, and a second copy of the rule here
 # could only ever agree with itself.
 sys.path.insert(0, str(HERE))
-from install import content_hash  # noqa: E402
+from install import SHIM, content_hash  # noqa: E402
 
 PASSED = 0
 FAILED: list[str] = []
@@ -89,6 +89,51 @@ def owner_registrations(repo: Path, name: str = "settings.json") -> list[str]:
                 if "worktree-owner.py" in " ".join(str(p) for p in hook.get("args") or []):
                     found.append(event)
     return sorted(found)
+
+
+def hooks_of(repo: Path, script: str = "worktree-guard.py",
+             name: str = "settings.json") -> dict[str, list[dict]]:
+    """Every registration naming `script`, by event, exactly as the settings file has it."""
+    path = repo / ".claude" / name
+    settings = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    found: dict[str, list[dict]] = {}
+    for event, matchers in (settings.get("hooks") or {}).items():
+        for matcher in matchers:
+            for hook in matcher.get("hooks") or []:
+                if script in " ".join(str(p) for p in hook.get("args") or []):
+                    found.setdefault(event, []).append(hook)
+    return found
+
+
+def to_direct(repo: Path) -> None:
+    """Rewrite every registration of ours into the shape installers wrote before the shim.
+
+    `python -S <script>` and nothing else, which is what every repository installed before
+    it still has, and what a resync has to recognise and replace.
+    """
+    path = repo / ".claude" / "settings.json"
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    for matchers in (settings.get("hooks") or {}).values():
+        for matcher in matchers:
+            for hook in matcher.get("hooks") or []:
+                args = [str(arg) for arg in hook.get("args") or []]
+                if "-c" in args:
+                    hook["args"] = ["-S", args[-1]]
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def run_hook(hook: dict, project: Path, payload: dict) -> subprocess.CompletedProcess:
+    """Run a registration the way Claude Code does: exec form, the project dir substituted.
+
+    No shell, each `args` element one argument exactly as written, and `python` read as the
+    interpreter running these tests, because a committed install names `python` and this
+    machine's may not answer to it.
+    """
+    command = sys.executable if hook["command"] == "python" else hook["command"]
+    args = [str(arg).replace("${CLAUDE_PROJECT_DIR}", str(project))
+            for arg in hook.get("args") or []]
+    return subprocess.run([command, *args], input=json.dumps(payload), capture_output=True,
+                          text=True, cwd=str(project))
 
 
 def fresh(root: Path, name: str) -> Path:
@@ -507,6 +552,173 @@ def main() -> int:
         check("while ours is registered", registrations(legacy),
               ["PreToolUse", "SessionStart", "Stop"])
 
+        # --- a missing script is not a block ----------------------------------------
+        # `python -S <script>` exits 2 when the file is not there, and Claude Code reads
+        # exit 2 from PreToolUse as a block — so a deleted or not-yet-pulled guard refused
+        # every Bash, PowerShell, Edit and Write call in the session. Measured 2026-10-16:
+        # stale copies of the hook files could not safely be deleted mid-session, and a
+        # person had to. So every registration goes through a shim that exits 0 instead.
+        # Status is asked with an empty user scope, so this machine's own settings cannot
+        # answer for the repository under test.
+        nobody = {**__import__("os").environ, "CLAUDE_CONFIG_DIR": str(root / "nobody")}
+        shimmed = fresh(root, "shimmed")
+        install(shimmed, "--session-ownership")
+        guard_hooks = hooks_of(shimmed)
+        check("each event registers the guard once", sorted(guard_hooks),
+              ["PreToolUse", "SessionStart", "Stop"])
+        check("through the shim, with the event and the script as its arguments",
+              {event: hooks[0].get("args") for event, hooks in guard_hooks.items()},
+              {event: ["-S", "-c", SHIM, event,
+                       "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py"]
+               for event in ("PreToolUse", "SessionStart", "Stop")})
+        check("still under the plain interpreter a committed file can carry",
+              {hooks[0].get("command") for hooks in guard_hooks.values()}, {"python"})
+        check("the ownership hook goes through it too",
+              {event: hooks[0].get("args") for event, hooks in
+               hooks_of(shimmed, "worktree-owner.py").items()},
+              {event: ["-S", "-c", SHIM, event,
+                       "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-owner.py"]
+               for event in ("PreToolUse", "SessionStart")})
+        # The shim must not name either script, or recognising ours by file name — which
+        # is how a resync, an uninstall and `--status` all find them — would misfire.
+        check("the shim names neither script",
+              any(name in SHIM for name in ("worktree-guard", "worktree_guard",
+                                            "worktree-owner", "worktree_owner")), False)
+
+        # Present, it behaves exactly as `python -S <script>` does: same output, same
+        # exit code, for a call the guard denies.
+        main_write = {"session_id": "t", "hook_event_name": "PreToolUse", "cwd": str(shimmed),
+                      "tool_name": "Write",
+                      "tool_input": {"file_path": str(shimmed / "a.txt")}}
+        script = shimmed / ".claude" / "hooks" / "worktree-guard.py"
+        through = run_hook(guard_hooks["PreToolUse"][0], shimmed, main_write)
+        direct = subprocess.run([sys.executable, "-S", str(script)], input=json.dumps(main_write),
+                                capture_output=True, text=True, cwd=str(shimmed))
+        check("a present guard still denies a write in the main checkout",
+              '"permissionDecision": "deny"' in through.stdout, True)
+        check("...exactly as running it directly does",
+              (through.returncode, through.stdout, through.stderr),
+              (direct.returncode, direct.stdout, direct.stderr))
+
+        # ...down to what the script itself can see. A probe in the guard's place reports
+        # its argv, its module name, its own path, its sys.path[0] and its stdin, then
+        # writes to stderr and exits 3 — each of which the shim must hand over untouched.
+        probed = fresh(root, "probed")
+        install(probed)
+        probe = probed / ".claude" / "hooks" / "worktree-guard.py"
+        probe.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'argv': sys.argv, 'name': __name__, 'file': __file__,\n"
+            "                  'path0': sys.path[0], 'stdin': sys.stdin.read()}))\n"
+            "print('to stderr', file=sys.stderr)\n"
+            "sys.exit(3)\n", encoding="utf-8")
+        payload = {"hook_event_name": "PreToolUse", "cwd": str(probed)}
+        through = run_hook(hooks_of(probed)["PreToolUse"][0], probed, payload)
+        direct = subprocess.run([sys.executable, "-S", str(probe)], input=json.dumps(payload),
+                                capture_output=True, text=True, cwd=str(probed))
+        seen, expected = json.loads(through.stdout or "{}"), json.loads(direct.stdout or "{}")
+        check("the script's exit code passes through", through.returncode, 3)
+        check("...and its stderr", through.stderr, direct.stderr)
+        check("it reads the payload from stdin as before", seen.get("stdin"), json.dumps(payload))
+        check("it runs as __main__", seen.get("name"), "__main__")
+        check("with argv shifted to just the script",
+              [Path(arg).resolve() for arg in seen.get("argv") or []],
+              [Path(arg).resolve() for arg in expected.get("argv") or []])
+        check("knowing its own path", Path(seen.get("file") or ".").resolve(), probe.resolve())
+        # Not the cwd: `-c` puts the cwd there, the cwd is the repository, and a `json.py`
+        # at its root would otherwise be imported in place of the stdlib's.
+        check("with its own directory first on sys.path, not the repository",
+              Path(seen.get("path0") or ".").resolve(),
+              Path(expected.get("path0") or "..").resolve())
+        (probed / "json.py").write_text("raise SystemExit('the repository shadowed json')\n",
+                                        encoding="utf-8")
+        check("so a module at the repository's root cannot stand in for the stdlib",
+              run_hook(hooks_of(probed)["PreToolUse"][0], probed, payload).returncode, 3)
+
+        # Missing, it exits 0 — silently on the two events that run on every call, and
+        # out loud on SessionStart, whose stdout reaches the session as context.
+        script.unlink()
+        main_add = {"session_id": "t", "hook_event_name": "PreToolUse", "cwd": str(shimmed),
+                    "tool_name": "Bash", "tool_input": {"command": "git add -A"}}
+        blocked = run_hook(guard_hooks["PreToolUse"][0], shimmed, main_add)
+        check("a missing guard does not block PreToolUse",
+              (blocked.returncode, blocked.stdout, blocked.stderr), (0, "", ""))
+        stopped = run_hook(guard_hooks["Stop"][0], shimmed,
+                           {"session_id": "t", "hook_event_name": "Stop", "cwd": str(shimmed)})
+        check("...nor Stop", (stopped.returncode, stopped.stdout, stopped.stderr), (0, "", ""))
+        started = run_hook(guard_hooks["SessionStart"][0], shimmed,
+                           {"session_id": "t", "hook_event_name": "SessionStart",
+                            "cwd": str(shimmed)})
+        check("SessionStart exits 0 too", started.returncode, 0)
+        check("...and says, on one line, that nothing is enforced",
+              "worktree-guard.py is registered as a hook but missing at" in started.stdout
+              and "nothing it enforces is enforced" in started.stdout
+              and len(started.stdout.strip().splitlines()) == 1, True)
+        # As a path, not a string: `${CLAUDE_PROJECT_DIR}/...` mixes separators on Windows.
+        named = started.stdout.split("missing at ", 1)[-1].split(", so nothing", 1)[0]
+        check("...naming where it looked", Path(named).resolve(), script.resolve())
+        told = subprocess.run([sys.executable, str(INSTALL), "--repo", str(shimmed), "--status"],
+                              capture_output=True, text=True, env=nobody).stdout
+        check("--status says the registered script is missing",
+              "is registered but missing, so nothing it enforces is enforced" in told, True)
+        # The shape this replaces, against the same missing file: the block it existed for.
+        to_direct(shimmed)
+        before = run_hook(hooks_of(shimmed)["PreToolUse"][0], shimmed, main_add)
+        check("the old shape blocks every call when the file is missing", before.returncode, 2)
+
+        # --- the old shape is upgraded, never doubled -------------------------------
+        # Every repository installed before the shim has `python -S <script>`. A resync has
+        # to replace those registrations rather than add the new ones beside them, keep
+        # anything the repo registered itself, and leave the file's key order alone.
+        upgraded = fresh(root, "upgraded")
+        install(upgraded, "--session-ownership")
+        to_direct(upgraded)
+        settings_file = upgraded / ".claude" / "settings.json"
+        blob = json.loads(settings_file.read_text(encoding="utf-8"))
+        blob["hooks"]["PreToolUse"].append(
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo", "args": ["x"]}]})
+        settings_file.write_text(json.dumps(blob, indent=2) + "\n", encoding="utf-8")
+        told = subprocess.run([sys.executable, str(INSTALL), "--repo", str(upgraded), "--status"],
+                              capture_output=True, text=True, env=nobody).stdout
+        check("--status recognises the old shape as installed",
+              "settings.json  ->  installed (PreToolUse, SessionStart, Stop)" in told, True)
+        check("...and says what it costs", "registered as `python -S <script>`" in told, True)
+        keys = list(json.loads(settings_file.read_text(encoding="utf-8")))
+        check("a resync over the old shape succeeds", install(upgraded).returncode, 0)
+        check("it leaves one guard registration per event",
+              {event: len(hooks) for event, hooks in hooks_of(upgraded).items()},
+              {"PreToolUse": 1, "SessionStart": 1, "Stop": 1})
+        check("...and one ownership registration per event",
+              {event: len(hooks) for event, hooks in
+               hooks_of(upgraded, "worktree-owner.py").items()},
+              {"PreToolUse": 1, "SessionStart": 1})
+        check("all of them in the new shape",
+              all("-c" in hook["args"]
+                  for found in (hooks_of(upgraded), hooks_of(upgraded, "worktree-owner.py"))
+                  for hooks in found.values() for hook in hooks), True)
+        check("the repo's own hook beside them survives",
+              any(hook.get("command") == "echo"
+                  for matcher in json.loads(settings_file.read_text(encoding="utf-8"))
+                  ["hooks"]["PreToolUse"] for hook in matcher.get("hooks") or []), True)
+        check("the file's key order survives the upgrade",
+              list(json.loads(settings_file.read_text(encoding="utf-8"))), keys)
+        told = subprocess.run([sys.executable, str(INSTALL), "--repo", str(upgraded), "--status"],
+                              capture_output=True, text=True, env=nobody).stdout
+        check("--status stops warning once it is upgraded",
+              "registered as `python -S <script>`" in told, False)
+
+        # --- uninstall takes either shape -------------------------------------------
+        for shape in ("new", "old"):
+            removed = fresh(root, f"uninstall-{shape}")
+            install(removed, "--session-ownership")
+            if shape == "old":
+                to_direct(removed)
+            install(removed, "--uninstall")
+            check(f"uninstall clears the {shape} shape's guard registrations",
+                  hooks_of(removed), {})
+            check(f"...and the {shape} shape's ownership ones",
+                  hooks_of(removed, "worktree-owner.py"), {})
+
         # --- installing where nothing may be committed ----------------------------
         # A committed guard changes what a COLLEAGUE's session may do in their own working
         # directory. Where that is not wanted, the install still has to be a real install:
@@ -537,6 +749,13 @@ def main() -> int:
               "CLAUDE_PROJECT_DIR" in registered, False)
         # Compared against the parsed args, not the serialised text: `json.dumps` escapes
         # every backslash, so a substring test for a Windows path passes only on POSIX.
+        local_hooks = hooks_of(local, name="settings.local.json")
+        check("--guard-root registers through the same shim",
+              {event: hooks[0].get("args")[:4] for event, hooks in local_hooks.items()},
+              {event: ["-S", "-c", SHIM, event] for event in ("PreToolUse", "SessionStart", "Stop")})
+        check("...with the absolute path as the script it runs",
+              {Path(hooks[0].get("args")[-1]) for hooks in local_hooks.values()},
+              {outside / "hooks" / "worktree-guard.py"})
         check("and it names the file that exists",
               any(Path(arg) == outside / "hooks" / "worktree-guard.py"
                   for event in (local_settings.get("hooks") or {}).values()

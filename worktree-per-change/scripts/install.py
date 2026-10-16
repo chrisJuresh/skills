@@ -340,6 +340,48 @@ EVENTS = ("PreToolUse", "SessionStart", "Stop")
 # session ending is not a write. Registering it there would cost a interpreter start per
 # stop to decide nothing.
 OWNER_EVENTS = ("PreToolUse", "SessionStart")
+
+# Every hook this installer registers runs through this, with the event and the script's
+# path as its arguments, instead of as `python -S <script>`. The difference is the one
+# question no script can answer for itself: whether it is there at all. Python exits 2 when
+# it cannot open a script, and Claude Code reads exit 2 from `PreToolUse` as a block — so a
+# guard that was deleted, or not pulled yet, refused every Bash, PowerShell, Edit and Write
+# call in the session, which is the opposite of the rule that it fails open on anything it
+# cannot answer. Measured 2026-10-16: it made deleting stale untracked copies of the hook
+# files from a main checkout unsafe mid-session, and a person had to do it instead.
+#
+# So a missing script exits 0, and says so only on `SessionStart`, whose stdout reaches the
+# session as context; `PreToolUse` and `Stop` stay silent. That is a trade, not a free fix:
+# a deleted guard now stops enforcing without a word on every call, and the SessionStart
+# notice is how anybody finds out.
+#
+# Otherwise the script runs in the real `__main__` module, with argv shifted to `[script]`,
+# and its stdin, stdout, stderr and exit code are its own. Its directory goes where
+# `python <script>` would have put it on `sys.path`, and BEFORE anything is imported: `-c`
+# puts the cwd there instead, the cwd is the repository, and a stray `json.py` at its root
+# would otherwise be imported in place of the stdlib's. `exec` rather than `runpy`, which
+# pulls in `pkgutil`: measured on Windows, ~4 ms over `python -S <script>` against ~11 ms.
+#
+# No double quotes, `$` or backslashes in it, so it reads plainly in the JSON it lands in.
+# It reaches the interpreter as one argument because `args` is exec form: no shell.
+SHIM = "\n".join([
+    "import os, sys",
+    "event, script = sys.argv[1:3]",
+    "if not os.path.isfile(script):",
+    "    if event == 'SessionStart':",
+    "        print(f'worktree-per-change: {os.path.basename(script)} is registered as a hook'",
+    "              f' but missing at {script}, so nothing it enforces is enforced.'",
+    "              ' Restore it (git pull, or re-run install.py) or remove the registration.')",
+    "    sys.exit(0)",
+    "del sys.argv[:2], event",
+    "if not getattr(sys.flags, 'safe_path', False):",
+    "    sys.path[0] = os.path.dirname(os.path.realpath(script))",
+    "with open(script, 'rb') as source:",
+    "    code = compile(source.read(), script, 'exec')",
+    "__file__ = script",
+    "exec(code)",
+])
+
 STATE_DIRNAME = "claude-worktree-gate"
 
 # Guards this one supersedes. A repo that ships one of these is mid-migration, not
@@ -530,6 +572,33 @@ def is_legacy(hook: dict) -> bool:
     return not is_ours(hook) and bool(LEGACY_GUARD.search(hook_text(hook)))
 
 
+def is_direct(hook: dict) -> bool:
+    """A registration of ours in the shape before `SHIM`: `python -S <script>`.
+
+    Recognised, never written. `strip` already takes both shapes by the script's name, so a
+    resync replaces this one rather than adding the new one beside it; `--status` uses it to
+    say which repositories still block every call when the file goes missing.
+    """
+    return is_ours(hook) and "-c" not in [str(arg) for arg in hook.get("args") or []]
+
+
+def registered_script(hook: dict, project: Path | None) -> Path | None:
+    """The script a registration of ours runs, in either shape, or None if it cannot say.
+
+    The last argument naming one of the two scripts, with `${CLAUDE_PROJECT_DIR}` read as
+    the repository being reported on. Anything still unexpanded after that is a path this
+    cannot check, and a status that guessed at it would report a missing file that is not.
+    """
+    names = (GUARD_FILENAME, "worktree_guard.py", OWNER_FILENAME, "worktree_owner.py")
+    for arg in reversed([str(arg) for arg in hook.get("args") or []]):
+        if not arg.endswith(names):
+            continue
+        if project is not None:
+            arg = arg.replace("${CLAUDE_PROJECT_DIR}", str(project))
+        return None if "$" in arg else Path(arg)
+    return None
+
+
 def link_skill(user_root: Path, dry_run: bool) -> str:
     """Make `/worktree-per-change` resolve in every repo.
 
@@ -599,8 +668,9 @@ def strip(settings: dict, also_legacy: bool) -> tuple[dict, list[str]]:
 def entry(interpreter: str, script: str, event: str, owner: bool = False) -> dict:
     # `-S` skips site initialisation, ~13% of interpreter startup and worth having on a
     # hook that runs before every write-tool call. Both hooks are stdlib-only by design so
-    # that they can.
-    hook = {"type": "command", "command": interpreter, "args": ["-S", script], "timeout": 10}
+    # that they can. The script goes through `SHIM`, so that its absence is not a block.
+    hook = {"type": "command", "command": interpreter,
+            "args": ["-S", "-c", SHIM, event, script], "timeout": 10}
     if event == "PreToolUse":
         hook["statusMessage"] = (
             "Checking this worktree is this session's" if owner
@@ -795,7 +865,8 @@ def report_status(user_root: Path, repo: Path | None) -> int:
         if label == "local" and not settings_path(root, name).is_file():
             continue
         settings = load(settings_path(root, name))
-        events, owner_events, legacy = [], [], []
+        events, owner_events, legacy, direct = [], [], [], []
+        missing: dict[str, Path] = {}
         for event, matchers in (settings.get("hooks") or {}).items():
             for matcher in matchers if isinstance(matchers, list) else []:
                 for hook in (matcher or {}).get("hooks") or []:
@@ -810,6 +881,11 @@ def report_status(user_root: Path, repo: Path | None) -> int:
                         events.append(event)
                     elif is_legacy(hook):
                         legacy.append(event)
+                    if is_direct(hook):
+                        direct.append(event)
+                    script = registered_script(hook, repo if label != "user" else None)
+                    if script is not None and not script.is_file():
+                        missing[str(script)] = script
         state = f"installed ({', '.join(sorted(set(events)))})" if events else "not installed"
         print(f"{label:5} {settings_path(root, name)}  ->  {state}")
         if owner_events:
@@ -819,6 +895,15 @@ def report_status(user_root: Path, repo: Path | None) -> int:
                   "writes it there")
         if legacy:
             print(f"      ! a predecessor guard is still registered ({', '.join(sorted(set(legacy)))})")
+        # The two halves of failing open on a missing script. A registration in the old
+        # shape blocks every call when its file goes; one in the new shape lets every call
+        # through, and this is one of the two places that says so.
+        if direct:
+            print(f"      ! registered as `python -S <script>` ({', '.join(sorted(set(direct)))}): "
+                  "if that file goes missing, Python exits 2 and every tool call is blocked — "
+                  "re-running the installer upgrades it")
+        for script in missing:
+            print(f"      ! {script} is registered but missing, so nothing it enforces is enforced")
 
     print(f"\nmode: {os.environ.get('CLAUDE_WORKTREE_GATE') or 'on (default)'}"
           f"   ownership: {os.environ.get('CLAUDE_WORKTREE_OWNER') or 'on (default)'}")
