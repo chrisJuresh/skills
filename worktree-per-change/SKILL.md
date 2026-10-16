@@ -89,6 +89,15 @@ A bare `<integration>`, a bare `git log`, and a file read from the main checkout
 from whenever this disk last caught up. That is the expensive kind of stale: unlike a bad
 base it never surfaces as a conflict, so the reading is simply wrong and looks fine.
 
+**Under Git Bash on Windows, MSYS path conversion rewrites that `git show` argument** when
+the path starts with a dot — every `.claude/…` file this protocol installs. Measured
+2026-10-16: `origin/main:.claude/settings.json` reached git as
+`origin\main;.claude\settings.json`, and git said `fatal: ambiguous argument`.
+`MSYS_NO_PATHCONV=1 git show origin/main:.claude/settings.json` passes it through
+untouched; so does `origin/main:./.claude/settings.json`, which git reads relative to the
+current directory, so run that one from the repository root. The first is an environment
+prefix, which an allow rule for `git show` does not match past. PowerShell is not affected.
+
 That is also why a bare `EnterWorktree` (no `git worktree add` first) is only correct when
 the repository's **default branch is also its integration branch** *and* you want it fresh
 from the remote. `worktree.baseRef` never accepts a branch name — it chooses between two
@@ -410,8 +419,9 @@ Two ways to fix it, and the second is better for anything a *human* also needs:
   a worktree that is missing a secret and says nothing.
 - **Un-ignore the file.** If every worktree needs it and it holds nothing private, the
   honest answer is to commit it — a worktree only gets a file if git puts it there. This
-  applies to the guard itself: `.claude/settings.json`, `.claude/hooks/worktree-guard.py`
-  and `.claude/worktree-per-change.json` must be tracked, or the rule stops applying
+  applies to the guard itself: `.claude/settings.json`, `.claude/hooks/` (the guard, and
+  `worktree-owner.py` where it is installed), `.claude/scripts/land.py` and
+  `.claude/worktree-per-change.json` must be tracked, or the rule stops applying
   inside the very worktrees it sends you to. A repo that ignores `.claude/` wholesale
   needs its ignore narrowed to name them, keeping `settings.local.json` and
   `.claude/worktrees/` out — the second stays ignored for a reason of its own, and the
@@ -478,6 +488,18 @@ It merges rather than replaces, so re-running it to resync keeps the branch and 
 else the repo keeps in that file. `syncedFrom` is absent when the skill directory is not a
 git checkout — a tarball cannot name a commit, and saying nothing is honest where a stale
 sha is not.
+
+**A `syncedFrom` can be stale too, and the installer says so before it writes one.** It is
+whatever commit the skill's own checkout is at. Measured 2026-10-16: a clone one commit
+behind GitHub installed without a word, and the record named the stale commit. So when the
+skill's checkout is behind its upstream tracking ref, an install, a resync and a dry run
+each open with a warning saying how far — and install anyway, because this is about the
+copy's age, not its correctness. `--status` prints the same line, or says the
+checkout is current. Both read the **last-fetched** refs and say "as of its last fetch":
+the installer never fetches, so it works offline and writes nothing into the skill's
+repository, and a clone nobody has fetched looks current. Under this protocol that is the
+rarer case, since a clone worked in this way fetches before every worktree it cuts.
+`git pull --ff-only` in the skill's checkout is the fix.
 
 **That merge is also what makes the rest of this file the repository's to write.** Five more
 keys have accumulated there, one incident each, and every one of them is optional and off
@@ -621,7 +643,10 @@ denied that `git add` in the same session, and the files then held the checkout 
   resync that changes nothing removes the worktree it cut and says there was nothing to
   land.
 
-Check `.gitignore` is not swallowing the four that have to stay tracked. `--uninstall`
+Check `.gitignore` is not swallowing any of the files the install commits — how many
+depends on the flags, so read the list it prints rather than counting. `git add` refuses an
+ignored path, so the install stops before its commit, with every file written in its
+worktree and the ignored one left unstaged. `--uninstall`
 still writes in place; it leaves the `.gitignore` and `.worktreeinclude` entries alone and
 says so — un-ignoring `.claude/worktrees/` is how a stale checkout ends up committed, and
 that outlives the guard.
@@ -751,11 +776,12 @@ nothing to check.
   guard into the next repo is exactly that shape of task.
 - `--status` reports what is installed — including a local install and the ownership hook,
   a registered script that is missing, and a registration still in the shape that blocks
-  every call when it is — which branch this repo integrates through, **which of the
-  optional declarations it has made**, whether the cwd may write, every worktree with what
-  it is still holding and which session is holding it, and whether the `.gitignore` and
-  `.worktreeinclude` entries are there, which is how a repo installed before the installer
-  wrote them finds out, since nothing at runtime repairs either.
+  every call when it is — whether the skill it would install from is behind its upstream,
+  which branch this repo integrates through, **which of the optional declarations it has
+  made**, whether the cwd may write, every worktree with what it is still holding and which
+  session is holding it, and whether the `.gitignore` and `.worktreeinclude` entries are
+  there, which is how a repo installed before the installer wrote them finds out, since
+  nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.

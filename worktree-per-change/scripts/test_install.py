@@ -173,6 +173,42 @@ def remoted(root: Path, name: str) -> Path:
     return repo
 
 
+def skill_clone(root: Path, name: str) -> tuple[Path, Path]:
+    """A clone carrying this skill's scripts, and a second clone that can move its upstream.
+
+    The installer judges whether it is current by the directory it runs from, so the only
+    honest test runs a COPY of it from a checkout whose history the test controls. Returns
+    the clone the installer runs from and the one that pushes past it.
+    """
+    upstream = root / f"{name}.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True)
+    seed = remoted_from(root / f"{name}-seed", upstream)
+    scripts = seed / "worktree-per-change" / "scripts"
+    scripts.mkdir(parents=True)
+    for script in ("install.py", "worktree_guard.py", "worktree_owner.py", "land.py"):
+        shutil.copy2(HERE / script, scripts / script)
+    for args in (("add", "worktree-per-change"), ("commit", "-q", "-m", "the skill"),
+                 ("push", "-q", "-u", "origin", "main")):
+        subprocess.run(["git", "-C", str(seed), *args], check=True, capture_output=True)
+    clone = root / f"{name}-clone"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(upstream), str(clone)], check=True,
+                   capture_output=True)
+    return clone, seed
+
+
+def remoted_from(repo: Path, upstream: Path) -> Path:
+    """An empty repository on `main` with `upstream` as its origin, ready to commit."""
+    repo.mkdir(parents=True)
+    for args in (("init", "-q", str(repo)),
+                 ("-C", str(repo), "checkout", "-q", "-b", "main"),
+                 ("-C", str(repo), "config", "user.name", "install test"),
+                 ("-C", str(repo), "config", "user.email", "install-test@example.invalid"),
+                 ("-C", str(repo), "config", "commit.gpgsign", "false"),
+                 ("-C", str(repo), "remote", "add", "origin", str(upstream))):
+        subprocess.run(["git", *args], check=True, capture_output=True)
+    return repo
+
+
 def checkout_bytes(repo: Path) -> dict:
     """Every file in the checkout by path, leaving out `.git` and the worktrees under it."""
     found = {}
@@ -1064,6 +1100,80 @@ def main() -> int:
         check("...including this clone's excludes",
               "/.claude/worktrees/" in (rehearsed / ".git" / "info" / "exclude")
               .read_text(encoding="utf-8"), False)
+
+        # --- an install from a stale clone says so, and still installs ---------------
+        # `syncedFrom` is whatever HEAD the skill's own checkout is at, and nothing asked
+        # whether that was current. Measured 2026-10-16: a clone one commit behind GitHub
+        # installed without a word, and its record named the stale commit. The answer comes
+        # from the last-fetched refs — the installer never reaches the network itself.
+        clone, seed = skill_clone(root, "skill")
+        cloned = clone / "worktree-per-change" / "scripts" / "install.py"
+
+        def from_clone(target: Path, *extra: str) -> subprocess.CompletedProcess:
+            return subprocess.run([sys.executable, str(cloned), "--repo", str(target),
+                                   "--branch", "development", "--no-skill", *extra],
+                                  capture_output=True, text=True)
+
+        out = from_clone(fresh(root, "from-current"))
+        check("a current clone installs without a warning", "behind" in out.stdout, False)
+        check("...and its status says it is current, and as of when",
+              "up to date with origin/main as of its last fetch"
+              in from_clone(root / "from-current", "--status").stdout, True)
+
+        (seed / "NEWS").write_text("a change that landed upstream\n", encoding="utf-8")
+        for args in (("add", "NEWS"), ("commit", "-q", "-m", "landed"), ("push", "-q")):
+            subprocess.run(["git", "-C", str(seed), *args], check=True, capture_output=True)
+        out = from_clone(fresh(root, "unfetched"))
+        check("with nothing fetched it cannot know, and does not go and ask",
+              "behind" in out.stdout, False)
+
+        subprocess.run(["git", "-C", str(clone), "fetch", "-q"], check=True, capture_output=True)
+        stale_target = fresh(root, "from-stale")
+        out = from_clone(stale_target)
+        check("a clone behind its last-fetched upstream warns",
+              "1 commit(s) behind origin/main as of its last fetch" in out.stdout, True)
+        check("...before the rest of the report, so it is not lost under it",
+              out.stdout.startswith("warning:"), True)
+        check("...and does not refuse", out.returncode, 0)
+        check("...so the guard is still installed",
+              (stale_target / ".claude" / "hooks" / "worktree-guard.py").is_file(), True)
+        check("...recording the commit it actually came from",
+              (config_of(stale_target).get("guard") or {}).get("syncedFrom"),
+              git_in(clone, "rev-parse", "HEAD"))
+        check("the dry run warns too",
+              "behind origin/main" in from_clone(fresh(root, "stale-dry"), "--dry-run").stdout,
+              True)
+        check("--status says the same",
+              "1 commit(s) behind origin/main as of its last fetch; `git pull --ff-only`"
+              in from_clone(stale_target, "--status").stdout, True)
+        check("--uninstall has nothing to warn about",
+              "behind" in from_clone(stale_target, "--uninstall").stdout, False)
+
+        subprocess.run(["git", "-C", str(clone), "pull", "-q", "--ff-only"], check=True,
+                       capture_output=True)
+        check("pulling clears it", "behind" in from_clone(fresh(root, "pulled")).stdout, False)
+
+        # A branch with no upstream, and a directory that is not a checkout at all, have
+        # nothing to compare with — and say that in --status rather than claiming currency.
+        subprocess.run(["git", "-C", str(clone), "switch", "-q", "-c", "local-only"], check=True,
+                       capture_output=True)
+        check("a branch with no upstream installs without a warning",
+              "behind" in from_clone(fresh(root, "no-upstream")).stdout, False)
+        check("...and its status says there is nothing to compare with",
+              "no upstream to compare it with"
+              in from_clone(root / "no-upstream", "--status").stdout, True)
+        unpacked = root / "unpacked" / "worktree-per-change"
+        shutil.copytree(clone / "worktree-per-change", unpacked)
+        out = subprocess.run([sys.executable, str(unpacked / "scripts" / "install.py"),
+                              "--repo", str(fresh(root, "from-unpacked")), "--branch",
+                              "development", "--no-skill"], capture_output=True, text=True)
+        check("a skill that is not a checkout installs without a warning",
+              (out.returncode, "behind" in out.stdout), (0, False))
+        out = subprocess.run([sys.executable, str(unpacked / "scripts" / "install.py"),
+                              "--repo", str(root / "from-unpacked"), "--status"],
+                             capture_output=True, text=True)
+        check("...and its status says how current it is cannot be said",
+              "not a git checkout, so how current it is cannot be said" in out.stdout, True)
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:
