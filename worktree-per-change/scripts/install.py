@@ -1109,15 +1109,19 @@ class Staging:
         why = None
         if not command:
             command = land_command(land_path(self.tree / ".claude"), self.tree, interpreter)
-            # `land.py` reads the integration branch from the MAIN checkout, which has no
-            # record of one until this lands. On a first install, or a change of branch, it
-            # would fall back to its default and aim the PR at the wrong base — so its own
+            # `land.py` reads the integration branch from the MAIN checkout, and from this
+            # worktree's record only where the main checkout has none — so a first install,
+            # or a resync into a checkout that never pulled one, needs nothing said and
+            # gets the plain command its allowlist entry matches. A main checkout that
+            # records anything else still wins there, so for a change of branch its own
             # operator override says it, once.
-            recorded = load(self.main_root / ".claude" / CONFIG_FILENAME).get("integrationBranch")
-            if recorded != self.branch:
+            main_record = self.main_root / ".claude" / CONFIG_FILENAME
+            recorded = load(main_record).get("integrationBranch")
+            if main_record.is_file() and recorded != self.branch:
                 command = f"CLAUDE_INTEGRATION_BRANCH={self.branch} {command}"
+                says = f"`{recorded}`" if recorded else "no branch"
                 why = ("      The prefix is needed this once: land.py reads the branch from "
-                       "the main checkout, which records none until this lands.")
+                       f"the main checkout first, which records {says} until this lands.")
         if declared.get("enterWorktree") is False:
             lines = [f"Next: `cd {where}`, in a command of its own, then run `{command}`."]
         else:
