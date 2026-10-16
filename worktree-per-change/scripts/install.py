@@ -31,10 +31,20 @@ repo; what it costs is that **a fresh worktree does not contain an untracked set
 file**, so whatever creates worktrees has to put one there. The installer says so
 rather than leaving it to be discovered.
 
+A committed install is itself a change, so it is made the way every change is: in a
+worktree of its own, cut from the fetched integration branch, committed on a branch of its
+own, and landed with `land.py` like anything else. It used to be written into the main
+checkout with an instruction to commit it there — which the protocol forbids, and which
+the guard it had just installed then refused, in the same session. `--in-place` keeps the
+old behaviour; a user-scope, local, permissions-only or remote-less install has nothing to
+land and is written in place without being asked.
+
 Usage:
     python install.py --status                what is installed, and where the work is
-    python install.py --repo . --dry-run      show the exact settings.json changes
-    python install.py --repo .                install into this repository, committed
+    python install.py --repo . --dry-run      show the worktree, the files and the changes
+    python install.py --repo .                install into this repository, committed in a
+                                              worktree and on a branch of its own
+    python install.py --repo . --in-place     ... written into this checkout instead
     python install.py --repo . --branch queue  ... integrating through `queue`
     python install.py --repo . --session-ownership   ... one worktree, one session
     python install.py --repo . --settings-file settings.local.json \
@@ -64,6 +74,14 @@ LAND_SOURCE = Path(__file__).resolve().parent / "land.py"
 LAND_FILENAME = "land.py"
 CONFIG_FILENAME = "worktree-per-change.json"
 DEFAULT_BRANCH = "development"
+DEFAULT_WORKTREES_ROOT = ".claude/worktrees"
+
+# The branch a committed install is made on, and the leaf of the worktree it is made in,
+# suffixed with the time of the run. Not one fixed name: `land.py` refuses a branch whose
+# name already has a merged pull request — rightly, because a landed change leaves nothing
+# else behind to tell it from one never delivered — so a fixed name would land the first
+# install and refuse every resync after it.
+INSTALL_TOPIC = "install-worktree-per-change"
 
 # The invocation the allowlist entry below matches, character for character. Permission
 # rules are prefix matches on the command string, so the rule and the call have to be
@@ -231,7 +249,7 @@ def carried_by_repository(repo: Path, entry: str) -> bool:
     return bool(git(repo, "ls-files", "--", found.group(1)))
 
 
-def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
+def missing_ignores(repo: Path, entries=IGNORE_ENTRIES, text: str | None = None) -> list[str]:
     """Which of `entries` this repository itself does not already ignore.
 
     Asked of git rather than of the file, so a repo that already covers them under a
@@ -252,27 +270,37 @@ def missing_ignores(repo: Path, entries=IGNORE_ENTRIES) -> list[str]:
     The entry is probed exactly as it is written, trailing slash included: a `foo/`
     pattern matches directories only, and git decides what a path *is* by looking at the
     disk, so probing `foo` for a directory that does not exist yet answers no.
+
+    `text` stands in for the file where there is no tree to ask yet — the dry run of an
+    install whose worktree has not been cut. Git answers only about a tree on disk, so
+    there a literal line is the one answer recognised, and the dry run says so.
     """
-    try:
-        present = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        present = []
+    ask = text is None
+    if text is None:
+        try:
+            text = (repo / ".gitignore").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+    present = text.splitlines()
     missing = []
     for entry in entries:
         if entry in present or entry.rstrip("/") in present:
             continue
-        if carried_by_repository(repo, entry):
+        if ask and carried_by_repository(repo, entry):
             continue
         missing.append(entry)
     return missing
 
 
-def missing_includes(repo: Path, entries=INCLUDE_ENTRIES) -> list[str]:
-    """Which of `entries` are not already listed in `.worktreeinclude`."""
-    try:
-        present = (repo / INCLUDE_PATH).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        present = []
+def missing_includes(repo: Path, entries=INCLUDE_ENTRIES, text: str | None = None) -> list[str]:
+    """Which of `entries` are not already listed in `.worktreeinclude` (or in `text`)."""
+    if text is not None:
+        present = text.splitlines()
+    else:
+        try:
+            present = (repo / INCLUDE_PATH).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            present = []
     listed = {line.strip() for line in present if line.strip() and not line.startswith("#")}
     return [entry for entry in entries if entry not in listed]
 
@@ -466,6 +494,14 @@ def load(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
+        return {}
+
+
+def loads(text: str | None) -> dict:
+    try:
+        data = json.loads(text or "")
+        return data if isinstance(data, dict) else {}
+    except ValueError:
         return {}
 
 
@@ -862,6 +898,281 @@ def report_status(user_root: Path, repo: Path | None) -> int:
     return 0
 
 
+# ------------------------------------------------------------ the install's own worktree
+#
+# A committed install is a change, and the protocol has one rule for the main checkout:
+# nothing is written there. The installer used to write there anyway and print "commit
+# these" — measured 2026-10-16, the guard it had just registered denied that `git add` in
+# the same session, and getting the files back out took a person, because the guard denies
+# `git restore` there too. So it is made the way every change is made, and the main checkout
+# is not touched at all.
+
+
+EXCLUDE_NOTE = """
+# worktree-per-change: keeps the worktrees out of this clone's `git status` until the
+# tracked .gitignore that ignores them has landed and been pulled. This file is local to
+# the clone and never pushed; once that pull is done the line is redundant, not wrong.
+"""
+
+
+def run_git(tree: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    """`git` for the steps that change something, keeping what it said if it refused."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(tree), *args], capture_output=True, input=stdin,
+            encoding="utf-8", errors="replace", timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return subprocess.CompletedProcess(list(args), 1, "", str(error))
+
+
+def common_dir(tree: Path) -> Path | None:
+    found = git(tree, "rev-parse", "--git-common-dir")
+    if not found:
+        return None
+    path = Path(found)
+    return Path(os.path.normpath(str(path if path.is_absolute() else tree / path)))
+
+
+def in_place_reason(args, repo: Path | None, committed: bool) -> str | None:
+    """Why this install is written where it stands rather than committed in a worktree.
+
+    None means it is not: a committed install into a repository with an `origin` is what
+    the worktree is for. Every other shape has nothing to commit or nowhere to land it, and
+    says so, because an installer that quietly did one or the other leaves the operator
+    working out which from `git status`.
+    """
+    if args.in_place:
+        return "asked for with --in-place, so committing it is yours to do"
+    if repo is None:
+        return "a user-scope install has no repository to cut a worktree in"
+    if not committed:
+        return "nothing this install writes is committed, so there is nothing to land"
+    if not git(repo, "remote", "get-url", "origin"):
+        return (f"{repo} has no `origin` remote, so there is no fetched base to cut a "
+                "worktree from and nowhere to land one")
+    return None
+
+
+def earlier_installs(main_root: Path, trees: Path) -> list[str]:
+    """Branches and worktrees an earlier install left standing, one line each."""
+    found = [
+        f"branch    {name}" for name in (git(
+            main_root, "for-each-ref", "--format=%(refname:short)",
+            f"refs/heads/{INSTALL_TOPIC}*",
+        ) or "").splitlines() if name.strip()
+    ]
+    listing = git(main_root, "worktree", "list", "--porcelain") or ""
+    registered = [Path(line.split(" ", 1)[1]) for line in listing.splitlines()
+                  if line.startswith("worktree ")]
+    try:
+        # A directory as well as the registration: `git worktree remove` deregisters first
+        # and keeps the deregistration when the delete fails, so a leftover checkout can
+        # stand there with nothing in `git worktree list` to say so.
+        leftover = [child for child in trees.iterdir() if child.is_dir()]
+    except OSError:
+        leftover = []
+    seen: set[str] = set()
+    for label, paths in (("worktree", registered), ("directory", leftover)):
+        for path in paths:
+            key = os.path.normcase(os.path.normpath(str(path)))
+            if path.name.startswith(INSTALL_TOPIC) and key not in seen:
+                seen.add(key)
+                found.append(f"{label:9} {path}")
+    return found
+
+
+class Staging:
+    """A committed install made in a worktree, and on a branch, of its own.
+
+    Cut from the FETCHED integration branch, like every change, and read from it: the
+    record this install merges into is the one that branch carries, and the ignore
+    questions are asked of the worktree. The main checkout's working tree is wherever the
+    operator last left it, which under this protocol is behind.
+    """
+
+    def __init__(self, main_root: Path, common: Path | None, branch: str, landed: dict,
+                 tree: Path):
+        self.main_root = main_root
+        self.common = common
+        self.branch = branch
+        self.base = f"origin/{branch}"
+        # The record as the integration branch has it — empty on a first install.
+        self.landed = landed
+        self.tree = tree
+        self.name = tree.name
+
+    def shown(self, relative: str) -> str | None:
+        """`relative` as the integration branch has it, for a dry run with no tree to read."""
+        return git(self.main_root, "show", f"{self.base}:{relative}")
+
+    def cut(self) -> None:
+        made = run_git(self.main_root, "worktree", "add", "-b", self.name, str(self.tree),
+                       self.base)
+        if made.returncode:
+            print(f"could not cut {self.tree}: {made.stderr.strip()}", file=sys.stderr)
+            raise SystemExit(1)
+
+    def hide(self, dry_run: bool) -> str | None:
+        """Keep the worktrees out of the main checkout's `git status` until this lands.
+
+        Until the install merges and is pulled, nothing there ignores the worktrees root,
+        so its status grows `?? .claude/worktrees/` — and that line is the hazard the
+        ignore exists for, in its one unguarded window: no guard in the main checkout yet,
+        and a `git add -A` by anyone commits this install's own worktree as a gitlink no
+        clone can resolve. `.git/info/exclude` closes the window without touching a byte of
+        the checkout. It is this clone's file and never pushed, which is why
+        `missing_ignores` does not take it as the repository answering, and also why it is
+        the right place for a stopgap: the tracked .gitignore still gets its entry, and
+        once that is pulled this line is redundant rather than wrong.
+
+        The whole root rather than this one tree: every later worktree goes there too, and
+        a line naming one tree would outlive it as an entry for nothing. Skipped when
+        anything already hides the root — the question here is this clone's status, not
+        what the repository carries — and when the root is outside the checkout.
+        """
+        try:
+            relative = self.tree.parent.relative_to(self.main_root).as_posix()
+        except ValueError:
+            return None
+        if self.common is None or relative in ("", "."):
+            return None
+        if git(self.main_root, "check-ignore", "-q", f"{relative}/") is not None:
+            return None
+        exclude = self.common / "info" / "exclude"
+        entry = f"/{relative}/"
+        if dry_run:
+            return f"would exclude {entry} in {exclude} (this clone only) until this lands"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        append_block(exclude, EXCLUDE_NOTE, [entry])
+        return f"exclude -> {exclude} ({entry}, this clone only, until the .gitignore lands)"
+
+    def message(self, record: dict) -> str:
+        guard = record.get("guard") or {}
+        synced = guard.get("syncedFrom")
+        resync = bool(self.landed.get("guard"))
+        subject = f"{'Resync' if resync else 'Install'} the worktree-per-change guard"
+        if synced:
+            subject += f" {'to' if resync else 'at'} {synced[:12]}"
+        return "\n".join([
+            subject,
+            "",
+            f"Written by install.py in a worktree of its own, cut from {self.base}, so the",
+            "main checkout is left exactly as it was. It lands like any other change.",
+            "",
+            f"syncedFrom: {synced or 'none (the skill directory is not a git checkout)'}",
+            f"source: {guard.get('source') or 'unknown'}",
+            f"integrationBranch: {self.branch}",
+            "",
+            # For a repository that sets `requireIssueReference`: land.py refuses a body
+            # that closes nothing and does not say why, and this one has a reason.
+            "No issue: the guard's own install, committed by its installer.",
+        ]) + "\n"
+
+    def commit(self, paths: list[Path], record: dict, interpreter: str) -> int:
+        """Stage exactly what this run wrote, commit it, and say the one thing left to do."""
+        names = sorted({path.relative_to(self.tree).as_posix() for path in paths})
+        staged = run_git(self.tree, "add", "--", *names)
+        if staged.returncode:
+            print(f"could not stage the install in {self.tree}: {staged.stderr.strip()}",
+                  file=sys.stderr)
+            return 1
+        if git(self.tree, "diff", "--cached", "--quiet") is not None:
+            # A resync of exactly what the branch already carries. A worktree holding
+            # nothing to land is only one more tree for the next status to explain.
+            run_git(self.main_root, "worktree", "remove", "--force", str(self.tree))
+            run_git(self.main_root, "branch", "-D", self.name)
+            print(f"nothing to land: {self.base} already carries exactly this install, so "
+                  f"{self.name} and its worktree are gone again")
+            return 0
+        hidden = self.hide(dry_run=False)
+        if hidden:
+            print(hidden)
+        made = run_git(self.tree, "commit", "--quiet", "-F", "-", stdin=self.message(record))
+        if made.returncode:
+            print(f"the commit was refused: {(made.stderr or made.stdout).strip()}\n"
+                  f"Everything is written and staged in {self.tree}; deal with what refused "
+                  "it and commit there.", file=sys.stderr)
+            return 1
+        print(f"commit  -> {self.name} ({len(names)} files, in {self.tree}); "
+              f"{self.main_root} is untouched")
+        for line in self.next_step(interpreter):
+            print(line)
+        return 0
+
+    def next_step(self, interpreter: str) -> list[str]:
+        """The one thing left to do, phrased the way the repository it lands in would."""
+        declared = self.landed.get("delivery")
+        declared = declared if isinstance(declared, dict) else {}
+        where = self.tree.as_posix()
+        command = str(declared.get("command") or "").strip()
+        why = None
+        if not command:
+            command = land_command(land_path(self.tree / ".claude"), self.tree, interpreter)
+            # `land.py` reads the integration branch from the MAIN checkout, which has no
+            # record of one until this lands. On a first install, or a change of branch, it
+            # would fall back to its default and aim the PR at the wrong base — so its own
+            # operator override says it, once.
+            recorded = load(self.main_root / ".claude" / CONFIG_FILENAME).get("integrationBranch")
+            if recorded != self.branch:
+                command = f"CLAUDE_INTEGRATION_BRANCH={self.branch} {command}"
+                why = ("      The prefix is needed this once: land.py reads the branch from "
+                       "the main checkout, which records none until this lands.")
+        if declared.get("enterWorktree") is False:
+            lines = [f"Next: `cd {where}`, in a command of its own, then run `{command}`."]
+        else:
+            lines = [f"Next: enter {where} — EnterWorktree from a session, `cd` from a "
+                     f"terminal — and run `{command}` there."]
+        if why:
+            lines.append(why)
+        lines.append(f"      Once it has merged, `git pull --ff-only` in "
+                     f"{self.main_root.as_posix()} brings the guard in.")
+        return lines
+
+
+def prepare(checkout: Path, given: str | None, worktrees_root: str | None) -> Staging:
+    """Fetch the integration branch and decide where the install goes. Cuts nothing yet.
+
+    Only the branch's NAME comes from the main checkout, because before it is known there
+    is nowhere else to read it; everything else the record says is read from the fetched
+    branch. Refuses rather than reuses: an earlier install still standing writes the same
+    files as this one, so two in flight conflict — and a half-landed one is a question for
+    whoever left it, not something to build over.
+    """
+    common = common_dir(checkout)
+    main_root = common.parent if common is not None and common.name == ".git" else checkout
+    branch = choose_branch(main_root, given)
+    base = f"origin/{branch}"
+    fetched = run_git(main_root, "fetch", "origin", branch)
+    if fetched.returncode or git(main_root, "rev-parse", "--verify", "--quiet",
+                                 f"{base}^{{commit}}") is None:
+        print(f"could not fetch {base}: {fetched.stderr.strip() or 'no such ref'}\n"
+              "The integration branch has to exist on the remote before anything lands in "
+              "it — if it does not yet, create it from the default branch and push it once. "
+              "--in-place writes into this checkout instead.", file=sys.stderr)
+        raise SystemExit(1)
+    landed = loads(git(main_root, "show", f"{base}:.claude/{CONFIG_FILENAME}"))
+    recorded = landed.get("integrationBranch")
+    if not given and isinstance(recorded, str) and recorded.strip() not in ("", branch):
+        print(f"this checkout records `{branch}` as the integration branch, but {base} "
+              f"records `{recorded.strip()}`. Pass --branch with the one changes actually "
+              "merge into.", file=sys.stderr)
+        raise SystemExit(2)
+    root = worktrees_root or landed.get("worktreesRoot") or DEFAULT_WORKTREES_ROOT
+    tree = Path(os.path.normpath(str(
+        main_root / str(root) / f"{INSTALL_TOPIC}-{time.strftime('%Y%m%d-%H%M%S')}")))
+    standing = earlier_installs(main_root, tree.parent)
+    if standing:
+        print("an earlier install is still standing here:\n"
+              + "\n".join(f"    {line}" for line in standing)
+              + "\nLand it — `python .claude/scripts/land.py` from inside that worktree — or "
+              "take it down with `git worktree remove --force <path>` and "
+              "`git branch -D <branch>`, then run this again. Two installs in flight write "
+              "the same files, so they conflict with each other.", file=sys.stderr)
+        raise SystemExit(2)
+    return Staging(main_root, common, branch, landed, tree)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -888,6 +1199,9 @@ def main() -> int:
     parser.add_argument("--worktrees-root", metavar="PATH",
                         help="where this repo's worktrees go, quoted in the guard's "
                              "remedy text (default .claude/worktrees)")
+    parser.add_argument("--in-place", action="store_true",
+                        help="write a committed install into the checkout itself, "
+                             "uncommitted, instead of committing it in a worktree of its own")
     # Three states, not two: the repo's recorded answer is the default, and either flag
     # overrides it for one run. A plain boolean would make "the repo asked for this"
     # indistinguishable from "this resync forgot to", and a resync that silently retires a
@@ -900,6 +1214,7 @@ def main() -> int:
 
     try:  # Windows consoles default to a codepage that mangles the report's punctuation.
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")  # the refusals carry it too
     except (AttributeError, OSError):
         pass
 
@@ -920,10 +1235,6 @@ def main() -> int:
     # has to be spelled with the same interpreter that will type it.
     interpreter = args.python or ("python" if committed else sys.executable)
 
-    if args.session_ownership is None and repo is not None:
-        args.session_ownership = bool(
-            load(repo / ".claude" / CONFIG_FILENAME).get("sessionOwnership")
-        )
     # Never at user scope. The ownership hook keys its claims off the repository's common
     # git dir, so it is per-repo state by construction, and a user-scope registration would
     # run it against every repository on the machine — including the ones with no worktree
@@ -946,18 +1257,37 @@ def main() -> int:
         target = settings_path(root, args.settings_file)
         settings = load(target)
         settings, granted = add_permissions(settings, entries)
+        print("in place: --permissions-only writes one settings file and lands nothing")
         if args.dry_run:
             print(f"would allow {granted} command(s) in {target}\n"
                   + "\n".join(f"  {r}" for r in entries))
             return 0
         write_json(target, settings, backup=not committed)
         print(f"allow   -> {target} ({granted} added, {len(entries) - granted} already there)")
-        print("Restart or /reload any running sessions for the rules to take effect.")
+        # Measured 2026-08-21: a rule added mid-session covered the very next call, with no
+        # restart and no /reload. This used to say a restart was needed.
+        print("Rules take effect in sessions already running; nothing needs restarting.")
         return 0
 
     if not GUARD_SOURCE.is_file():
         print(f"guard script missing: {GUARD_SOURCE}", file=sys.stderr)
         return 1
+
+    # Decided before anything is read for the install, because it decides where everything
+    # is read FROM: the main checkout, or the fetched integration branch. `--uninstall` is
+    # left where it was, in place.
+    staging = None
+    if not args.uninstall:
+        reason = in_place_reason(args, repo, committed)
+        if reason is None:
+            staging = prepare(repo, args.branch, args.worktrees_root)
+        else:
+            print(f"in place: {reason}")
+
+    if args.session_ownership is None and repo is not None:
+        recorded = (staging.landed if staging is not None
+                    else load(repo / ".claude" / CONFIG_FILENAME))
+        args.session_ownership = bool(recorded.get("sessionOwnership"))
     if args.session_ownership and not OWNER_SOURCE.is_file():
         # Refused rather than quietly downgraded to a guard-only install. The operator
         # asked for a rule; installing three quarters of one and printing nothing is how a
@@ -965,8 +1295,19 @@ def main() -> int:
         print(f"ownership hook missing: {OWNER_SOURCE}", file=sys.stderr)
         return 1
 
+    if staging is not None:
+        if not args.dry_run:
+            staging.cut()
+        # Everything below writes where `repo` says, and from here that is the worktree.
+        # The main checkout is not named again except to be left alone.
+        repo = staging.tree
+        root = files_root = repo / ".claude"
+
     target = settings_path(root, args.settings_file)
     settings = load(target)
+    if staging is not None and args.dry_run:
+        # No tree to read yet, so the branch it would be cut from stands in for it.
+        settings = loads(staging.shown(f".claude/{args.settings_file}"))
     before = json.dumps(settings, indent=2)
     settings, removed = strip(settings, also_legacy=not args.keep_legacy)
 
@@ -1048,11 +1389,20 @@ def main() -> int:
         (READ_ONLY + delivery(land_command(lander, repo, interpreter)) if repo else READ_ONLY)
     ]
     settings, granted = add_permissions(settings, wanted)
+    # In the file's own key order. `strip` drops an emptied `hooks` block and `add_ours`
+    # puts it back last, so every first resync rewrote the file with its two blocks
+    # swapped: a diff of nothing, which committed means a pull request of nothing.
+    settings = {**{key: settings[key] for key in json.loads(before) if key in settings},
+                **settings}
     after = json.dumps(settings, indent=2)
-    branch = choose_branch(repo, args.branch)
+    branch = staging.branch if staging is not None else choose_branch(repo, args.branch)
     config = (repo / ".claude" / CONFIG_FILENAME) if repo else None
 
     if args.dry_run:
+        if staging is not None:
+            print(f"would cut   {staging.tree}\n        on  {staging.name}, from "
+                  f"{staging.base} (fetched), and write everything below there; "
+                  f"{staging.main_root} is not touched")
         print(f"would copy  {GUARD_SOURCE}\n        ->  {script}")
         if owner_script is not None:
             print(f"would copy  {OWNER_SOURCE}\n        ->  {owner_script}")
@@ -1068,20 +1418,35 @@ def main() -> int:
                   + f", sessionOwnership = {bool(args.session_ownership)}"
                   + f", guard = {json.dumps(provenance(GUARD_SOURCE))}")
         if repo:
-            for entry in missing_ignores(repo):
-                print(f"would ignore {entry} in {repo / '.gitignore'}")
-            for entry in missing_includes(repo):
+            # With a worktree still to cut there is no tree to ask, so the branch's own
+            # copies answer — literally, which a broader pattern can only make redundant.
+            ignored = None if staging is None else staging.shown(".gitignore") or ""
+            included = None if staging is None else staging.shown(INCLUDE_PATH) or ""
+            caveat = "" if staging is None else " (unless a broader pattern there covers it)"
+            for entry in missing_ignores(repo, text=ignored):
+                print(f"would ignore {entry} in {repo / '.gitignore'}{caveat}")
+            for entry in missing_includes(repo, text=included):
                 print(f"would copy {entry} into every new worktree "
                       f"via {repo / INCLUDE_PATH}")
         for line in removed:
             print(f"would remove predecessor guard  {line}")
+        if staging is not None:
+            synced = provenance(GUARD_SOURCE).get("syncedFrom")
+            print(f"would commit exactly those files on {staging.name}"
+                  + (f", recording syncedFrom {synced[:12]}" if synced else ""))
+            hidden = staging.hide(dry_run=True)
+            if hidden:
+                print(hidden)
         if not args.no_skill:
             print(link_skill(user_root, dry_run=True))
-        print(f"would rewrite {target}\n--- before\n{before}\n--- after\n{after}")
+        print(f"would rewrite {target}\n--- before"
+              + (f" ({staging.base})" if staging is not None else "")
+              + f"\n{before}\n--- after\n{after}")
         return 0
 
     script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(GUARD_SOURCE, script)
+    retired: list[Path] = []  # deleted, and so staged as deletions in a worktree install
     if owner_script is not None:
         owner_script.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(OWNER_SOURCE, owner_script)
@@ -1091,6 +1456,7 @@ def main() -> int:
         # for a deliberate copy.
         try:
             owner_path(files_root).unlink()
+            retired.append(owner_path(files_root))
         except OSError:
             pass
     if lander is not None and LAND_SOURCE.is_file():
@@ -1159,7 +1525,7 @@ def main() -> int:
     if granted:
         scope = "read-only git/gh, and the protocol's own writes" if repo else "read-only git/gh"
         print(f"allow   -> {target} ({granted} command(s): {scope})")
-    print("Restart or /reload any running sessions for the hooks to take effect.")
+    files = []
     if committed:
         files = ([target, script, config] + ([owner_script] if owner_script is not None else [])
                  + ([lander] if lander is not None else []))
@@ -1167,8 +1533,24 @@ def main() -> int:
             files.append(repo / ".gitignore")
         if includes:
             files.append(repo / INCLUDE_PATH)
+    # Hooks used to be described as reaching only sessions started after the install, and
+    # that was wrong in the direction that strands a session. Measured 2026-10-16 in the
+    # Claude desktop app: an install wrote a project's `.claude/settings.json` mid-session,
+    # and that same session's very next `git add` was denied by the hook it had just
+    # registered. It may differ by Claude Code version or settings scope, so the advice is
+    # the reading that cannot strand anybody.
+    if staging is not None:
+        print("The hooks are on that branch, not in the main checkout. A session that enters "
+              "its worktree may be covered from its next call — plan as if it is.")
+        return staging.commit([path for path in files if path.is_file()] + retired,
+                              load(config), interpreter)
+    print("Hooks can take effect in sessions already running, the installing one included, "
+          "so plan as if this one is covered now.")
+    if committed:
         print("Commit " + ", ".join(str(p.relative_to(repo)) for p in files)
-              + " for everyone working here to get it.")
+              + " for everyone working here to get it — from a terminal of your own if this "
+              "session's `git add` is now denied here: the guard sees only Claude's own "
+              "tool calls.")
     elif repo:
         # The honest version of the sentence above, and the one thing about this install
         # that will otherwise be found out the hard way. A worktree is a checkout of

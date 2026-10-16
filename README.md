@@ -34,23 +34,28 @@ git clone https://github.com/chrisJuresh/skills.git
 python skills/worktree-per-change/scripts/install.py --repo . --branch development --dry-run
 ```
 
-Read the diff it prints, then run it without `--dry-run`. Per repository is the usual
-install, because the rule depends on what that repository's branches mean. It copies the
-guard to `.claude/hooks/`, registers three hooks (`PreToolUse`, `SessionStart`, `Stop`) in
-the committed `.claude/settings.json`, writes `.claude/worktree-per-change.json` with the
-integration branch and the provenance of the copy it just made, and links the skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three, and
-check `.gitignore` is not swallowing them — a worktree only gets a file if git puts it
-there.
+Read what it prints, then run it without `--dry-run`. Per repository is the usual install,
+because the rule depends on what that repository's branches mean. The install is a change
+like any other, so it is made like one: it fetches the integration branch, cuts a worktree
+and a branch of its own from it, and writes everything there — the guard in
+`.claude/hooks/`, three hooks (`PreToolUse`, `SessionStart`, `Stop`) in the committed
+`.claude/settings.json`, `.claude/worktree-per-change.json` with the integration branch and
+the provenance of the copy, `land.py`, and the `.gitignore` and `.worktreeinclude` entries.
+It commits exactly those files and prints one next step: run `land.py` from inside that
+worktree. The main checkout is not touched; once the PR merges, `git pull --ff-only` there
+brings the guard in. It also links the skill into `~/.claude/skills/` so
+`/worktree-per-change` resolves everywhere.
 
 Re-running it is how a repo resyncs. The config file is merged rather than replaced, so
 the branch, the provenance and anything else that repo keeps beside them all survive.
 
-New hooks apply to sessions started afterwards, not the one you are in.
+Plan as if new hooks cover running sessions, the one doing the install included: measured,
+a hook written mid-session denied that same session's very next call.
 
 | Flag | Effect |
 |---|---|
-| `--repo .` | Install into a repository's committed `.claude/settings.json` (the usual case) |
+| `--repo .` | Install into a repository's committed `.claude/settings.json` (the usual case), committed in a worktree of its own |
+| `--in-place` | Write it into the checkout instead, uncommitted — also what a repo with no `origin` gets |
 | `--branch NAME` | The branch changes merge into. Default `development` |
 | `--status` | What is installed, which branch this repo integrates through, and what each worktree is still holding |
 | `--uninstall` | Remove it |
