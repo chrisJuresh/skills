@@ -329,6 +329,40 @@ def main() -> int:
         check("an unconfigured repo is not asked for an issue",
               land(quiet, "--dry-run").returncode, 0)
 
+        # --- a main checkout with no record yet --------------------------------------
+        # The ordinary state while an install is in flight: install.py commits the record
+        # in a worktree of its own and leaves the main checkout untouched, so until that
+        # lands and is pulled the only record is the one the worktree carries. Reading the
+        # default instead would aim the PR at `development` here, which this repository
+        # does not integrate through.
+        fresh = repo_with_commit(root, "unrecorded", "main")
+        git(fresh, "worktree", "add", "-q", "-b", "install", str(root / "wt-install"), "main")
+        installing = root / "wt-install"
+        record_branch(installing, "main", protected=["main"])
+        git(installing, "add", ".claude")
+        git(installing, "commit", "-qm", "install")
+        out = land(installing, "--dry-run")
+        check("with no record in the main checkout, the worktree's is read",
+              "install  ->  main" in out.stdout, True)
+        check("...and says where the branch came from", "this worktree's" in out.stdout, True)
+        check("...protected targets included", "is protected" in out.stdout, True)
+
+        # The worktree's record never outranks the main checkout's. Every worktree has to
+        # agree about the target, so a branch that carries a different record — a change
+        # of integration branch, or a session's own edit — is landed where the repository
+        # says, and the operator's override is still the way to say otherwise.
+        record_branch(fresh, "queue")
+        out = land(installing, "--dry-run")
+        check("a record in the main checkout wins", "install  ->  queue" in out.stdout, True)
+        check("...without mentioning the worktree's", "this worktree's" in out.stdout, False)
+        (fresh / ".claude" / "worktree-per-change.json").unlink()
+
+        # Neither has one: the default, as before.
+        git(fresh, "worktree", "add", "-q", "-b", "bare", str(root / "wt-bare"), "main")
+        out = land(root / "wt-bare", "--dry-run")
+        check("with no record anywhere, the default is used",
+              "bare  ->  development" in out.stdout, True)
+
         # --- a tree outside a repository -------------------------------------------
         loose = root / "not-a-repo"
         loose.mkdir()

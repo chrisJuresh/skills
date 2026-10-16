@@ -597,9 +597,15 @@ denied that `git add` in the same session, and the files then held the checkout 
 `git pull --ff-only` until a person restored and cleaned it by hand — the guard denies
 `git restore` there too. Doing it properly has three consequences worth knowing:
 
-- **On a first install `land.py` cannot read the branch yet.** It reads the record from the
-  main checkout, which has none until this lands, so the printed step passes the branch
-  once: `CLAUDE_INTEGRATION_BRANCH=<integration> python .claude/scripts/land.py`.
+- **On a first install `land.py` reads the branch from the install's own worktree.** It
+  reads the record from the main checkout first, which has none until this lands and is
+  pulled, and only then from the record the worktree carries — so the printed step is the
+  plain `python .claude/scripts/land.py` its allowlist entry matches. It used to carry a
+  `CLAUDE_INTEGRATION_BRANCH=<integration>` prefix instead, which Claude Code's permission
+  docs say an allow rule does not match past, and which PowerShell does not parse at all.
+  The prefix is still printed for a change of branch, where the main checkout records the
+  old one and still wins. The guard reads only the main checkout, so until the pull its
+  messages in that worktree name `development`.
 - **Until it lands, nothing in the main checkout ignores `.claude/worktrees/`,** so its
   `git status` shows `?? .claude/worktrees/` — in the one window where no guard stands
   between that checkout and a `git add -A` that commits the install's own worktree as a

@@ -85,13 +85,16 @@ DEFAULT_INTEGRATION_BRANCH = "development"
 DEFAULT_PROTECTED_MERGE_TARGETS: frozenset[str] = frozenset()
 
 
-def protected_targets(main_root: Path) -> frozenset[str]:
+def protected_targets(main_root: Path, tree: Path | None = None) -> frozenset[str]:
     """What this repository refuses to merge into. Read from the MAIN checkout.
 
     Same source and same reason as `integration_branch`: every worktree of a repo has to
-    agree, and `.claude/` is checked out separately in each of them.
+    agree, and `.claude/` is checked out separately in each of them. Where the main
+    checkout has no record yet, that includes falling back to the worktree's — which a
+    session can edit, so the refusal holds there only as well as nothing did before; it
+    is the main checkout's copy that cannot be talked out of it.
     """
-    extra = config(main_root).get("protectedMergeTargets")
+    extra = config(main_root, tree).get("protectedMergeTargets")
     if isinstance(extra, list):
         names = {str(n).strip().lower() for n in extra if str(n).strip()}
         return DEFAULT_PROTECTED_MERGE_TARGETS | frozenset(names)
@@ -141,9 +144,9 @@ CLOSING_KEYWORD = re.compile(
 NO_ISSUE = re.compile(r"^\s*no[ -]issue\s*:\s*\S+", re.IGNORECASE | re.MULTILINE)
 
 
-def requires_issue_reference(main_root: Path) -> bool:
-    """Whether this repository has opted in. Read from the MAIN checkout, like the rest."""
-    return bool(config(main_root).get("requireIssueReference"))
+def requires_issue_reference(main_root: Path, tree: Path | None = None) -> bool:
+    """Whether this repository has opted in. Read from the same record as the rest."""
+    return bool(config(main_root, tree).get("requireIssueReference"))
 
 
 def closes_an_issue(body: str) -> bool:
@@ -247,38 +250,66 @@ def locate(start: Path) -> tuple[Path, Path]:
     raise Refused(f"{start} is not inside a git repository.")
 
 
-def config(main_root: Path) -> dict:
-    """This repository's record, or an empty one. Read from the MAIN checkout.
+def record_root(main_root: Path, tree: Path | None = None) -> Path | None:
+    """Where this repository's record is read from: the MAIN checkout, until it has none.
 
     Every worktree of the repo has to agree about the integration branch, and `.claude/`
     is checked out separately in each of them — so the main checkout is the only copy
-    there is one of.
+    there is one of, and while it has a record nothing else is read.
+
+    A main checkout with no record is the ordinary state for a while, not a hand-made
+    install: `install.py` commits the record in a worktree of its own and leaves the main
+    checkout untouched, so it has none until that lands *and* is pulled. Every worktree cut
+    in that window carries the record and its main checkout does not, and the only other
+    answer is the hard-coded default — which aims the PR at `development` in a repository
+    that integrates through anything else. So the worktree's own record is read instead:
+    the one its branch was cut with, or the one an install has just committed on it. It
+    never outranks the main checkout's — it is read only where there is nothing to
+    disagree with, so a change that moves the branch still needs the operator's override.
+
+    What it costs is that, in that window, the target is a file the session can edit. That
+    is not a new reach — the `land.py` that runs is this worktree's own copy, equally
+    editable — but it is a quieter one, so `land()` says when the record is this one.
+
+    The guard and `worktree_owner.py` still read only the main checkout, so in the same
+    window their messages name the default. This one reads further because landing is the
+    step a wrong branch cannot be taken back from.
     """
+    for root in (main_root, tree):
+        if root is not None and (root / ".claude" / CONFIG_FILENAME).is_file():
+            return root
+    return None
+
+
+def config(main_root: Path, tree: Path | None = None) -> dict:
+    """This repository's record, or an empty one. See `record_root` for which copy."""
+    root = record_root(main_root, tree)
+    if root is None:
+        return {}
     try:
-        blob = json.loads(
-            (main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8")
-        )
+        blob = json.loads((root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8"))
         return blob if isinstance(blob, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def integration_branch(main_root: Path) -> str:
+def integration_branch(main_root: Path, tree: Path | None = None) -> str:
     """The branch this repository's PRs target.
 
     Read from the repository rather than guessed, and read from the *main checkout* so
-    that every worktree of it agrees. The environment override is the operator's, and
-    exists for the same reason it does in the guard.
+    that every worktree of it agrees — or from this worktree's record while the main
+    checkout has none (see `record_root`). The environment override is the operator's,
+    and exists for the same reason it does in the guard.
 
     The fallback is a fallback, not a default anyone should reach: `install.py` asks and
-    records the answer, so a repo arriving here without a record is one where the guard
-    was installed by hand. Landing into the wrong branch is not recoverable by rerunning,
-    so this says which branch it is about to use, every time.
+    records the answer, so a repo arriving here with a record in neither place is one
+    where the guard was installed by hand. Landing into the wrong branch is not
+    recoverable by rerunning, so this says which branch it is about to use, every time.
     """
     override = (os.environ.get("CLAUDE_INTEGRATION_BRANCH") or "").strip()
     if override:
         return override
-    name = config(main_root).get("integrationBranch")
+    name = config(main_root, tree).get("integrationBranch")
     if isinstance(name, str) and name.strip():
         return name.strip()
     return DEFAULT_INTEGRATION_BRANCH
@@ -386,9 +417,13 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     print(f"repository:  {main_root}")
     print(f"worktree:    {tree}")
     print(f"branch:      {topic}  ->  {branch}")
+    if record_root(main_root, tree) == tree:
+        # Said every time, because it is the one case where the target comes from a file
+        # this worktree itself carries.
+        print("record:      this worktree's — the main checkout has none yet")
     # Said before anything runs, not just at the merge step, because the whole reason to
     # read a dry run is to find out what it is about to do to which branch.
-    if is_protected(branch, protected_targets(main_root)):
+    if is_protected(branch, protected_targets(main_root, tree)):
         print(f"merge:       NO — `{branch}` is protected; this will push and open a PR only")
     print()
 
@@ -436,7 +471,7 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     number = None if args.dry_run else head_pr(tree, topic, "open")
     print("\npull request")
     if number is None:
-        if requires_issue_reference(main_root):
+        if requires_issue_reference(main_root, tree):
             # Checked here rather than before the push, because this is the only step it
             # is about: a PR that is already open has its body, and re-running this script
             # against it must not start refusing. A push with no PR behind it is benign —
@@ -516,7 +551,7 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     # before the push and leave the change undelivered, which is the failure this whole
     # script exists to prevent. Refusing *here* means the branch is pushed, the PR is
     # open, and the only thing that did not happen is the thing that should not.
-    if is_protected(branch, protected_targets(main_root)):
+    if is_protected(branch, protected_targets(main_root, tree)):
         print(f"  NOT MERGING — `{branch}` is a protected branch.")
         print(f"  #{target} is open and waiting for a human to merge it.")
         print()
@@ -601,9 +636,11 @@ def main() -> int:
 
     try:
         tree, main_root = locate(Path.cwd().resolve())
-        branch = integration_branch(main_root)
+        branch = integration_branch(main_root, tree)
         if args.merge_integration is None:
-            args.merge_integration = bool(config(main_root).get("mergeIntegrationBeforeLanding"))
+            args.merge_integration = bool(
+                config(main_root, tree).get("mergeIntegrationBeforeLanding")
+            )
         topic = preflight(tree, branch)
         return land(tree, main_root, branch, topic, args)
     except Refused as refusal:

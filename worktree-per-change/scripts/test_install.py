@@ -703,11 +703,13 @@ def main() -> int:
                   True)
         check("the one next step is land.py, from inside that worktree",
               "land.py" in out.stdout and topic in out.stdout.split("Next:", 1)[-1], True)
-        # land.py reads the integration branch from the MAIN checkout, which has no record
-        # until this lands — so on its own it would fall back to its default and aim the
-        # pull request at a branch this repository does not integrate through.
-        check("naming the branch land.py cannot read yet",
-              "CLAUDE_INTEGRATION_BRANCH=main python .claude/scripts/land.py" in out.stdout, True)
+        # land.py reads the record from the MAIN checkout, which has none until this lands,
+        # and falls back to the one this worktree carries — so the step is the plain
+        # command the allowlist entry matches, with no prefix in front of it.
+        check("the step is the command the allowlist matches",
+              "run `python .claude/scripts/land.py`" in out.stdout, True)
+        check("...with no override in front of it",
+              "CLAUDE_INTEGRATION_BRANCH" in out.stdout, False)
 
         # Refused, never reused or overwritten: a second install in flight writes the same
         # files and conflicts with the first, and a half-landed one is its owner's question.
@@ -752,10 +754,27 @@ def main() -> int:
               "D\t.claude/hooks/worktree-owner.py"
               in git_in(landed, "diff", "--name-status", "origin/main",
                         retired[0] if retired else "main").splitlines(), True)
-        check("...still naming the branch, since the main checkout has pulled no record",
-              "CLAUDE_INTEGRATION_BRANCH=main" in out.stdout, True)
+        check("...needing no override, since the main checkout has pulled no record",
+              "CLAUDE_INTEGRATION_BRANCH" in out.stdout, False)
         check("...and the un-pulled main checkout is still untouched",
               checkout_bytes(landed) == untouched, True)
+
+        # --- a change of branch still needs the override -----------------------------
+        # land.py falls back to the worktree's record only where the main checkout has
+        # none. One that records the OLD branch still wins, which is what keeps every
+        # worktree agreeing — so moving the branch is the one install whose step says it.
+        moving = remoted(root, "moving")
+        subprocess.run(["git", "-C", str(moving), "push", "-q", "origin", "main:queue"],
+                       check=True, capture_output=True)
+        (moving / ".claude").mkdir(exist_ok=True)
+        (moving / ".claude" / "worktree-per-change.json").write_text(
+            json.dumps({"integrationBranch": "main"}), encoding="utf-8")
+        out = install(moving, "--branch", "queue")
+        check("an install that moves the branch succeeds", out.returncode, 0)
+        check("...and names the new one for land.py",
+              "CLAUDE_INTEGRATION_BRANCH=queue python .claude/scripts/land.py" in out.stdout, True)
+        check("...saying what the main checkout records instead", "records `main`" in out.stdout,
+              True)
 
         # --- in place: asked for, or where a worktree makes no sense -----------------
         placed = remoted(root, "placed")

@@ -286,7 +286,17 @@ The integration branch is per repository, read in this order:
 
 1. `CLAUDE_INTEGRATION_BRANCH` in the environment;
 2. `integrationBranch` in the main checkout's `.claude/worktree-per-change.json`;
-3. `development`.
+3. for `land.py` only, and only where the main checkout has **no such file at all**: the
+   same key in the worktree's own copy;
+4. `development`.
+
+Step 3 exists because a main checkout with no record is an ordinary state, not a hand-made
+install: `install.py` commits the record in a worktree of its own, so the main checkout has
+none until that lands and is pulled, and every worktree cut in between carries one. It never
+outranks step 2 — every worktree has to agree, so a change that *moves* the branch still
+needs step 1 — and `land.py` prints a line whenever it is the record in use, because in that
+window the target is a file the session can edit. The guard does not read it yet, so in the
+same window its messages name `development`.
 
 It is committed next to the hook rather than inferred from the remote's default branch,
 because the default branch is frequently *not* the integration branch, and guessing it wrong
