@@ -562,7 +562,8 @@ python scripts/test_guard.py
 ```
 
 `--status` reports what is installed, which branch the repo integrates through, whether the
-cwd may write, and every worktree with what it is still holding. To see a decision directly,
+cwd may write, every worktree with what it is still holding, and whether the skill checkout
+a resync would copy from is behind its upstream as of its last fetch. To see a decision directly,
 feed the guard a payload on stdin:
 
 ```bash

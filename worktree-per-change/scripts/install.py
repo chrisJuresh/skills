@@ -206,8 +206,8 @@ IGNORE_NOTE = """
 # repository inside itself -- a `git add -A` that catches one commits it as a gitlink
 # no clone can resolve. settings.local.json is this machine's permission mode, which
 # is nobody else's. The guard itself stays TRACKED: .claude/settings.json,
-# .claude/hooks/ and .claude/worktree-per-change.json, because a worktree only gets a
-# file if git puts it there.
+# .claude/hooks/, .claude/scripts/ and .claude/worktree-per-change.json, because a
+# worktree only gets a file if git puts it there.
 """
 
 INCLUDE_PATH = ".worktreeinclude"
@@ -774,6 +774,47 @@ def provenance(script: Path, source: Path = GUARD_SOURCE) -> dict:
     return record
 
 
+def skill_currency(source: Path = SKILL_SOURCE) -> tuple[str | None, str | None, int]:
+    """This skill's own checkout: its HEAD, its upstream, and how far behind that it is.
+
+    `syncedFrom` is whatever HEAD this directory is at, and nothing checked that HEAD was
+    current. Measured 2026-10-16: a clone one commit behind GitHub installed without a word,
+    and the record it wrote named the stale commit as the one the copy came from.
+
+    Asked of the **last-fetched** refs, and nothing here fetches. An installer that needs
+    the network to install is one that fails offline for a reason that has nothing to do
+    with the install, and a fetch would also write into a repository other than the one
+    being installed into. What that costs is honest and bounded: a clone nobody has fetched
+    looks current. Under this protocol that is the rarer case — a clone the protocol is
+    worked in fetches before every worktree it cuts, so its tracking ref runs ahead of a
+    HEAD nobody pulls, which is exactly the measured case — and every message built on this
+    says "as of its last fetch", so silence is not read as currency.
+
+    `(None, None, 0)` where it is not a git checkout; `(head, None, 0)` where the branch has
+    no upstream, a detached HEAD included. Never refuses: a warning that stopped installs
+    would be the network dependency again by another route.
+    """
+    head = git(source, "rev-parse", "HEAD")
+    if not head:
+        return None, None, 0
+    upstream = git(source, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream:
+        return head, None, 0
+    behind = git(source, "rev-list", "--count", "HEAD..@{upstream}") or ""
+    return head, upstream, int(behind) if behind.isdigit() else 0
+
+
+def stale_skill(source: Path = SKILL_SOURCE) -> str | None:
+    """The warning for an install from a checkout behind its upstream, or None."""
+    head, upstream, behind = skill_currency(source)
+    if not behind:
+        return None
+    return (f"warning: {source} is at {head[:12]}, {behind} commit(s) behind {upstream} as of "
+            "its last fetch — what this installs, and the syncedFrom it records, is older than "
+            "what has landed there. `git pull --ff-only` in that checkout first. "
+            "This does not stop the install.")
+
+
 # ------------------------------------------------------------------------- status
 
 
@@ -907,6 +948,20 @@ def report_status(user_root: Path, repo: Path | None) -> int:
 
     print(f"\nmode: {os.environ.get('CLAUDE_WORKTREE_GATE') or 'on (default)'}"
           f"   ownership: {os.environ.get('CLAUDE_WORKTREE_OWNER') or 'on (default)'}")
+    # Where the next install or resync would copy from, and whether that is current. Said
+    # every time, including when it is fine, because "as of its last fetch" is the part
+    # worth knowing and silence would hide it.
+    head, upstream, behind = skill_currency()
+    if head is None:
+        print(f"skill: {SKILL_SOURCE} — not a git checkout, so how current it is cannot be said")
+    elif upstream is None:
+        print(f"skill: {SKILL_SOURCE} at {head[:12]} — no upstream to compare it with")
+    elif behind:
+        print(f"skill: {SKILL_SOURCE} at {head[:12]} — {behind} commit(s) behind {upstream} "
+              "as of its last fetch; `git pull --ff-only` there before installing")
+    else:
+        print(f"skill: {SKILL_SOURCE} at {head[:12]} — up to date with {upstream} "
+              "as of its last fetch")
 
     # `--repo` names the repository being reported on, so the working half reads it too.
     # It used to read `Path.cwd()` unconditionally, which put the named repo's settings and
@@ -1333,6 +1388,12 @@ def main() -> int:
 
     if args.status:
         return report_status(user_root, repo)
+
+    # First, so it is not lost under the report. Every run that writes something says it,
+    # the dry run included, since that is the output the protocol says to show the user.
+    stale = None if args.uninstall else stale_skill()
+    if stale:
+        print(stale)
 
     if args.permissions_only:
         # The read-only half, and nothing else. This is the user-scope install that
