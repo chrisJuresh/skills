@@ -437,7 +437,11 @@ it cannot reach costs a turn to disprove and teaches the reader the guard can be
 - `CLAUDE_WORKTREE_GATE=off`;
 - `cwd` is not inside a git repository, or the git metadata will not resolve;
 - the payload has no `cwd`, or does not parse;
-- the operation targets another repository, or no repository at all.
+- the operation targets another repository, or no repository at all;
+- **its own script is missing.** That one is not the guard's code at all: a script cannot
+  run to say it is absent. `install.py` registers every hook through a few lines of `-c`
+  with the script's path as an argument, and those lines exit 0 when there is no file —
+  see below.
 
 Note what is *not* on that list: unlike its predecessor, this guard does **not** stand down
 for a repo that ships another concurrent-writer hook. There is no version of this protocol
@@ -448,6 +452,53 @@ the two-denials-one-action problem.
 It fails open on every question it cannot answer. Blocking the only writer in a tree over
 state it merely failed to read is the worse error, and it is the error that gets a hook
 deleted.
+
+### A missing script, and the shim that makes it fail open
+
+Registered directly, as `python -S <script>`, the one failure the guard could not answer
+for was its own absence: Python exits **2** when it cannot open a script, and Claude Code
+reads exit 2 from `PreToolUse` as a block. So a guard that had been deleted — or not pulled
+yet, or never copied into a fresh worktree — refused every Bash, PowerShell, Edit and Write
+call in the session, including the ones that would have put it back. Measured 2026-10-16
+in a downstream repository: stale untracked copies of the hook files sat in the main
+checkout, deleting them mid-session was unsafe for exactly this reason, and a person had to
+do it.
+
+So every hook `install.py` writes — the guard on `PreToolUse`, `SessionStart` and `Stop`,
+the ownership hook on `PreToolUse` and `SessionStart` — has this shape:
+
+```json
+{ "type": "command", "command": "python",
+  "args": ["-S", "-c", "<SHIM>", "<event>", "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py"],
+  "timeout": 10 }
+```
+
+`SHIM` is a constant in `install.py`, and what it does is all of this:
+
+- **The script is not a file:** exit 0. On `SessionStart` it first prints one line, that
+  the script is registered but missing at `<path>` so nothing it enforces is enforced —
+  `SessionStart` stdout reaches the session as context. `PreToolUse` and `Stop` say nothing:
+  they run on every call, and a line there would reach only the debug log.
+- **The script is there:** argv is shifted to `[script]`, the script's directory goes
+  where `python <script>` would put it on `sys.path`, and the file is compiled and run in
+  the real `__main__` module. Its stdin, stdout, stderr and exit code are its own, so the
+  guard behaves exactly as it did registered directly. The `sys.path` step comes before
+  anything is imported, because `-c` puts the cwd there instead and the cwd is the
+  repository — a `json.py` at its root would otherwise stand in for the stdlib's.
+
+The event is passed by the installer rather than read from the payload, so the shim never
+touches stdin before the script does. The path stays an argument, which is what lets
+`strip`, `--uninstall` and `--status` find a registration of ours by the script's name in
+either shape, and a resync replace the old one rather than add the new one beside it.
+`args` is exec form — no shell, each element one argument as written — so a multi-line
+program survives as one.
+
+**This trades a loud failure for a quiet one, and that is the cost to know about.** A
+guard that goes missing now stops enforcing without a word on every tool call. The
+`SessionStart` line is how anybody finds out, and `install.py --status` repeats it, along
+with any registration still in the old shape. What argues for the trade is the same thing
+as everywhere else in this file: the old failure blocked the very calls that fix it, and a
+hook with no reachable remedy is the one that gets deleted.
 
 ## What it does not protect
 
@@ -495,8 +546,10 @@ by walking up for `.git` rather than shelling out, precisely because a subproces
 write-tool call is the one cost that cannot be amortised.
 
 Wall-clock is interpreter startup, roughly 75 ms per guarded tool call on Windows (the
-install registers `-S` to skip site initialisation, about 13% of that). Against a tool call
-that itself takes hundreds of milliseconds, that is the right trade.
+install registers `-S` to skip site initialisation, about 13% of that). The shim above adds
+about 4 ms to it — measured on Windows, median 99 ms through the shim against 96 ms direct
+for the same denial — where `runpy` would have cost 11, because it imports `pkgutil`.
+Against a tool call that itself takes hundreds of milliseconds, that is the right trade.
 
 ## Debugging
 

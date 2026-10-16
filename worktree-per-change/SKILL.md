@@ -676,6 +676,31 @@ checkout's absolute location, and `${CLAUDE_PROJECT_DIR}` resolves to whichever 
 the session is actually in. `--python` overrides the interpreter where `python` is not on
 `PATH`.
 
+**Every hook goes through a few lines of `-c`, with the script as an argument**, rather than
+as `python -S <script>`:
+
+```json
+{ "type": "command", "command": "python",
+  "args": ["-S", "-c", "<shim>", "PreToolUse", "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.py"] }
+```
+
+The shim exists for the one question no script can answer about itself: whether it is
+there. Python exits **2** when it cannot open a script, and Claude Code reads exit 2 from
+`PreToolUse` as a block — so a guard that was deleted, or not pulled yet, refused every
+Bash, PowerShell, Edit and Write call in the session. Measured 2026-10-16: stale untracked
+copies of the hook files could not safely be deleted from a main checkout mid-session, and
+a person had to do it. Now a missing script exits 0; present, it runs exactly as before —
+same stdin, output and exit code. `args` is exec form, so the shim reaches the interpreter
+as one argument with no shell in between.
+
+**That is a trade, and the cost is silence.** A deleted guard now stops enforcing without a
+word on every call. The `SessionStart` registration is the exception: it prints one line —
+*the script is registered but missing at `<path>`, so nothing it enforces is enforced* —
+which reaches the session as context, and `--status` says the same. That notice is how
+anyone finds out. A repository installed before the shim still has the old shape, and
+`--status` names it; re-running the installer replaces it rather than adding the new one
+beside it.
+
 ### Installing where nothing may be committed
 
 A committed install is right when the repository's team is adopting the rule. It is wrong
@@ -724,12 +749,13 @@ nothing to check.
   config. Run it once at user scope on any machine doing this work: a repo-scoped rule
   cannot cover a session that has to read a *different* repository, and installing this
   guard into the next repo is exactly that shape of task.
-- `--status` reports what is installed — including a local install and the ownership hook
-  — which branch this repo integrates through, **which of the optional declarations it has
-  made**, whether the cwd may write, every worktree with what it is still holding and which
-  session is holding it, and whether the `.gitignore` and `.worktreeinclude` entries are
-  there, which is how a repo installed before the installer wrote them finds out, since
-  nothing at runtime repairs either.
+- `--status` reports what is installed — including a local install and the ownership hook,
+  a registered script that is missing, and a registration still in the shape that blocks
+  every call when it is — which branch this repo integrates through, **which of the
+  optional declarations it has made**, whether the cwd may write, every worktree with what
+  it is still holding and which session is holding it, and whether the `.gitignore` and
+  `.worktreeinclude` entries are there, which is how a repo installed before the installer
+  wrote them finds out, since nothing at runtime repairs either.
 - `--uninstall` removes it, including the allowlist entries it wrote — by exact match, so
   a rule the operator added or narrowed by hand survives. `--keep-legacy` leaves a
   predecessor concurrent-writer guard registered instead of replacing it.
@@ -925,8 +951,8 @@ doing, what it blocked, why the guard is wrong — and stop.
 ## When the rule was already broken
 
 The guard has holes by design, and each one is defended somewhere above: it **fails open**
-on every question it cannot answer, it sees only Claude's own tool calls, `warn` reports
-without denying, and an install reaches the main checkout only once it has landed and been
+on every question it cannot answer — its own file being missing included — it sees only
+Claude's own tool calls, `warn` reports without denying, and an install reaches the main checkout only once it has landed and been
 pulled — after which whether a session already running picks the hooks up is not
 something to rely on in either direction. So arriving in the state this protocol exists to prevent — a write in the main checkout, two
 sessions in one tree — does not mean anything went wrong with the guard, and it is worth
