@@ -14,7 +14,7 @@ Every job is a separate `claude -p` process with its own `--session-id`, recorde
 "photos-93": {
   "repo": "photos", "issue": 93,
   "sessionId": "c143d862-adf1-4ca3-b1fd-451ff6aff3fb",
-  "cwd": "C:/Users/Chris/Documents/photos",
+  "cwd": "/home/me/src/photos",
   "startedAt": "2026-09-02T04:12:00.394Z",
   "status": "running"
 }

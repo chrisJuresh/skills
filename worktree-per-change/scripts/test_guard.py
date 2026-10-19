@@ -683,17 +683,52 @@ def main() -> int:
             decision(run(write(unspent, str(unspent / "README.md")))),
             "allow",
         )
-        # `land.py` reaches the same merge, so the same refusal has to reach it. It was
-        # invisible to the phrase-matching this check used to do, which would have left
-        # the route SKILL.md recommends as the way past a rule the repo opted into.
+        # `land.py` is let through: against a protected branch it pushes, opens the PR and
+        # stops before its merge step, so it is the narrow route to exactly the state this
+        # repository asked for. It used to be denied while the denial pointed at it.
         check(
-            "the declared delivery script is refused too",
+            "the declared delivery script is allowed against a protected branch",
             decision(run(shell(unspent, "python .claude/scripts/land.py"))),
-            "deny",
+            "allow",
         )
         check(
-            "and refusing it does not spend the tree either",
+            "and, merging nothing there, it does not spend the tree",
             decision(run(write(unspent, str(unspent / "README.md")))),
+            "allow",
+        )
+        check(
+            "the refusal of `gh pr merge` names land.py as the allowed route",
+            "land.py" in denial and "stops before the merge" in denial,
+            True,
+        )
+        check(
+            "a dry run is allowed against a protected branch",
+            decision(run(shell(unspent, "python .claude/scripts/land.py --dry-run"))),
+            "allow",
+        )
+        # A `CLAUDE_INTEGRATION_BRANCH=` prefix moves where land.py lands. Into an
+        # unprotected batch it really merges, so the tree must still be marked — letting
+        # it through unmarked left a merged tree editable and nobody asked to take it down.
+        retarget = repo / ".claude" / "worktrees" / "retarget"
+        git(repo, "worktree", "add", str(retarget), "-b", "retarget-topic", "development")
+        check(
+            "land.py retargeted at an unprotected batch is allowed",
+            decision(run(shell(
+                retarget, "CLAUDE_INTEGRATION_BRANCH=batch python .claude/scripts/land.py"))),
+            "allow",
+        )
+        check(
+            "and, since it merges there, it spends the tree",
+            decision(run(write(retarget, str(retarget / "README.md")))),
+            "deny",
+        )
+        protected_too = repo / ".claude" / "worktrees" / "protected-too"
+        git(repo, "worktree", "add", str(protected_too), "-b", "protected-too", "development")
+        run(shell(protected_too,
+                  "CLAUDE_INTEGRATION_BRANCH=Development python .claude/scripts/land.py"))
+        check(
+            "retargeted at the protected branch itself, it merges nothing and spends nothing",
+            decision(run(write(protected_too, str(protected_too / "README.md")))),
             "allow",
         )
         # The protected check reads the same parse as the mark, so prose costs nothing
@@ -913,7 +948,7 @@ def main() -> int:
         # The marker goes down BEFORE `gh pr merge` runs, because no after-hook can tell a
         # merge from a merge that failed. That was called the harmless direction while only
         # the merging session saw it; the sweep and the Stop block then started reporting it
-        # to everybody as fact. Measured in integration-console on 2026-08-13: a `DIRTY` PR
+        # to everybody as fact. Measured in a consumer repository on 2026-08-13: a `DIRTY` PR
         # whose merge was refused, an unresolved rebase, ten modified files — announced to
         # every new session as merged, with a request to remove the tree. Conflict
         # resolution is the most expensive thing this hook could destroy.
@@ -1009,6 +1044,20 @@ def main() -> int:
         # `land.py` is the delivery route SKILL.md recommends, and the regex never saw it:
         # the command string holds no `gh pr merge`, so the supported path left no mark.
         landing = worktree_at(repo, "landing", "dev/landing", merged=False)
+        # The dry run is the step a session is told to read before landing. It merges
+        # nothing, so it must leave the tree as editable as it found it.
+        run(shell(landing, "python .claude/scripts/land.py --dry-run"))
+        check(
+            "land.py --dry-run does not spend the worktree",
+            decision(run(write(landing, str(landing / "a.txt")))),
+            "allow",
+        )
+        run(shell(landing, ".claude/scripts/land.py --dry-run --title T"))
+        check(
+            "nor does a dry run invoked by path with other flags",
+            decision(run(write(landing, str(landing / "a.txt")))),
+            "allow",
+        )
         run(shell(landing, "python .claude/scripts/land.py"))
         check(
             "land.py spends the worktree it delivered from",
@@ -1140,6 +1189,144 @@ def main() -> int:
         config.write_text(
             json.dumps({"integrationBranch": "development"}), encoding="utf-8"
         )
+
+        # --- the merge step never invites a way past the forge -------------------
+        check("the default merge step forbids --admin",
+              "Never `--admin`" in default, True)
+        check("and no longer suggests adding it", "add `--admin`" in default, False)
+
+        # --- a repository may end its runs before the merge ----------------------
+        # A repository whose runs stop at the pushed branch, into per-batch branches it
+        # cannot list as protected, was told by Stop to open and merge a PR it forbids.
+        config.write_text(
+            json.dumps({"integrationBranch": "development", "delivery": {"endsAt": "push"}}),
+            encoding="utf-8",
+        )
+        check(
+            "endsAt push: Stop lets a pushed, unmerged branch end",
+            decision(run({"session_id": "e1", "hook_event_name": "Stop", "cwd": str(onremote)})),
+            "allow",
+        )
+        pushing = run({"session_id": "e2", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        check("endsAt push: a commit on no remote still blocks",
+              pushing.get("decision"), "block")
+        check(
+            "and the steps end at the push, with no pull request",
+            "Stop there" in pushing.get("reason", "")
+            and "gh pr create" not in pushing.get("reason", ""),
+            True,
+        )
+        briefing = run({"session_id": "e3", "hook_event_name": "SessionStart", "cwd": str(published)})
+        context = ((briefing or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        check("endsAt push: the briefing says a PR is opened only when asked",
+              "only when someone asks for one" in context, True)
+
+        config.write_text(
+            json.dumps({"integrationBranch": "development", "delivery": {"draft": True}}),
+            encoding="utf-8",
+        )
+        drafting = (
+            run({"session_id": "e4", "hook_event_name": "Stop", "cwd": str(unpushed)}) or {}
+        ).get("reason", "")
+        check("draft: the pull request is opened as a draft",
+              "gh pr create --base development --fill --draft" in drafting, True)
+        check(
+            "and left open as one, never merged",
+            "Leave the pull request open" in drafting
+            and "gh pr merge" not in drafting
+            and "It stays a draft" in drafting,
+            True,
+        )
+        check(
+            "draft: Stop lets a pushed, unmerged branch end",
+            decision(run({"session_id": "e5", "hook_event_name": "Stop", "cwd": str(onremote)})),
+            "allow",
+        )
+        run(shell(unpushed, "python .claude/scripts/land.py"))
+        check(
+            "draft: land.py merges nothing there, so it spends nothing",
+            decision(run(write(unpushed, str(unpushed / "work.txt")))),
+            "allow",
+        )
+        run(shell(unpushed, "gh pr merge --squash"))
+        check(
+            "while a merge typed by hand still spends the tree",
+            decision(run(write(unpushed, str(unpushed / "work.txt")))),
+            "deny",
+        )
+        # The tree is spent now; the checks below read only the briefing and Stop's budget.
+
+        # --- a repository may name its own command for cutting a worktree --------
+        config.write_text(
+            json.dumps(
+                {
+                    "integrationBranch": "development",
+                    "delivery": {"create": "node scripts/new.mjs <name> --base <integration>"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        briefing = run({"session_id": "e6", "hook_event_name": "SessionStart", "cwd": str(published)})
+        context = ((briefing or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        check("create: the briefing names the repository's command, base filled in",
+              "node scripts/new.mjs <name> --base development" in context, True)
+        check("and does not offer the bare `git worktree add` beside it",
+              "git worktree add" in context, False)
+        denied = reason(run(write(published, str(published / "README.md"))))
+        check("create: the main-checkout denial names it too",
+              "node scripts/new.mjs <name> --base development" in denied, True)
+        config.write_text(
+            json.dumps({"integrationBranch": "development"}), encoding="utf-8"
+        )
+
+        # --- Stop's allowance is per held state, not per session -----------------
+        # A session-wide count spent on an earlier, legitimate block let the same session
+        # end silently days later with a commit on no remote.
+        budget = published / ".claude" / "worktrees" / "budget"
+        git(published, "worktree", "add", str(budget), "-b", "budget-topic", "development")
+        (budget / "one.txt").write_text("one\n", encoding="utf-8")
+        git(budget, "add", "one.txt")
+        git(budget, "commit", "-q", "-m", "one")
+        stop = {"session_id": "s-budget", "hook_event_name": "Stop", "cwd": str(budget)}
+        first, second, third = run(stop), run(stop), run(stop)
+        check("the same held state blocks twice", [decision(first), decision(second)],
+              ["block", "block"])
+        check("and is then let through", decision(third), "allow")
+        check("saying once that it gave up, rather than going quiet",
+              "will not block again" in (third or {}).get("systemMessage", ""), True)
+        check("and only once", run(stop), None)
+        (budget / "two.txt").write_text("two\n", encoding="utf-8")
+        git(budget, "add", "two.txt")
+        git(budget, "commit", "-q", "-m", "two")
+        check("a new commit is checked afresh in the same session",
+              decision(run(stop)), "block")
+
+        # --- a pushed branch may be waiting on the session's own review -----------
+        waiting = (
+            run({"session_id": "w1", "hook_event_name": "Stop", "cwd": str(onremote)}) or {}
+        ).get("reason", "")
+        check("a pushed-only block offers the honest wait instead of an early merge",
+              "waiting on work you started yourself" in waiting, True)
+        # The wait it offers is a stop with the same tree and HEAD, so it must pass.
+        honest = run({"session_id": "w1", "hook_event_name": "Stop", "cwd": str(onremote)})
+        check("and the stop that takes it is let through, not refused again",
+              decision(honest), "allow")
+
+        # Nothing held means nothing said: the give-up notice is not spent on a state that
+        # holds nothing, after earlier blocks on the same HEAD.
+        quiet = published / ".claude" / "worktrees" / "quiet"
+        git(published, "worktree", "add", str(quiet), "-b", "quiet-topic", "development")
+        (quiet / "scratch.txt").write_text("x\n", encoding="utf-8")
+        stop_quiet = {"session_id": "q1", "hook_event_name": "Stop", "cwd": str(quiet)}
+        check("an uncommitted file blocks", [decision(run(stop_quiet)), decision(run(stop_quiet))],
+              ["block", "block"])
+        (quiet / "scratch.txt").unlink()
+        check("with it gone, Stop says nothing at all", run(stop_quiet), None)
+        check("an unpushed block does not",
+              "waiting on work you started yourself" in (
+                  run({"session_id": "w2", "hook_event_name": "Stop", "cwd": str(budget)}) or {}
+              ).get("reason", ""),
+              False)
 
     print(f"{PASSED} passed, {len(FAILED)} failed")
     for line in FAILED:

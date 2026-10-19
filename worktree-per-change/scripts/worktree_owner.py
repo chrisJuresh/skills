@@ -350,7 +350,7 @@ def lex(raw: str) -> list | None:
     r"""One segment's tokens, with backslashes left alone. None when it cannot be read.
 
     Deliberately **not** `shlex.split(raw)`, whose POSIX mode consumes a backslash as an
-    escape: `cd C:\Users\chris\trees\alpha` comes back as `C:Userschristreesalpha`,
+    escape: `cd C:\Users\me\trees\alpha` comes back as `C:Usersmetreesalpha`,
     which exists nowhere, so the token names no directory and the call is allowed — on the
     one platform where `\` is the separator, and for every command whose target is spelled
     the platform's own way. Measured on Windows: four of this hook's denials and its
@@ -493,6 +493,12 @@ def ago(seconds: float) -> str:
 def cut_your_own(common: Path) -> str:
     branch = setting(common, "integrationBranch", "CLAUDE_INTEGRATION_BRANCH", DEFAULT_BRANCH)
     root = setting(common, "worktreesRoot", "CLAUDE_WORKTREES_ROOT", DEFAULT_WORKTREES_ROOT)
+    delivery = config(common).get("delivery")
+    create = delivery.get("create") if isinstance(delivery, dict) else None
+    if isinstance(create, str) and create.strip():
+        # The repository's own command, where it declared one, and never the bare git
+        # beside it: offered both, sessions take the shorter and lack the setup.
+        return f"  {create.strip().replace('<integration>', branch)}"
     return (
         f"  git fetch origin {branch}\n"
         f"  git worktree add {root}/<name> -b <branch> origin/{branch}"

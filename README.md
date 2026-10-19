@@ -94,7 +94,8 @@ Requires Python 3 and git. No third-party packages.
   for the repository whose trunk takes reviewed PRs. `land.py` stops at the open PR there
   too, so opting in cannot be undone by typing `gh pr merge` instead
 
-A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most.
+A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most for
+any one held state.
 
 With `--session-ownership`, a second hook adds one more denial: **a write into a worktree
 another live session is holding.** The guard isolates changes and has nothing to say about
@@ -122,13 +123,19 @@ worktree-per-change/
   SKILL.md                                     the skill itself
   references/
     guard-internals.md                         what the guard checks, its modes, how to debug it
+    permissions.md                             the allowlist install.py writes, and why
+    session-ownership.md                       the opt-in second hook: one worktree, one session
     ticketing.md                               working a ticket queue with several agents
     replacing-a-concurrent-writer-guard.md     migrating a repo that ships its own hook
   scripts/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
-    test_guard.py                              104 checks on what the hook decides
-    test_install.py                            27 checks on what the installer leaves on disk
+    worktree_owner.py                          the opt-in ownership hook
+    land.py                                    push, PR, merge, verify — the allowlisted delivery
+    test_guard.py                              178 checks on what the hook decides
+    test_install.py                            222 checks on what the installer leaves on disk
+    test_land.py                               84 checks on what land.py refuses and prints
+    test_worktree_owner.py                     63 checks on what the ownership hook decides
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against
@@ -136,7 +143,7 @@ worktree-per-change/
 
 ### Tests
 
-Both run against real git repositories in a temp dir, and need nothing but git.
+All four run against real git repositories in a temp dir, and need nothing but git.
 
 ```bash
 python worktree-per-change/scripts/test_guard.py
@@ -144,6 +151,14 @@ python worktree-per-change/scripts/test_guard.py
 
 ```bash
 python worktree-per-change/scripts/test_install.py
+```
+
+```bash
+python worktree-per-change/scripts/test_land.py
+```
+
+```bash
+python worktree-per-change/scripts/test_worktree_owner.py
 ```
 
 ## `board-runner`
