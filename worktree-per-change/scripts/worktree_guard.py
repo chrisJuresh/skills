@@ -67,6 +67,7 @@ import shlex
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 STATE_DIRNAME = "claude-worktree-gate"
@@ -282,6 +283,22 @@ class Delivery:
     worktree yet, and a placeholder filled in some messages and left standing in others is
     worse than one that never fills.
 
+    Three more keys move only *where* the default sequence stops or how a tree is cut:
+
+        "delivery": {
+          "endsAt": "push",                  // or "pr", or "merge" (the default)
+          "draft": true,                     // open PRs as drafts; implies "pr"
+          "create": "node scripts/new.mjs <name> --base <integration>"
+        }
+
+    `endsAt` exists because the commonest conflict between a repository's policy and this
+    hook was a repository that ends every run at a pushed branch, or at an open pull
+    request, into a branch it cannot list in `protectedMergeTargets` because the branch
+    changes per batch. `Stop` then prescribed a PR and a merge that the repository forbids,
+    twice per session. `create` exists because the remedy text printed a bare
+    `git worktree add` beside a repository's own script that also installs dependencies and
+    copies ignored config, and sessions took the bare command: measured, seven of eight.
+
     Every key is optional and absence means the default, so a repository that has declared
     nothing reads exactly as it did before this existed. That is the point: the repository
     that needs this is the one that has already written its protocol down somewhere, and
@@ -292,9 +309,20 @@ class Delivery:
         blob = blob if isinstance(blob, dict) else {}
         self.command = phrase(blob.get("command"))
         self.teardown = phrase(blob.get("teardown"))
+        self.create = phrase(blob.get("create"))
         # Only an explicit `false` turns it off. An absent key is not a repository saying
         # it enters by path; it is a repository that has not been asked.
         self.enter = blob.get("enterWorktree") is not False
+        self.draft = blob.get("draft") is True
+        ends = (phrase(blob.get("endsAt")) or "").lower()
+        ends = ends if ends in {"merge", "pr", "push"} else "merge"
+        # A draft cannot be merged — the forge refuses — so a repository that drafts its
+        # pull requests ends at the open PR whatever else it said.
+        self.ends_at = "pr" if self.draft and ends == "merge" else ends
+
+    def stops_before_merge(self) -> bool:
+        """This repository's runs end before any merge: at a pushed branch or an open PR."""
+        return self.ends_at != "merge"
 
     def fill(self, command: str, tree, topic: str | None) -> str:
         return command.replace("<name>", Path(tree).name).replace("<branch>", topic or "<branch>")
@@ -314,6 +342,23 @@ class Delivery:
         )
 
     def protocol(self, branch: str) -> str:
+        if not self.command and self.ends_at == "push":
+            return (
+                f"The protocol: {self.entering()} before the first edit. Work, commit, then "
+                "`git push -u origin HEAD` — this repository ends a run at the pushed branch, "
+                "and a pull request is opened only when someone asks for one. A second change "
+                "in the same session starts a new worktree — one worktree, one branch, one "
+                "change."
+            )
+        if not self.command and self.ends_at == "pr":
+            draft = " --draft" if self.draft else ""
+            return (
+                f"The protocol: {self.entering()} before the first edit. Work, commit, "
+                f"`git push -u origin HEAD`, then `gh pr create --base {branch}{draft}` — this "
+                "repository ends a run at the open pull request, and merging it is a "
+                "person's decision. A second change in the same session starts a new "
+                "worktree — one worktree, one branch, one PR, one change."
+            )
         if not self.command:
             return PROTOCOL.format(branch=branch, enter=self.entering())
         return (
@@ -325,6 +370,20 @@ class Delivery:
 
     def base_note(self, branch: str, worktrees: str) -> str:
         stale = "\n\n" + STALE_LOCAL.format(branch=branch)
+        if self.create:
+            # Printed instead of the bare `git worktree add`, never beside it: offered both,
+            # sessions take the shorter one and then find, at the first test run, everything
+            # the repository's own command would have set up.
+            create = self.create.replace("<integration>", branch)
+            enter = "enter the path it prints" if self.enter else "work in the path it prints"
+            return (
+                f"The base is `origin/{branch}` — the FETCHED remote tip. Cut the worktree "
+                f"with this repository's own command:\n`{create}`\nFill in any `<name>` "
+                f"and `<branch>`, run it otherwise as written, and {enter}. It cuts the "
+                "tree and does the setup a hand-made one lacks — "
+                "dependencies, ignored config, the toolchain — so do not reconstruct it "
+                "with git by hand." + stale
+            )
         if self.enter:
             return BASE_NOTE.format(branch=branch, worktrees=worktrees) + stale
         # Half of BASE_NOTE is about `worktree.baseRef` choosing the wrong base, which is
@@ -365,23 +424,41 @@ class Delivery:
                 "is what this repository has instead of the push-PR-merge sequence, so do "
                 "not reconstruct that sequence by hand here."
             )
-        if protected:
+        if self.ends_at == "push":
+            return (
+                commit
+                + "2. `git push -u origin HEAD`\n"
+                "3. Stop there. This repository ends a run at the pushed branch: say in "
+                "your reply that it is pushed and waiting, and open a pull request only "
+                "when someone asks for one.\n"
+            )
+        draft = " --draft" if self.draft else ""
+        if protected or self.ends_at == "pr":
+            why = (
+                f"`{branch}` is a protected branch here"
+                if protected
+                else "This repository ends a run at the open pull request"
+            )
             last = (
-                f"4. Leave the pull request open. `{branch}` is a protected branch here, "
+                f"4. Leave the pull request open. {why}, "
                 "so merging it is a person's decision — say in your reply that it is "
                 "open and waiting, and do not delete the branch it is opened from."
+                + (" It stays a draft: marking it ready for review is a person's act too."
+                   if self.draft else "")
             )
         else:
             last = (
-                "4. `gh pr merge --squash` (add `--admin` only if the repo's checks do "
-                "not apply here). Never `--delete-branch`: it makes `gh` check out the "
-                "base branch this main checkout permanently holds, so it fails *after* "
-                "the merge and leaves the branch it was asked to delete on the remote."
+                "4. `gh pr merge --squash`. Never `--admin`, or any other way past the "
+                "forge's own protection: whether its checks apply is the repository's "
+                "decision, and a merge the forge refuses is a question for a person. Never "
+                "`--delete-branch` either: it makes `gh` check out the base branch locally "
+                "after the merge, which fails wherever another worktree holds that branch, "
+                "and then leaves the branch it was asked to delete on the remote."
             )
         return (
             commit
             + "2. `git push -u origin HEAD`\n"
-            f"3. `gh pr create --base {branch} --fill`\n"
+            f"3. `gh pr create --base {branch} --fill{draft}`\n"
             + last
             + "\n"
         )
@@ -438,8 +515,9 @@ def reason_protected_merge(branch: str) -> str:
         "The change is still delivered the same way — push and open the PR:\n\n"
         "```\ngit push -u origin HEAD\ngh pr create --base "
         f"{branch} --fill\n```\n\n"
-        "Then leave it open and say so. `land.py` does exactly this and stops at the same "
-        "point.\n\n"
+        "Then leave it open and say so. Or run `python .claude/scripts/land.py`, which is "
+        "allowed here: against a protected branch it pushes, opens the pull request and "
+        "stops before the merge.\n\n"
         "Squash-merging without review is for a batch branch you own; point "
         "`integrationBranch` in `.claude/worktree-per-change.json` at one if that is what "
         "this is."
@@ -505,7 +583,7 @@ def is_spent(common: Path, tree_root: Path, topic: str | None) -> dict | None:
     What is spent is a *branch in a tree*, not a directory name. The marker file is named
     after the worktree's leaf name — the only stable, filesystem-safe handle available —
     so it has to confirm both fields before it applies. Two worktrees can share a leaf
-    name (`../hermes-dev-x` and `.claude/worktrees/hermes-dev-x`), and once cleanup is
+    name (`../app-x` and `.claude/worktrees/app-x`), and once cleanup is
     routine a path gets *reused*: the same name, cut again off the integration branch, for
     the next change. Trusting the filename alone would greet that fresh tree with "your
     change has already landed", which is the most confusing denial this guard can produce.
@@ -630,8 +708,19 @@ def sweep_spent(common: Path) -> tuple[list[str], list[str]]:
     return standing, remains
 
 
-def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
-    path = state_dir(common) / f"stop-{re.sub(r'[^A-Za-z0-9._-]', '_', session)}.json"
+def stop_blocks(common: Path, session: str, held: str = "", bump: bool = False) -> int:
+    """How often `Stop` has refused this session over this exact held state.
+
+    Keyed on the state — the tree, its `HEAD` and what it is holding — and not on the
+    session alone. A session-wide count was spent on a legitimate earlier block, and two
+    days later the same resumed session committed onto a branch whose PR had already
+    merged and ended without a word: the strongest case this hook exists for, let through
+    on a budget used up by something else. A new commit, another tree or a different hold
+    starts a fresh allowance; the same unchanged state is still refused at most
+    `MAX_STOP_BLOCKS` times.
+    """
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{session}-{held}" if held else session)
+    path = state_dir(common) / f"stop-{name}.json"
     count = 0
     try:
         count = int(json.loads(path.read_text(encoding="utf-8")).get("blocks", 0))
@@ -644,6 +733,20 @@ def stop_blocks(common: Path, session: str, bump: bool = False) -> int:
         except OSError:
             pass
     return count
+
+
+def prune_stop_records(common: Path, days: int = 7) -> None:
+    """Drop old `Stop` counts: keyed per held state, they gain a file per commit stopped on."""
+    cutoff = time.time() - days * 86400
+    try:
+        for path in state_dir(common).glob("stop-*.json"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------- command parse
@@ -854,13 +957,27 @@ def merges(tokens: list[str]) -> str | None:
     further edit in a tree that has delivered nothing.
     """
     index = 0
+    retarget = None
     while index < len(tokens) and _ASSIGNMENT.match(unquote(tokens[index])):
+        name, _, value = unquote(tokens[index]).partition("=")
+        if name == "CLAUDE_INTEGRATION_BRANCH" and value.strip():
+            retarget = value.strip()
         index += 1
     if index >= len(tokens):
         return None
     head = tokens[index]
-    rest = (unquote(token) for token in tokens[index + 1 :])
+    rest = [unquote(token) for token in tokens[index + 1 :]]
     words = [word for word in rest if word and not word.startswith("-")]
+    # `land.py --dry-run` prints the sequence and runs none of it, and it is the step both
+    # the script and the skill tell a session to read before landing. Counted as a merge,
+    # it spent the tree it was read from — every later edit denied as already delivered —
+    # and against a protected branch it was refused outright. Read off the raw arguments,
+    # because `words` has already dropped everything that starts with `-`.
+    rehearsal = "--dry-run" in rest
+    # `CLAUDE_INTEGRATION_BRANCH=<batch> python .claude/scripts/land.py` lands into the
+    # batch, not into the branch this repository recorded, and whether it merges at all
+    # depends on that branch. So the target travels with the call: "land.py into <batch>".
+    landing = f"land.py into {retarget}" if retarget else "land.py"
     if names(head, _GH):
         # `gh pr merge`, and not `gh pr view` or `gh pr list`. The pair is looked for
         # anywhere in the arguments rather than at their head, because `gh --repo o/r pr
@@ -869,13 +986,15 @@ def merges(tokens: list[str]) -> str | None:
         adjacent = any(words[at : at + 2] == ["pr", "merge"] for at in range(len(words)))
         return "gh pr merge" if adjacent else None
     if names(head, _LAND):
-        return "land.py"
+        return None if rehearsal else landing
     if names(head, _PYTHON):
         # `python .claude/scripts/land.py`, which is the shape SKILL.md now recommends and
         # which the old regex never saw at all: the string holds no `gh pr merge`, so the
         # supported delivery route left no mark, the `SessionStart` sweep never reported
         # the tree, and the cleanup gate never fired for it.
-        return "land.py" if any(Path(word).name in _LAND for word in words) else None
+        if not any(Path(word).name in _LAND for word in words):
+            return None
+        return None if rehearsal else landing
     return None
 
 
@@ -1248,8 +1367,25 @@ def unlanded(tree: Path, branch: str, topic: str | None,
     return " and ".join(parts) if parts else None
 
 
+def only_pushed(holding: str) -> bool:
+    """Everything held is already on the remote: pushed, and not yet integrated."""
+    return "on no remote" not in holding and "uncommitted" not in holding
+
+
 def block_stop(tree: Path, branch: str, topic: str | None, holding: str,
                plan: Delivery, protected: bool = False) -> None:
+    # Only pushed and not integrated: everything is on the remote, so the session may
+    # be waiting on something it started itself. Without this sentence the block's only
+    # way out was to merge, and sessions merged before their own review agents reported —
+    # one review then found a real defect, which cost a second tree and a second PR.
+    waiting = (
+        "If the pull request is open and you are waiting on work you started yourself — "
+        "review agents, CI — say in your reply what you are waiting on, with the PR link, "
+        "and stop. Do not open or merge early to clear this, and do not hold the turn "
+        "open with a sleep loop.\n\n"
+        if only_pushed(holding)
+        else ""
+    )
     emit(
         {
             "decision": "block",
@@ -1262,7 +1398,9 @@ def block_stop(tree: Path, branch: str, topic: str | None, holding: str,
                 + plan.deliver(branch, protected)
                 + "\nThen take the worktree down:\n\n"
                 + cleanup_steps(tree, topic, plan)
-                + "\n\nIf the change is genuinely abandoned, say so plainly in your reply "
+                + "\n\n"
+                + waiting
+                + "If the change is genuinely abandoned, say so plainly in your reply "
                 "and leave the worktree standing — do not delete it, and do not stash."
             ),
         }
@@ -1380,6 +1518,7 @@ def main() -> None:
         # The sweep runs at SessionStart deliberately: it is the one moment nothing is in
         # flight, so a landed tree still on disk is somebody's leftovers rather than the
         # work in progress two minutes from its own merge.
+        prune_stop_records(common)
         standing, remains = sweep_spent(common)
         if standing:
             context += (
@@ -1420,22 +1559,42 @@ def main() -> None:
     if event == "Stop":
         if not linked:
             return
-        if stop_blocks(common, session) >= MAX_STOP_BLOCKS:
-            return
         # Spent first. A landed tree can also read as holding unlanded commits — a squash
         # merge leaves none of the branch's own commits in `origin/<branch>` — and telling
         # a session to push work it has already merged is the one wrong answer here.
         topic = branch_of(git_dir)
         marker = is_spent(common, tree_root, topic)
+        protected = is_protected(branch, protected_targets(main_root))
+        holding = None
+        if not marker:
+            holding = unlanded(tree_root, branch, topic, protected or plan.stops_before_merge())
+            if not holding:
+                return
+        # The allowance is consulted only once a block would fire, so nothing held means
+        # nothing said, and a give-up notice is never spent on a state that held nothing.
+        held = (git(tree_root, "rev-parse", "HEAD") or "")[:8]
+        what = "spent" if marker else holding
+        held_state = f"{tree_root.name}-{held}-{zlib.crc32(what.encode('utf-8')):08x}"
+        blocked = stop_blocks(common, session, held_state)
+        if blocked >= MAX_STOP_BLOCKS:
+            if blocked == MAX_STOP_BLOCKS:
+                # Said once, so giving up is not mistaken for having nothing to say.
+                stop_blocks(common, session, held_state, bump=True)
+                emit({"systemMessage": (
+                    f"worktree-per-change: Stop will not block again for {tree_root} as it "
+                    "stands. The next commit, or another tree, is checked afresh."
+                )})
+            return
+        stop_blocks(common, session, held_state, bump=True)
         if marker:
-            stop_blocks(common, session, bump=True)
             block_stop_cleanup(tree_root, branch, topic, marker, plan)
             return
-        protected = is_protected(branch, protected_targets(main_root))
-        holding = unlanded(tree_root, branch, topic, protected)
-        if holding:
-            stop_blocks(common, session, bump=True)
-            block_stop(tree_root, branch, topic, holding, plan, protected)
+        if only_pushed(holding):
+            # The block offers "say what you are waiting on, and stop" as the way out, and
+            # that stop has the same tree and HEAD. One block, then, or the honest wait is
+            # refused a second time and only gets out by exhausting the allowance.
+            stop_blocks(common, session, held_state, bump=True)
+        block_stop(tree_root, branch, topic, holding, plan, protected)
         return
 
     if event != "PreToolUse":
@@ -1470,7 +1629,8 @@ def main() -> None:
         return
 
     merges_here = merge_calls(command)
-    if merges_here and is_protected(branch, protected_targets(main_root)):
+    protected = is_protected(branch, protected_targets(main_root))
+    if protected and any(what == "gh pr merge" for what, _ in merges_here):
         # Denied BEFORE anything is marked below, and the order is the whole point: a
         # denied merge never ran, so spending the worktree here would strand a live change
         # in a tree the guard then refuses to edit — the change would need a new worktree
@@ -1479,14 +1639,25 @@ def main() -> None:
         # Not gated on `linked`, unlike the marking. A merge into a shared trunk is
         # refused wherever it is typed; the main checkout is if anything the more likely
         # place for someone to try it.
-        #
-        # `land.py` is in `merges_here` too, and denying it is right: a repo with a
-        # protected target has told this hook that no session merges into it, and a
-        # session that has to reach for `land.py`'s push-and-open half can run its two
-        # commands. Denying is what makes the refusal legible — `land.py` stopping
-        # halfway with an open PR reads, to the session, like a step that did not work.
         deny(reason_protected_merge(branch), warn_only)
         return
+    def lands_nothing(what: str) -> bool:
+        """`land.py` stops before its merge step here, so it is let through and marks nothing.
+
+        Against a protected branch, or in a repository whose runs end at the push or the
+        open PR, it merges nothing and says so. It used to be denied with the rest, while
+        SKILL.md and this hook's own refusal both pointed at it as the way to push and
+        open — so the one allowlisted route was usable only by a person, and a consumer
+        wrote a companion hook to print the commands instead. Judged against the branch
+        the call actually lands into: a `CLAUDE_INTEGRATION_BRANCH=` prefix naming an
+        unprotected batch merges, and that tree must still be marked.
+        """
+        if not what.startswith("land.py"):
+            return False
+        target = what[len("land.py into "):] if what.startswith("land.py into ") else branch
+        return is_protected(target, protected_targets(main_root)) or plan.stops_before_merge()
+
+    merges_here = [(what, where) for what, where in merges_here if not lands_nothing(what)]
 
     for what, where in merges_here:
         # Recorded *before* the merge runs rather than after, because there is no

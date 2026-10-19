@@ -141,6 +141,16 @@ three ways that each cost a measured session:
   branch that had no PR, which then refused that session's `Stop` — and left the tree that
   merged unmarked and still editable. Two costs from one missing reading.
 
+**A rehearsal is not a merge.** `land.py --dry-run` prints the sequence and runs none of
+it, and it is the step a session is told to read before landing; counted as a merge it
+spent the tree it was read from, and against a protected branch it was refused outright.
+So a `land.py` call carrying `--dry-run` marks nothing and is never refused. Nor does a
+`land.py` mark anything where it stops before its merge step — against a
+`protectedMergeTargets` branch, or in a repository whose `delivery.endsAt` is `"pr"` or
+`"push"` — and there the guard lets it through: it is the narrow, allowlisted route to the
+open PR those repositories ask for. A `gh pr merge` typed by hand into a protected branch is
+still denied.
+
 The command position is read and the rest of the segment is not, which is the opposite of
 `git_calls`, and the asymmetry is deliberate: a missed `git` on the write path is an
 unguarded mutation, while a missed merge is only a mark not written — and that mark's own
@@ -204,7 +214,7 @@ path is printed — and each was verified to fail against the old wording before
 
 What is spent is a **branch in a tree**, not a directory name. The file has to be named
 after something filesystem-safe and stable, and the leaf name is the only candidate — but a
-leaf name is not unique (`../hermes-dev-x` and `.claude/worktrees/hermes-dev-x`) and, once
+leaf name is not unique (`../app-x` and `.claude/worktrees/app-x`) and, once
 teardown is routine, it gets **reused**: same obvious name, cut again off the integration
 branch, for the next change. So the marker records the tree path and the branch, and
 `is_spent` requires both to match before it applies. A marker with no `branch` field predates
@@ -275,10 +285,20 @@ this guard: three of them under one `.claude/worktrees/`, one a full checkout wi
 `node_modules` in it, while `git worktree list` named only the main checkout — and one had
 been in every new session's context since the day it was left.
 
-It blocks at most **twice** per session and then lets the session end. A hook that can block
-forever hangs a session, and an agent that has ignored the same instruction twice will not
-take it on the third telling. Every git call that fails resolves to "nothing to hold" —
-blocking a session over a command that merely errored would strand it with no way out.
+It blocks at most **twice** for one held state — the tree and its `HEAD` — and then lets the
+session end, saying once that it has stopped asking. A hook that can block forever hangs a
+session, and an agent that has ignored the same instruction twice will not take it on the
+third telling. The allowance is per state rather than per session because a session-wide
+count was spent on a legitimate early block, and the same resumed session later committed
+onto a branch whose PR had already merged and ended without a word; a new commit or another
+tree is checked afresh. The counts live beside the spent markers and are pruned after a week
+at `SessionStart`. Every git call that fails resolves to "nothing to hold" — blocking a
+session over a command that merely errored would strand it with no way out.
+
+Where the only thing held is a branch that is pushed and not yet integrated, the block also
+offers the honest way to wait: a session waiting on review agents or CI it started itself
+names what it is waiting on and the PR, and stops — rather than merging early to clear the
+block, which is what it used to buy.
 
 ## Configuration
 
@@ -312,7 +332,7 @@ at a time and are otherwise scattered across the two scripts that read them:
 | `integrationBranch` | guard, `land.py` | the branch every PR targets and every worktree is cut from |
 | `worktreesRoot` | guard | the path quoted in the remedy text. **Text only** — whether a directory *is* a worktree is a stat on `.git`, never path arithmetic, so a wrong value here misleads a reader and cannot mis-classify a tree |
 | `guard` | `install.py` | the provenance record: `source`, `syncedFrom`, `sha256`. Written by the installer, never by hand |
-| `delivery` | guard | the repository's own delivery and teardown commands, in place of push-PR-merge — see below |
+| `delivery` | guard, `land.py`, the ownership hook | the repository's own delivery, create and teardown commands, and where a run ends — see below |
 | `sessionOwnership` | `install.py` | whether `worktree-owner.py` is registered too. A resync keeps the repository's answer without the flag |
 | `mergeIntegrationBeforeLanding` | `land.py` | bring `origin/<integration>` down into the topic branch before pushing, so a conflict lands in a tree set up to resolve it instead of in an API response |
 | `protectedMergeTargets` | guard, `land.py` | branches that are pushed to and opened against but **never merged** by a session. Additive only: no key removes a name and no environment variable turns it off, so a repository that has opted in cannot be talked back out of it |
@@ -404,6 +424,14 @@ same file as the branch:
 | `command` | `git push` / `gh pr create` / `gh pr merge` in every message that prescribes them |
 | `teardown` | the four teardown steps, in the `Stop` blocks and the `SessionStart` briefing |
 | `enterWorktree` | when `false`, "call **EnterWorktree**" becomes the `cd` rule, and the `ExitWorktree` teardown step is dropped rather than renumbered around |
+| `create` | `git fetch … && git worktree add …` in the briefing, the main-checkout denial and the ownership hook's "cut your own" — printed instead of it, never beside it. `<integration>` is filled in with the branch; `<name>` and `<branch>` stay for the session to choose |
+| `endsAt` | where a run ends: `"merge"` (the default), `"pr"` (push and open, then stop) or `"push"` (push, then stop; a PR only when someone asks). `Stop` stops counting a pushed branch as undelivered, its steps end there, and `land.py` stops there too. Anything else reads as `"merge"` |
+| `draft` | `true` opens pull requests with `--draft` — in the prescribed steps and in `land.py` — and implies `endsAt: "pr"`, because the forge will not merge a draft. Marking it ready is left to a person |
+
+`endsAt` is not `protectedMergeTargets` by another name. That key names branches a merge
+typed by hand is **denied** into; this one says where *this repository's* runs stop, for
+every branch — which is what a repository with a branch per batch needs, since no fixed list
+names its targets — and denies nothing. A repository can declare both.
 
 `<name>` and `<branch>` in the **teardown** are filled in with the worktree's leaf name and
 its branch, so what a block prints is runnable rather than a template. Not in `command` —

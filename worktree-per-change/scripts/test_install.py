@@ -789,11 +789,14 @@ def main() -> int:
         check("--guard-root registers through the same shim",
               {event: hooks[0].get("args")[:4] for event, hooks in local_hooks.items()},
               {event: ["-S", "-c", SHIM, event] for event in ("PreToolUse", "SessionStart", "Stop")})
+        # Compared resolved: the installer resolves the path it records, and on macOS the
+        # temp directory is reached through a symlink (`/var` → `/private/var`), so the
+        # same file has two spellings and only one of them is what was written.
         check("...with the absolute path as the script it runs",
-              {Path(hooks[0].get("args")[-1]) for hooks in local_hooks.values()},
-              {outside / "hooks" / "worktree-guard.py"})
+              {Path(hooks[0].get("args")[-1]).resolve() for hooks in local_hooks.values()},
+              {(outside / "hooks" / "worktree-guard.py").resolve()})
         check("and it names the file that exists",
-              any(Path(arg) == outside / "hooks" / "worktree-guard.py"
+              any(Path(arg).resolve() == (outside / "hooks" / "worktree-guard.py").resolve()
                   for event in (local_settings.get("hooks") or {}).values()
                   for matcher in event
                   for hook in matcher.get("hooks", [])

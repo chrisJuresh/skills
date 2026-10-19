@@ -47,11 +47,20 @@ What it buys, in the order the failures actually happen:
 
 This is the default, and a repository may have replaced its last three steps. Check
 `.claude/worktree-per-change.json` for a `delivery` block before following the loop: a repo
-that lands without pull requests, or enters worktrees by path rather than with
-`EnterWorktree`, declares it there and the guard's own messages follow that instead. The
+that lands without pull requests, enters worktrees by path rather than with
+`EnterWorktree`, cuts its trees with a script of its own (`create`), or ends every run at
+the pushed branch or at an open — perhaps draft — pull request (`endsAt`, `draft`) declares
+it there, and the guard's own messages and `land.py` follow that instead. The
 **invariant** never moves — one change, one worktree, one branch, and a branch that exists
 only on this disk is not a delivered change — only the commands do. See
 [references/guard-internals.md](references/guard-internals.md#configuration).
+
+**Where the repository declares a `create` command, use it instead of the `git worktree add`
+below** — filling in `<name>` and `<branch>`, and otherwise exactly as written. It cuts the same tree and does the setup a hand-made one lacks
+— dependencies, ignored config, a toolchain, a port — and the gap otherwise shows only at
+the first test run. Measured in one consumer: seven of eight sessions typed the bare git
+command beside the repository's own script, and every one of them then rebuilt the setup by
+hand.
 
 ```bash
 # 1. before the first edit — a worktree cut from the FETCHED integration branch
@@ -124,7 +133,17 @@ python .claude/scripts/land.py        # push, PR if there is none, merge, verify
 ```
 
 `land.py` is the same four commands with the verification that each of them needs, and it
-exists so that the delivery step can be *allowed* — see below.
+exists so that the delivery step can be *allowed* — see below. Read its `--dry-run` first
+when you are unsure what it will do: the header names the target branch and, where the
+repository says so, that it stops at the push or at the open PR. A dry run merges nothing,
+so the guard neither spends the worktree for it nor refuses it.
+
+**Deliver after your own review, not instead of it.** A turn that ends while review agents
+or CI you started are still running is a turn that is waiting, and `Stop` says so when the
+branch is already pushed: name what you are waiting on and the PR, and stop. Merging early
+to clear the block is what it used to buy — measured, a session merged before its own
+review reported, the review then found a real defect, and the fix cost a second worktree
+and a second PR.
 
 **Where several changes are in flight against one integration branch, bring it down before
 you push.** This protocol creates that situation rather than encountering it: every change
@@ -169,6 +188,12 @@ gh pr merge --squash                       # NOT --delete-branch — see below
 gh pr view <n> --json state --jq .state    # expect MERGED, whatever gh exited
 git push origin --delete <short-topic-name>
 ```
+
+**Never `--admin`, and never any other way past the forge's own protection.** Whether the
+repository's required checks apply to this merge is the repository's decision, not the
+session's, and a merge the forge refuses is a question for a person. Measured: a session
+merged four times with `--admin` into a branch whose CI it had just added a gate to — the
+gate it was there to deliver never ran on its own change.
 
 **The delivery step is the one a permission layer stops, and a stopped delivery is not a
 delivered change.** This is not the guard refusing — it is the machine not having been told
@@ -227,13 +252,13 @@ inside a worktree Claude Code refuses `git -C <main>` redirects back out. So the
 comes first and the removal second — two steps, and no way to fold them into one.
 
 **So do not pass `--delete-branch` under this protocol at all.** The flag makes `gh` do
-local git work after the API call, and there is no arrangement of worktrees in which that
-work can succeed here: to delete the merged branch it checks out the **base** branch, and
-the main checkout is permanently sitting on the base. Measured 2026-08-15, landing
-`land.py`'s own first change:
+local git work after the API call: to delete the merged branch it checks out the **base**
+branch, and that fails wherever another worktree already holds the base — the main
+checkout, very often, though not every repository keeps it there. When it fails, it fails
+after the merge. Measured 2026-08-15, landing `land.py`'s own first change:
 
 ```
-failed to run git: fatal: 'main' is already used by worktree at 'C:/Users/Chris/Desktop/skills'
+failed to run git: fatal: 'main' is already used by worktree at '<main-checkout>'
 ```
 
 `gh` exited 1, the pull request was **MERGED**, and the branch was still on the remote.
@@ -309,7 +334,8 @@ merge, so it is not a sweep, and a branch missing from it has not necessarily su
 
 A second change in the same session gets a **new** worktree and a **new** branch, cut
 from the integration branch you just merged into. The guard marks a worktree spent once a
-merge — `gh pr merge`, or `land.py` — has run **in** it, and denies further edits there — a merged branch that grows
+merge — `gh pr merge`, or `land.py` — has run **in** it (not a `land.py --dry-run`, and not
+a `land.py` the repository stops before its merge step), and denies further edits there — a merged branch that grows
 a new commit reaches nobody, because the PR that would have carried it is already
 closed.
 
@@ -379,7 +405,25 @@ output, local config and anything else `.gitignore` covers are simply absent:
   needed; often only a change that touches source requires one. **Do not pipe the install
   through `tail` to keep it out of a context window.** A pipeline reports the *last*
   command's status, so a failed install exits 0 and hands back a checkout whose every
-  later gate result means nothing. `set -o pipefail`, or read `${PIPESTATUS[0]}`.
+  later gate result means nothing. `set -o pipefail` works in bash and zsh alike;
+  `${PIPESTATUS[0]}` is bash's alone, and under zsh it reads empty and passes.
+- **A missing install that does not fail, where the trees sit inside the checkout.**
+  Under `.claude/worktrees/`, Node's module resolution — and the `.bin` directories a
+  package runner puts on `PATH` — climb out of the tree into the main checkout's
+  `node_modules`. The type checker, linter and test runner then go green against
+  dependencies installed for whatever revision the main checkout was left on, and a lockfile
+  change on the branch is never exercised. The same goes for a workspace's built packages:
+  the app imports build output the install step did not produce. Install, and build what
+  the app imports, in the tree itself; a green gate in a tree that never installed is not
+  evidence.
+- **The repository's git hooks, where an install step generates them.** `core.hooksPath`
+  is shared config, so every worktree inherits it — but a relative path resolves inside
+  each tree, and a hook manager that writes its runner during the dependency install has
+  written it only where that install ran with scripts enabled. Everywhere else git runs no
+  hook and says nothing: the commit exits 0 with none of the repository's format, lint,
+  test or message checks. Measured in one consumer: most of its standing trees ran no
+  hook at all. Check the hooks directory exists before the first commit, and run the
+  hook manager's install in the tree when it does not.
 - **Ignored-but-required config.** A `.claude/launch.json` that tells the preview how to
   start the dev server, an `.env`, an editor config. If it is ignored, no worktree has it,
   and the failure looks like the tool being broken rather than the file being missing.
@@ -503,11 +547,12 @@ rarer case, since a clone worked in this way fetches before every worktree it cu
 
 **That merge is also what makes the rest of this file the repository's to write.** Five more
 keys have accumulated there, one incident each, and every one of them is optional and off
-when absent: `delivery` (a repo that lands without pull requests, or without entering
-worktrees), `sessionOwnership` (the second hook), `mergeIntegrationBeforeLanding` (bring the
-base down before pushing), `protectedMergeTargets` (branches this repo never merges into
-from a session) and `requireIssueReference` (the PR body must close its ticket, or say why
-not). The full list, with what reads each, is in
+when absent: `delivery` (a repo that lands without pull requests or without entering
+worktrees, cuts trees with its own `create` command, or ends its runs at the push or the
+open PR with `endsAt` and `draft`), `sessionOwnership` (the second hook),
+`mergeIntegrationBeforeLanding` (bring the base down before pushing),
+`protectedMergeTargets` (branches this repo never merges into from a session) and
+`requireIssueReference` (the PR body must close its ticket, or say why not). The full list, with what reads each, is in
 [references/guard-internals.md](references/guard-internals.md#configuration) — read it
 before adding a key by hand, because a repository that has declared nothing gets exactly the
 behaviour it had before any of them existed, and that is the property they are all built to
@@ -528,9 +573,9 @@ the copy is not the repo's to edit, and a resync that forgot to record itself), 
 upstream moved** (needs a clone, so it must *skip out loud* rather than fail — a check that goes
 red over a clone nobody has is a gate nobody can turn green, and the first person to hit it
 deletes the step). Print the skip as `UNVERIFIED`, never as a pass: the whole failure above was
-something unverified reading as fine. `integration-console`'s
-[`scripts/check-guard.mjs`](https://github.com/third-bridge/hermes-frontend) is a worked
-example. Don't fetch this repo from CI — that puts a third-party's availability on a required
+something unverified reading as fine. One consumer repository's gate script is a worked
+example of that shape: it compares the committed copy with its record offline, and prints
+`UNVERIFIED` rather than failing when no clone of this skill is at hand. Don't fetch this repo from CI — that puts a third-party's availability on a required
 check — and don't auto-resync, because the suite has to run against the new file first.
 
 ## The worktrees live inside the repo, so its own tooling can see them
@@ -825,12 +870,22 @@ branching off a tip the remote no longer had. Classic branch protection with
 `allow_deletions: false`, `allow_force_pushes: false` and `enforce_admins: true` — the
 delete came *from* an admin path, so a rule admins bypass would not have stopped it — while
 leaving required checks and required reviews `null`, gates destruction without gating
-merging, which is exactly the split this one branch needs. The delete call is the test,
-because a protected branch refuses it:
+merging, which is exactly the split this one branch needs. Check it by **reading** the
+protection, never by attempting the delete — on a branch whose protection is misconfigured,
+the test would be the incident:
 
 ```bash
-gh api --method DELETE repos/<owner>/<repo>/git/refs/heads/<integration>   # expect 422
+gh api repos/<owner>/<repo>/branches/<integration>/protection \
+  --jq '{deletions: .allow_deletions.enabled, force_pushes: .allow_force_pushes.enabled, admins: .enforce_admins.enabled}'
+# expect deletions false, force_pushes false, admins true
 ```
+
+Reading protection needs admin rights on the repository: a 404 there means you cannot read
+it, not that the branch is unprotected.
+
+A repository that protects through rulesets rather than classic protection answers
+`gh api repos/<owner>/<repo>/rules/branches/<integration>` instead: look for the `deletion`
+and `non_fast_forward` rules, and check the ruleset's bypass list is empty.
 
 **And where the answer is a branch nobody may merge unreviewed, say that in the config
 rather than in a convention.** The first property above is the one repositories get wrong,
@@ -839,7 +894,8 @@ trunk where review is a *habit* rather than a required check. The forge then mer
 agent's PR on request, unreviewed, and nothing anywhere reports a problem. Name that branch
 in `protectedMergeTargets` and both halves of the protocol stop at the open pull request —
 `land.py` pushes and opens and returns 0, and a `gh pr merge` typed by hand is denied, so
-opting in cannot be undone by taking the shortcut:
+opting in cannot be undone by taking the shortcut. The guard lets `land.py` through there
+and spends nothing for it, because there it merges nothing:
 
 ```json
 { "integrationBranch": "main", "protectedMergeTargets": ["main"] }
@@ -851,6 +907,16 @@ the PR: `Stop` counts a pushed branch as delivered, and the reply names the PR a
 is waiting for a person. It is additive only — no key removes a name and no environment
 variable turns it off — so a repository that has opted in cannot be talked back out of it by
 a session, which is the point of putting it here rather than in a habit.
+
+**A repository whose runs end before the merge for every branch — not one named trunk —
+says so with `delivery.endsAt` instead.** Some integrate through a branch per batch, so no
+fixed list names their targets, and end every run at the pushed branch (`"push"`, a pull
+request only when someone asks) or at the open pull request (`"pr"`; `"draft": true` opens
+it as a draft and implies `"pr"`, since the forge will not merge a draft). `Stop` then
+counts a pushed branch as delivered and prescribes only the steps up to that point,
+`land.py` stops there too, and marking a draft ready stays a person's act. Unlike
+`protectedMergeTargets` this shapes what is prescribed; it does not deny a merge typed by
+hand.
 
 ## When the guard denies you
 
@@ -1233,9 +1299,26 @@ fork, which is the expensive half and is expensive *because* there is no second 
 What actually protects the next adopter is this section being right, which is cheaper and
 already done.
 
-**What would reopen it:** a second repository installing this guard. At that point
-`install.py` placing a teardown script is the same small change it is today, made with two
-data points about where it belongs and what it must not assume, instead of one.
+**That trigger — a second repository installing this guard — has since fired, and the
+answer stayed the same for a better reason.** Two consumer repositories now script both
+ends of a change, in different languages and shapes, each with setup the other does not
+need (package builds, dev-server records, generated files to restore). So no script
+ships; each repository declares its own as `delivery.create` and `delivery.teardown`, and
+the guard prints those in place of the raw steps. Both scripts converged on one contract,
+and a new one should meet it:
+
+- **Find the tree from its branch**, in `git worktree list --porcelain` (the
+  `branch refs/heads/<name>` line under its `worktree <path>`), never by re-deriving the
+  path the creating script would have chosen — that derivation drifts the first time the
+  layout changes, and one script reported a present tree as absent because of it. If the
+  match is the main checkout, stop.
+- **Confirm the merge with the forge**, never with git's ancestry (see step 4).
+- **Refuse on tracked changes or commits on no remote** (`git rev-list HEAD --not
+  --remotes`), after restoring any generated file the gate rewrote, and before anything
+  destructive — one script stopped its dev server and then aborted, leaving neither.
+- **Then remove the tree, delete the local branch, and delete the remote branch only if
+  `git ls-remote` still lists it.** Retry a busy delete for a few seconds, then name the
+  holder rather than looping.
 
 ## Cost, and where it actually is
 

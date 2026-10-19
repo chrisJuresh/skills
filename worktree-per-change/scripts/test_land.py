@@ -143,8 +143,8 @@ def main() -> int:
 
         # `--delete-branch` is deliberately absent, and this is the check that keeps it
         # absent. It makes `gh` do local git work after the API call — it checks out the
-        # base branch in order to delete the merged one — and under this protocol the main
-        # checkout is permanently sitting on the base, so it always fails, *after* the
+        # base branch in order to delete the merged one — and that fails wherever another
+        # worktree holds the base, usually the main checkout, *after* the
         # merge has already happened. Measured 2026-08-15 landing this script's own first
         # change: `fatal: 'main' is already used by worktree at ...`, exit 1, and a MERGED
         # pull request with its branch still standing.
@@ -259,7 +259,7 @@ def main() -> int:
         # The override cannot switch the protection OFF either: pointing it at a branch
         # this repo does not protect is allowed, which is what makes the batch flow work,
         # but `develop` stays refused however it is spelled (checked just above).
-        env = dict(os.environ, CLAUDE_INTEGRATION_BRANCH="ENS-1-batch")
+        env = dict(os.environ, CLAUDE_INTEGRATION_BRANCH="PROJ-1-batch")
         out = subprocess.run(
             [sys.executable, str(LAND), "--dry-run"],
             cwd=str(gtree), capture_output=True, text=True, env=env,
@@ -279,6 +279,85 @@ def main() -> int:
         out = land(ptree, "--dry-run")
         check("an unconfigured repo merges into main as before", "gh pr merge" in out.stdout, True)
         check("and says nothing about protection", "NOT MERGING" in out.stdout, False)
+        check("nor about where a run ends", "ends at:" in out.stdout, False)
+
+        # --- a repository may end its runs before the merge -------------------------
+        # Read from the same `delivery` keys as the guard, so the script and the Stop
+        # gate cannot disagree about where a run stops.
+        def declare(delivery: dict) -> None:
+            (plain / ".claude" / "worktree-per-change.json").write_text(
+                json.dumps({"integrationBranch": "main", "delivery": delivery}),
+                encoding="utf-8",
+            )
+
+        declare({"endsAt": "push"})
+        out = land(ptree, "--dry-run")
+        check("endsAt push succeeds", out.returncode, 0)
+        check("the header says the run ends at the push", "ends at:     the push" in out.stdout, True)
+        check("the push runs", "git push -u origin HEAD" in out.stdout, True)
+        check("no pull request is opened", "gh pr create" in out.stdout, False)
+        check("and nothing is merged", "gh pr merge" in out.stdout, False)
+
+        declare({"endsAt": "pr"})
+        out = land(ptree, "--dry-run")
+        check("endsAt pr opens the pull request", "gh pr create --base main" in out.stdout, True)
+        check("and stops before the merge", "gh pr merge" in out.stdout, False)
+        check("saying why", "ends a run at the open pull request" in out.stdout, True)
+        check("and the branch is not deleted", "--delete origin" in out.stdout, False)
+
+        declare({"draft": True})
+        out = land(ptree, "--dry-run")
+        check("draft opens the pull request as a draft",
+              "gh pr create --base main --draft" in out.stdout, True)
+        check("and never merges it, because the forge would refuse",
+              "gh pr merge" in out.stdout, False)
+
+        declare({"endsAt": "sideways"})
+        out = land(ptree, "--dry-run")
+        check("an unknown endsAt means the default merge", "gh pr merge" in out.stdout, True)
+        record_branch(plain, "main")
+
+        # --- an open PR against another base is refused, not merged there -----------
+        # The PR is found by its head alone, so one opened by hand against another base
+        # would be merged into that base. A stand-in `gh` answers the two reads this
+        # script makes before pushing; nothing reaches a forge.
+        fake = root / "fake-bin"
+        fake.mkdir()
+        stub = fake / "gh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *"--state open"*) echo "7 release" ;; esac\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        if os.name != "nt":
+            env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+            out = subprocess.run(
+                [sys.executable, str(LAND), "--dry-run"],
+                cwd=str(ptree), capture_output=True, text=True, env=env,
+            )
+            check("an open PR against another base is refused", out.returncode, 2)
+            check("naming both bases", "against `release`, not `main`" in out.stderr, True)
+            check("and the retarget command", "gh pr edit 7 --base main" in out.stderr, True)
+            check("before anything is pushed", "git push" in out.stdout, False)
+
+            # No `gh` at all is a refusal that says so, not a traceback.
+            bare = root / "bare-bin"
+            bare.mkdir()
+            (bare / "git").symlink_to(shutil.which("git"))
+            out = subprocess.run(
+                [sys.executable, str(LAND), "--dry-run"],
+                cwd=str(ptree), capture_output=True, text=True, env=dict(os.environ, PATH=str(bare)),
+            )
+            check("a missing gh is refused", out.returncode, 2)
+            check("saying what is missing", "`gh` is not on PATH" in out.stderr, True)
+            check("with no traceback", "Traceback" in out.stderr, False)
+
+        # The guard recognises a rehearsal by the exact flag, so an abbreviation that
+        # argparse would accept as `--dry-run` must not be accepted at all.
+        out = land(ptree, "--dry")
+        check("an abbreviated --dry-run is rejected", out.returncode, 2)
+        check("and nothing runs", "git push" in out.stdout, False)
 
         # --- a pull request that would close no issue -------------------------------
         # Off unless the repository asks, and when it does, the body is read by the same
