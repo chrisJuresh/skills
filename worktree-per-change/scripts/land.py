@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -84,13 +85,16 @@ DEFAULT_INTEGRATION_BRANCH = "development"
 DEFAULT_PROTECTED_MERGE_TARGETS: frozenset[str] = frozenset()
 
 
-def protected_targets(main_root: Path) -> frozenset[str]:
+def protected_targets(main_root: Path, tree: Path | None = None) -> frozenset[str]:
     """What this repository refuses to merge into. Read from the MAIN checkout.
 
     Same source and same reason as `integration_branch`: every worktree of a repo has to
-    agree, and `.claude/` is checked out separately in each of them.
+    agree, and `.claude/` is checked out separately in each of them. Where the main
+    checkout has no record yet, that includes falling back to the worktree's — which a
+    session can edit, so the refusal holds there only as well as nothing did before; it
+    is the main checkout's copy that cannot be talked out of it.
     """
-    extra = config(main_root).get("protectedMergeTargets")
+    extra = config(main_root, tree).get("protectedMergeTargets")
     if isinstance(extra, list):
         names = {str(n).strip().lower() for n in extra if str(n).strip()}
         return DEFAULT_PROTECTED_MERGE_TARGETS | frozenset(names)
@@ -110,6 +114,71 @@ def is_protected(branch: str, protected: frozenset[str]) -> bool:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     return name in protected
+
+
+# A pull request closes its ticket from its BODY, and only from its body.
+#
+# **Off by default**, because a repository that does not track work as issues has nothing
+# for this to check, and one whose tickets live in a tracker with no closing keywords
+# cannot satisfy it at all. Turned on per repository:
+#
+#     "requireIssueReference": true
+#
+# What it is for: the omission is invisible at the moment it is made. The PR merges green,
+# the reply is truthful, and the ticket stays open — so the next session reads the tracker,
+# sees undelivered work, and builds what already landed. Measured 2026-09-20 in a repo
+# using this protocol: #19 delivered issue #4 with `(#4)` in its TITLE, which GitHub does
+# not act on, and no keyword in its body. #20, one commit later, opened with `Closes #9.`
+# and closed its issue on merge. The difference was one line, and the cost was a session
+# spent rebuilding delivered work.
+#
+# This script's own default makes it easy to drop: with no `--body-file`, the PR body is
+# `--fill`, which is the branch's commit messages — so the line lives in the commit, where
+# nobody looking at a `gh pr create` command would think to check for it.
+CLOSING_KEYWORD = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:[\w.-]+/[\w.-]+)?#\d+",
+    re.IGNORECASE,
+)
+# The escape hatch, on a line of its own, with a reason after the colon. A line in the PR
+# outlives a flag on a command nobody will see again.
+NO_ISSUE = re.compile(r"^\s*no[ -]issue\s*:\s*\S+", re.IGNORECASE | re.MULTILINE)
+
+
+def requires_issue_reference(main_root: Path, tree: Path | None = None) -> bool:
+    """Whether this repository has opted in. Read from the same record as the rest."""
+    return bool(config(main_root, tree).get("requireIssueReference"))
+
+
+def closes_an_issue(body: str) -> bool:
+    return bool(CLOSING_KEYWORD.search(body) or NO_ISSUE.search(body))
+
+
+def pull_request_body(tree: Path, branch: str, body_file: str | None) -> str | None:
+    """The body the pull request will get, by whichever route this script takes.
+
+    `None` means the body could not be read, and the caller lets it through: refusing to
+    land a delivered change over a file this script merely failed to open is the worse
+    error, and it is the error that gets a check removed.
+    """
+    if body_file:
+        # Resolved against the worktree, which is the cwd `gh` itself will read it from.
+        path = Path(body_file)
+        try:
+            return (path if path.is_absolute() else tree / path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+    # No body file means `--fill`, whose body is the branch's commit messages — every
+    # commit the branch adds, not just the tip. `origin/<branch>` is the honest range and
+    # the local branch is the fallback for a repo whose remote has not been fetched;
+    # `-1` is the last resort, and it is last because a branch of several commits whose
+    # keyword sits in an earlier one would otherwise be refused for lacking it.
+    for revisions in (f"origin/{branch}..HEAD", f"{branch}..HEAD", "-1"):
+        body = git(tree, "log", revisions, "--pretty=%B")
+        if body:
+            return body
+    return None
 
 
 class Refused(Exception):
@@ -181,38 +250,83 @@ def locate(start: Path) -> tuple[Path, Path]:
     raise Refused(f"{start} is not inside a git repository.")
 
 
-def config(main_root: Path) -> dict:
-    """This repository's record, or an empty one. Read from the MAIN checkout.
+def record_root(main_root: Path, tree: Path | None = None) -> Path | None:
+    """Where this repository's record is read from: the MAIN checkout, until it has none.
 
     Every worktree of the repo has to agree about the integration branch, and `.claude/`
     is checked out separately in each of them — so the main checkout is the only copy
-    there is one of.
+    there is one of, and while it has a record nothing else is read.
+
+    A main checkout with no record is the ordinary state for a while, not a hand-made
+    install: `install.py` commits the record in a worktree of its own and leaves the main
+    checkout untouched, so it has none until that lands *and* is pulled. Every worktree cut
+    in that window carries the record and its main checkout does not, and the only other
+    answer is the hard-coded default — which aims the PR at `development` in a repository
+    that integrates through anything else. So the worktree's own record is read instead:
+    the one its branch was cut with, or the one an install has just committed on it. It
+    never outranks the main checkout's — it is read only where there is nothing to
+    disagree with, so a change that moves the branch still needs the operator's override.
+
+    What it costs is that, in that window, the target is a file the session can edit. That
+    is not a new reach — the `land.py` that runs is this worktree's own copy, equally
+    editable — but it is a quieter one, so `land()` says when the record is this one.
+
+    The guard and `worktree_owner.py` still read only the main checkout, so in the same
+    window their messages name the default. This one reads further because landing is the
+    step a wrong branch cannot be taken back from.
     """
+    for root in (main_root, tree):
+        if root is not None and (root / ".claude" / CONFIG_FILENAME).is_file():
+            return root
+    return None
+
+
+def config(main_root: Path, tree: Path | None = None) -> dict:
+    """This repository's record, or an empty one. See `record_root` for which copy."""
+    root = record_root(main_root, tree)
+    if root is None:
+        return {}
     try:
-        blob = json.loads(
-            (main_root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8")
-        )
+        blob = json.loads((root / ".claude" / CONFIG_FILENAME).read_text(encoding="utf-8"))
         return blob if isinstance(blob, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def integration_branch(main_root: Path) -> str:
+def delivery_end(main_root: Path, tree: Path | None = None) -> tuple[str, bool]:
+    """Where this repository's runs end — `merge`, `pr` or `push` — and whether PRs are drafts.
+
+    The same `delivery` keys the guard reads, so the script and the `Stop` gate agree about
+    where a run stops. One window differs: before an install has landed, this reads the
+    worktree's own record (see `record_root`) while the guard reads only the main checkout. `draft` implies `pr`: the forge
+    refuses to merge a draft, so a script that drafted and then merged would fail at the
+    one step that cannot be retried quietly.
+    """
+    blob = config(main_root, tree).get("delivery")
+    blob = blob if isinstance(blob, dict) else {}
+    draft = blob.get("draft") is True
+    ends = str(blob.get("endsAt") or "").strip().lower()
+    ends = ends if ends in {"merge", "pr", "push"} else "merge"
+    return ("pr" if draft and ends == "merge" else ends), draft
+
+
+def integration_branch(main_root: Path, tree: Path | None = None) -> str:
     """The branch this repository's PRs target.
 
     Read from the repository rather than guessed, and read from the *main checkout* so
-    that every worktree of it agrees. The environment override is the operator's, and
-    exists for the same reason it does in the guard.
+    that every worktree of it agrees — or from this worktree's record while the main
+    checkout has none (see `record_root`). The environment override is the operator's,
+    and exists for the same reason it does in the guard.
 
     The fallback is a fallback, not a default anyone should reach: `install.py` asks and
-    records the answer, so a repo arriving here without a record is one where the guard
-    was installed by hand. Landing into the wrong branch is not recoverable by rerunning,
-    so this says which branch it is about to use, every time.
+    records the answer, so a repo arriving here with a record in neither place is one
+    where the guard was installed by hand. Landing into the wrong branch is not
+    recoverable by rerunning, so this says which branch it is about to use, every time.
     """
     override = (os.environ.get("CLAUDE_INTEGRATION_BRANCH") or "").strip()
     if override:
         return override
-    name = config(main_root).get("integrationBranch")
+    name = config(main_root, tree).get("integrationBranch")
     if isinstance(name, str) and name.strip():
         return name.strip()
     return DEFAULT_INTEGRATION_BRANCH
@@ -300,6 +414,17 @@ def merge_integration(tree: Path, branch: str, dry_run: bool) -> None:
     print(f"  merged origin/{branch}")
 
 
+def forge(argv: list[str], tree: Path) -> subprocess.CompletedProcess:
+    """A read from the forge. No `gh` on PATH is a refusal that says so, not a traceback."""
+    try:
+        return subprocess.run(argv, cwd=str(tree), capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Refused(
+            "`gh` is not on PATH, so whether this branch has already merged cannot be asked.\n"
+            "Install the GitHub CLI, or deliver by hand."
+        )
+
+
 def head_pr(tree: Path, topic: str, state: str) -> int | None:
     """The PR whose head is `topic` and whose state is `state`, if there is one.
 
@@ -307,23 +432,44 @@ def head_pr(tree: Path, topic: str, state: str) -> int | None:
     script merge something that has nothing to do with the worktree it was run from,
     which is the whole reason it is narrow enough to allowlist.
     """
-    result = subprocess.run(
+    result = forge(
         ["gh", "pr", "list", "--head", topic, "--state", state,
          "--json", "number", "--jq", ".[0].number"],
-        cwd=str(tree), capture_output=True, text=True,
+        tree,
     )
     value = (result.stdout or "").strip()
     return int(value) if value.isdigit() else None
+
+
+def open_pr_base(tree: Path, topic: str) -> tuple[int, str] | None:
+    """The open PR whose head is `topic`, with the base it targets, if there is one."""
+    result = forge(
+        ["gh", "pr", "list", "--head", topic, "--state", "open",
+         "--json", "number,baseRefName", "--jq", '.[0] | "\\(.number) \\(.baseRefName)"'],
+        tree,
+    )
+    parts = (result.stdout or "").split()
+    return (int(parts[0]), parts[1]) if len(parts) == 2 and parts[0].isdigit() else None
 
 
 def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     print(f"repository:  {main_root}")
     print(f"worktree:    {tree}")
     print(f"branch:      {topic}  ->  {branch}")
+    if record_root(main_root, tree) == tree:
+        # Said every time, because it is the one case where the target comes from a file
+        # this worktree itself carries.
+        print("record:      this worktree's — the main checkout has none yet")
     # Said before anything runs, not just at the merge step, because the whole reason to
     # read a dry run is to find out what it is about to do to which branch.
-    if is_protected(branch, protected_targets(main_root)):
+    protected = is_protected(branch, protected_targets(main_root, tree))
+    ends, draft = delivery_end(main_root, tree)
+    if ends == "push":
+        print("ends at:     the push — this repository opens a pull request only when asked")
+    elif protected:
         print(f"merge:       NO — `{branch}` is protected; this will push and open a PR only")
+    elif ends == "pr":
+        print("ends at:     the open pull request" + (", as a draft" if draft else ""))
     print()
 
     # Asked BEFORE the push, because the push is what makes this undetectable. A landed
@@ -351,6 +497,20 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
             f"    git branch -D {topic}"
         )
 
+    # The open PR is found by its head and nothing else, so one opened by hand against
+    # another base — or before this repository's integration branch moved, which in a
+    # repository with a branch per batch is routine — would be merged into whatever base
+    # it has, with protection checked against the recorded branch instead of that one.
+    # Asked before the push, like the merged check above, so a refusal changes nothing.
+    opened = open_pr_base(tree, topic) if ends != "push" else None
+    if opened is not None and opened[1] != branch:
+        raise Refused(
+            f"#{opened[0]} is open for `{topic}` against `{opened[1]}`, not `{branch}`.\n"
+            "This script merges only into the branch this repository recorded. Retarget it\n"
+            f"    gh pr edit {opened[0]} --base {branch}\n"
+            "or close it, and then run this again."
+        )
+
     if args.merge_integration:
         merge_integration(tree, branch, args.dry_run)
         print()
@@ -366,14 +526,60 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
         raise Refused(
             f"the push was refused:\n{(pushed.stderr or '').strip()}"
         )
+    if ends == "push":
+        print("\n  Stopping at the push: this repository ends a run at the pushed branch.")
+        print("  Say in your reply that it is pushed and waiting. A pull request is opened")
+        print("  only when someone asks for one.")
+        if args.dry_run:
+            print("  (dry run — nothing was pushed)")
+        return 0
 
     number = None if args.dry_run else head_pr(tree, topic, "open")
     print("\npull request")
     if number is None:
+        if requires_issue_reference(main_root, tree):
+            # Checked here rather than before the push, because this is the only step it
+            # is about: a PR that is already open has its body, and re-running this script
+            # against it must not start refusing. A push with no PR behind it is benign —
+            # the next run finds no open PR and creates one.
+            body = pull_request_body(tree, branch, args.body_file)
+            if body is not None and not closes_an_issue(body):
+                raise Refused(
+                    "this repository requires a pull request to close its issue, and this "
+                    "body would close nothing.\n\n"
+                    "Put the keyword and the number on the body's first line, where the "
+                    "forge reads it — the TITLE is not read:\n"
+                    "    Closes #<n>.\n\n"
+                    + (
+                        f"The body comes from {args.body_file}.\n"
+                        if args.body_file
+                        else "With no --body-file the body is --fill, so the line goes in the "
+                        "commit message:\n"
+                        "    git commit --amend\n"
+                    )
+                    + "\nIf this change genuinely closes no issue, say so with a reason and "
+                    "this passes:\n"
+                    "    No issue: <why>\n\n"
+                    + (
+                        "This is a dry run; nothing ran."
+                        if args.dry_run
+                        else "The branch is pushed; nothing was opened or merged."
+                    )
+                )
         create = ["gh", "pr", "create", "--base", branch]
+        create += ["--draft"] if draft else []
         create += ["--title", args.title] if args.title else []
-        create += ["--body-file", args.body_file] if args.body_file else []
-        if not args.title and not args.body_file:
+        if args.body_file:
+            create += ["--body-file", args.body_file]
+        else:
+            # `--fill` whenever there is no body file, including alongside `--title`.
+            # gh documents the precedence — "if the --title and/or --body are also
+            # provided alongside --fill, the values specified by --title and/or --body
+            # will [win]" — so the explicit title survives and the commits supply the
+            # body. This used to add `--fill` only when there was no title either, which
+            # meant `land.py --title T` sent gh neither a body nor a way to derive one,
+            # and gh refuses that non-interactively: the run died at the forge, after the
+            # push, with an error about a missing body rather than about the flag.
             create += ["--fill"]
         created = run(create, tree, args.dry_run)
         if not args.dry_run:
@@ -391,8 +597,8 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
 
     # No `--delete-branch`, deliberately. It makes `gh` do local git work after the API
     # call — it checks out the base branch to delete the merged one — and under this
-    # protocol that always fails, because the main checkout is permanently sitting on the
-    # integration branch:
+    # protocol that fails wherever another worktree holds the base — usually the main
+    # checkout:
     #
     #     failed to run git: fatal: 'main' is already used by worktree at '…'
     #
@@ -412,7 +618,7 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
     # before the push and leave the change undelivered, which is the failure this whole
     # script exists to prevent. Refusing *here* means the branch is pushed, the PR is
     # open, and the only thing that did not happen is the thing that should not.
-    if is_protected(branch, protected_targets(main_root)):
+    if protected:
         print(f"  NOT MERGING — `{branch}` is a protected branch.")
         print(f"  #{target} is open and waiting for a human to merge it.")
         print()
@@ -426,6 +632,12 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
         print(f"  Merge it yourself when it has been reviewed, or point this at a batch")
         print("  branch you own — `integrationBranch` in .claude/worktree-per-change.json")
         print("  — which is the case squash-merging without review was written for.")
+        return 0
+    if ends == "pr":
+        print("  NOT MERGING — this repository ends a run at the open pull request.")
+        print(f"  #{target} is open" + (" as a draft" if draft else "") + " and waiting for a person.")
+        print("  Say so in your reply. Marking it ready for review, and merging it, are")
+        print("  not this script's to do; the branch stays on the remote as the PR's head.")
         return 0
 
     merged = run(["gh", "pr", "merge", target, "--squash"], tree, args.dry_run)
@@ -477,7 +689,9 @@ def land(tree: Path, main_root: Path, branch: str, topic: str, args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    # No abbreviations: the guard recognises a rehearsal by the exact `--dry-run`, so an
+    # accepted `--dry` would rehearse here and be counted as a merge there.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--dry-run", action="store_true", help="print the sequence, run none of it")
     parser.add_argument("--title", metavar="TEXT", help="title for the PR, if one is created")
     parser.add_argument("--body-file", metavar="PATH", help="body file for the PR, if one is created")
@@ -497,9 +711,11 @@ def main() -> int:
 
     try:
         tree, main_root = locate(Path.cwd().resolve())
-        branch = integration_branch(main_root)
+        branch = integration_branch(main_root, tree)
         if args.merge_integration is None:
-            args.merge_integration = bool(config(main_root).get("mergeIntegrationBeforeLanding"))
+            args.merge_integration = bool(
+                config(main_root, tree).get("mergeIntegrationBeforeLanding")
+            )
         topic = preflight(tree, branch)
         return land(tree, main_root, branch, topic, args)
     except Refused as refusal:

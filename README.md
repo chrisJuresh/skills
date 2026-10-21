@@ -34,23 +34,28 @@ git clone https://github.com/chrisJuresh/skills.git
 python skills/worktree-per-change/scripts/install.py --repo . --branch development --dry-run
 ```
 
-Read the diff it prints, then run it without `--dry-run`. Per repository is the usual
-install, because the rule depends on what that repository's branches mean. It copies the
-guard to `.claude/hooks/`, registers three hooks (`PreToolUse`, `SessionStart`, `Stop`) in
-the committed `.claude/settings.json`, writes `.claude/worktree-per-change.json` with the
-integration branch and the provenance of the copy it just made, and links the skill into
-`~/.claude/skills/` so `/worktree-per-change` resolves everywhere. Commit all three, and
-check `.gitignore` is not swallowing them — a worktree only gets a file if git puts it
-there.
+Read what it prints, then run it without `--dry-run`. Per repository is the usual install,
+because the rule depends on what that repository's branches mean. The install is a change
+like any other, so it is made like one: it fetches the integration branch, cuts a worktree
+and a branch of its own from it, and writes everything there — the guard in
+`.claude/hooks/`, three hooks (`PreToolUse`, `SessionStart`, `Stop`) in the committed
+`.claude/settings.json`, `.claude/worktree-per-change.json` with the integration branch and
+the provenance of the copy, `land.py`, and the `.gitignore` and `.worktreeinclude` entries.
+It commits exactly those files and prints one next step: run `land.py` from inside that
+worktree. The main checkout is not touched; once the PR merges, `git pull --ff-only` there
+brings the guard in. It also links the skill into `~/.claude/skills/` so
+`/worktree-per-change` resolves everywhere.
 
 Re-running it is how a repo resyncs. The config file is merged rather than replaced, so
 the branch, the provenance and anything else that repo keeps beside them all survive.
 
-New hooks apply to sessions started afterwards, not the one you are in.
+Plan as if new hooks cover running sessions, the one doing the install included: measured,
+a hook written mid-session denied that same session's very next call.
 
 | Flag | Effect |
 |---|---|
-| `--repo .` | Install into a repository's committed `.claude/settings.json` (the usual case) |
+| `--repo .` | Install into a repository's committed `.claude/settings.json` (the usual case), committed in a worktree of its own |
+| `--in-place` | Write it into the checkout instead, uncommitted — also what a repo with no `origin` gets |
 | `--branch NAME` | The branch changes merge into. Default `development` |
 | `--status` | What is installed, which branch this repo integrates through, and what each worktree is still holding |
 | `--uninstall` | Remove it |
@@ -89,7 +94,8 @@ Requires Python 3 and git. No third-party packages.
   for the repository whose trunk takes reviewed PRs. `land.py` stops at the open PR there
   too, so opting in cannot be undone by typing `gh pr merge` instead
 
-A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most.
+A `Stop` hook refuses to end a session holding uncommitted or unpushed work, twice at most for
+any one held state.
 
 With `--session-ownership`, a second hook adds one more denial: **a write into a worktree
 another live session is holding.** The guard isolates changes and has nothing to say about
@@ -117,13 +123,19 @@ worktree-per-change/
   SKILL.md                                     the skill itself
   references/
     guard-internals.md                         what the guard checks, its modes, how to debug it
+    permissions.md                             the allowlist install.py writes, and why
+    session-ownership.md                       the opt-in second hook: one worktree, one session
     ticketing.md                               working a ticket queue with several agents
     replacing-a-concurrent-writer-guard.md     migrating a repo that ships its own hook
   scripts/
     install.py                                 install / --status / --uninstall
     worktree_guard.py                          the hook
-    test_guard.py                              104 checks on what the hook decides
-    test_install.py                            27 checks on what the installer leaves on disk
+    worktree_owner.py                          the opt-in ownership hook
+    land.py                                    push, PR, merge, verify — the allowlisted delivery
+    test_guard.py                              178 checks on what the hook decides
+    test_install.py                            222 checks on what the installer leaves on disk
+    test_land.py                               84 checks on what land.py refuses and prints
+    test_worktree_owner.py                     63 checks on what the ownership hook decides
   evals/
     evals.json                                 skill evals
     fixture/                                   synthetic repo the evals run against
@@ -131,7 +143,7 @@ worktree-per-change/
 
 ### Tests
 
-Both run against real git repositories in a temp dir, and need nothing but git.
+All four run against real git repositories in a temp dir, and need nothing but git.
 
 ```bash
 python worktree-per-change/scripts/test_guard.py
@@ -139,4 +151,95 @@ python worktree-per-change/scripts/test_guard.py
 
 ```bash
 python worktree-per-change/scripts/test_install.py
+```
+
+```bash
+python worktree-per-change/scripts/test_land.py
+```
+
+```bash
+python worktree-per-change/scripts/test_worktree_owner.py
+```
+
+## `board-runner`
+
+Work a GitHub board unattended — one ticket, one brand-new session, one worktree, one
+landed change — with a live tree to watch it by.
+
+The idea it rests on is that **the queue is a query**. A list of tickets to work through
+is wrong the moment it is written: something lands and three blocked tickets become
+runnable, or a person picks one up by hand and it must not be started twice. So there is no
+list. Every cycle the runner asks the board which tickets are open, carry the agent label,
+and have no open blocker — using GitHub's own `blocked_by` edges — and works whatever comes
+back. Cascades then need no orchestration, because closing a ticket *is* the release of
+everything behind it.
+
+The unit is one ticket per brand-new `claude -p` session, because that is what `/implement`
+is for: several tickets in one chat share a context window, a cwd and a plan, and several
+tickets in several processes share nothing. Work stops at a wall-clock deadline — nothing
+new *starts* past it, and whatever is running is left to finish, because killing a session
+mid-land is how a branch gets pushed with no merge behind it.
+
+Three things the board cannot tell you live in the config instead: **epics**, which through
+the API look exactly like small independent tickets; **tickets already claimed** by a chat
+the runner did not start; and **gates**, for when a dependency has landed but the training
+run it started still owns the GPU.
+
+Assumes `worktree-per-change`, and reads that skill's config for each repository's
+integration branch and delivery command so the two agree by construction.
+
+### Install
+
+```bash
+python board-runner/scripts/install.py --dir ~/afk --add-repo ../photos --dry-run
+```
+
+Read the diff it prints, then run it without `--dry-run`. The runner stands outside the
+repositories it works — nothing is installed into them — so it lives in one directory with
+the scripts, a `config.json`, and the logs and state of every run.
+
+It will not guess the epics. `--suggest-epics <repo>` prints the candidates with the
+evidence for each and changes nothing; naming a leaf as an epic means it never runs, and
+missing a real one means an agent tries to implement six tickets in one session.
+
+| Flag | Effect |
+|---|---|
+| `--dir PATH` | Where the runner lives. Default `~/afk` |
+| `--add-repo PATH` | Detect a repository and append it to `config.json` |
+| `--suggest-epics PATH` | Print likely epics for a repository, and change nothing |
+| `--deadline HH:MM` | The wall-clock stop. Default `10:00` |
+| `--status` | What is configured, which epics are set, what has run |
+| `--uninstall` | Remove the scripts, keep `config.json` and the logs |
+
+### Running and watching
+
+```bash
+node ~/afk/scheduler.mjs --dry-run
+```
+
+```bash
+node ~/afk/tree.mjs
+```
+
+`scheduler.mjs --dry-run` prints the board and launches nothing. `tree.mjs` serves a live
+tree at `http://localhost:7717` (`--watch` for the terminal) where each ticket hangs under
+the blocker still gating it, so it reads downward as *when this lands, these are released*
+— with each running chat's elapsed time, current tool, context-window occupancy and last
+line. It reads chats the runner never started too, from their session transcripts, so a
+hand-started session is never invisible.
+
+```
+board-runner/
+  SKILL.md
+  references/
+    gates.md          when a landed dependency still owns the GPU
+    recovery.md       credits, crashes, and resuming one ticket
+  scripts/
+    install.py        install / --add-repo / --suggest-epics / --status / --uninstall
+    scheduler.mjs     the pool: query the board, launch, claim, retry, stop at the deadline
+    tree.mjs          the live board, as a server or a terminal watch
+    tree.html         the page it serves
+    gates/
+      compute-idle.mjs   refuses while a training or export run holds the machine
+    config.example.json
 ```

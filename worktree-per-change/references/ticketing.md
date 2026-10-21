@@ -88,6 +88,26 @@ blockers — if nothing gets closed, nothing ever becomes visibly unblocked and 
 agents have nothing to pick up. So close it yourself, with a comment naming the branch and
 what a reader can now see. Do not edit another ticket's body to record that this one is done.
 
+**Close it from the pull request body, not by hand afterwards.** Where the tracker supports
+closing keywords, `Closes #<n>.` on the body's first line closes the ticket on merge, and
+that is strictly better than `gh issue close` at the end: closing by hand is a step a
+session can end before reaching, and every one of this protocol's other endings — a refused
+merge, a crash, a context limit, an operator's interrupt — leaves the change landed and the
+ticket open.
+
+**The title is not read.** Not by GitHub, not by GitLab. Measured 2026-09-20: `#19`
+delivered issue `#4` with `(#4)` in its title and nothing in its body; `#4` stayed open, and
+a day later a session set out to rebuild it. The PR merged the day before with `Closes #9.`
+in its body closed its issue without anyone touching the tracker.
+
+This protocol makes the omission easy, so the check belongs to it rather than to the
+tracker: `land.py` defaults to `--fill`, whose body is the branch's **commit messages**, so
+the keyword goes in the commit. A repository that wants that enforced sets
+`"requireIssueReference": true` — see
+[guard-internals.md](guard-internals.md#requireissuereference--the-pull-request-closes-its-ticket-or-says-why-not).
+`gh issue close` stays right for a ticket no pull request delivers: one answered in
+discussion, or one that turns out to be already done.
+
 **"Let the dependents unblock themselves" is a property of the tracker, not a rule.** It
 holds on GitHub, where `blocked_by` is *computed* from the blockers' open/closed state, so
 closing one moves the frontier in the very next query and nobody has to touch a dependent.

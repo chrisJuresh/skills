@@ -168,13 +168,20 @@ minutes later, which is exactly what unstable judgement looks like from inside a
 `.worktreeinclude` is the fix, `install.py` writes the entry, and `install.py --status`
 says whether a given repo has it. See [the SKILL](../SKILL.md).
 
-**A rule takes effect immediately; a hook does not.** Measured 2026-08-21, adding an entry
-to `~/.claude/settings.json` mid-session: the next call of the command that had just been
-stopped went through, with no restart and no `/reload`. That matters for what you tell the
-operator. A session stopped by this layer is not over — name the exact rule, in the
+**A rule takes effect immediately, and a hook can too.** Measured 2026-08-21, adding an
+entry to `~/.claude/settings.json` mid-session: the next call of the command that had just
+been stopped went through, with no restart and no `/reload`. That matters for what you tell
+the operator. A session stopped by this layer is not over — name the exact rule, in the
 spelling `settings.json` wants, say which file to put it in, and the work continues in the
-same session once they have. Hook registrations are the other way round and only apply to
-sessions started afterwards, so do not offer the two in one breath.
+same session once they have.
+
+Hook registrations used to be described here as the other way round, applying only to
+sessions started afterwards. Measured 2026-10-16 in the Claude desktop app, that is wrong
+in the direction that strands a session: an install wrote a project's `.claude/settings.json`
+mid-session, and that same session's very next Bash call was denied by the `PreToolUse`
+hook it had just registered. It may vary by Claude Code version or settings scope, so plan
+as if a hook written now covers the current session from its next call — never on a
+restart standing between the install and its first denial.
 
 That is also why the **read-only** entries belong in `~/.claude/settings.json` and not only
 in each repo. A repo-scoped rule cannot cover a session that has to read another repository

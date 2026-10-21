@@ -227,17 +227,20 @@ def main() -> int:
             "Read it in place" in reason(run(shell(repo, f"cd {first}", B, alive_b))),
             True,
         )
-        # A path spelled the way Windows spells it, asserted on every platform. The lexer
-        # was `shlex.split(raw)` in POSIX mode, which eats a backslash as an escape: the
-        # token came back as `C:Userschristreesalpha`, existed nowhere, named no directory,
-        # and the call was allowed. That silently turned four of the denials above and the
-        # hint below them into allows on the one platform where `\` is the separator.
-        backslashed = str(first).replace("/", chr(92))
-        check(
-            "a backslash-separated path is still read as the tree it names",
-            decision(run(shell(repo, f"cd {backslashed} && pnpm dev", B, alive_b))),
-            "deny",
-        )
+        # A path spelled the way Windows spells it. The lexer was `shlex.split(raw)` in
+        # POSIX mode, which eats a backslash as an escape: the token came back as
+        # `C:Usersmetreesalpha`, existed nowhere, named no directory, and the call was
+        # allowed. That silently turned four of the denials above and the hint below them
+        # into allows on the one platform where `\` is the separator. Asked only there:
+        # on macOS and Linux `\` is not a separator, the shell itself would not reach the
+        # tree, and allowing the call is the right answer.
+        if os.name == "nt":
+            backslashed = str(first).replace("/", chr(92))
+            check(
+                "a backslash-separated path is still read as the tree it names",
+                decision(run(shell(repo, f"cd {backslashed} && pnpm dev", B, alive_b))),
+                "deny",
+            )
 
         # A repo that records a different layout gets a remedy it can actually carry out.
         config = repo / ".claude" / "worktree-per-change.json"
@@ -248,6 +251,18 @@ def main() -> int:
         moved = reason(run(edit(first, first / "package.json", B, alive_b)))
         check("the remedy follows integrationBranch", "origin/trunk" in moved, True)
         check("the remedy follows worktreesRoot", "../trees/<name>" in moved, True)
+        # A repository with its own command for cutting a tree gets that command, not
+        # the bare git that skips the setup the command exists to do.
+        config.write_text(
+            json.dumps({"integrationBranch": "trunk",
+                        "delivery": {"create": "node scripts/new.mjs <name> --base <integration>"}}),
+            encoding="utf-8",
+        )
+        declared = reason(run(edit(first, first / "package.json", B, alive_b)))
+        check("the remedy is the repository's own create command",
+              "node scripts/new.mjs <name> --base trunk" in declared, True)
+        check("with no bare `git worktree add` beside it",
+              "git worktree add" in declared, False)
         config.write_text(
             json.dumps({"integrationBranch": "development"}), encoding="utf-8"
         )

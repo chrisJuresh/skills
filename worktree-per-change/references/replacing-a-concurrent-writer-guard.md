@@ -34,8 +34,9 @@ matches too.
    python scripts/install.py --repo . --branch <integration> --dry-run
    ```
 
-   Then without `--dry-run`. The old hook script is left on disk; delete it, or it sits there
-   looking authoritative.
+   Then without `--dry-run`, and land the worktree it commits the install in — the step it
+   prints is the whole of that. The old hook script is left on disk; delete it in a change
+   of its own, or it sits there looking authoritative.
 
 3. **Create the integration branch on the remote if it does not exist yet.** A repo moving
    from "branch off `main`, PR into `main`" to a `development` integration branch needs that
